@@ -14,6 +14,29 @@ npm run build:win
 npm run release:checksums
 ```
 
+## 二进制下载镜像
+
+Electron 运行时与 electron-builder 辅助工具（winCodeSign、nsis、7zip）默认从 GitHub 下载，在网络受限环境下会失败。本项目把下载源统一指向 npmmirror，通过 `package.json` 的 `config` 字段声明（不改变任何依赖版本，只改变下载来源）：
+
+```json
+"config": {
+  "electron_mirror": "https://npmmirror.com/mirrors/electron/",
+  "electron_custom_dir": "{{ version }}",
+  "electron_builder_binaries_mirror": "https://npmmirror.com/mirrors/electron-builder-binaries/"
+}
+```
+
+选择 `config` 而非 `.npmrc` 的原因：npm 会把 `config` 中的键注入为 `npm_package_config_*` 环境变量，这是官方支持的机制；而 `.npmrc` 中的未知键在 npm 12 下会持续输出告警，并提示未来大版本将不再生效。两个消费方都能读取这两种形式：
+
+- `electron_*`：`@electron/get` 的 `mirrorVar`（同时支持 `npm_package_config_electron_*`）。
+- `electron_builder_binaries_mirror`：`app-builder-lib` 的 `getBinariesMirrorUrl`（同样支持 `npm_package_config_*`）。
+
+Electron 43 起 `electron` 包不再声明安装期脚本，二进制改为首次 `require('electron')` 时惰性下载；而打包只读取 `electron-builder.yml` 里的 `electronDist` 路径，不会触发该惰性逻辑，`dist` 会一直缺失。因此 `postinstall` 显式调用 `node scripts/install-electron.mjs`，该脚本设置镜像后调用 electron 包自带的幂等安装脚本（`dist/version` 与 `path.txt` 匹配时直接跳过）。
+
+`scripts/build-release.mjs` 同样在调用 electron-builder 前设置 `ELECTRON_BUILDER_BINARIES_MIRROR`，使打包不依赖 npm 的环境变量注入。
+
+如需临时改用其它镜像，直接覆盖对应环境变量（`ELECTRON_MIRROR`、`ELECTRON_BUILDER_BINARIES_MIRROR`）即可，环境变量优先级最高。
+
 `verify` 包含许可证清单一致性、格式、Lint、TypeScript、Vitest 和生产构建。`test:e2e` 启动隔离的 Electron 实例并实际操作文件、三维画布和导出流程。
 
 ## 架构边界

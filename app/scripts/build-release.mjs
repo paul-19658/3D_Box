@@ -11,6 +11,11 @@ if (target !== '--dir' && target !== '--win') {
   throw new Error('用法：node scripts/build-release.mjs --dir|--win')
 }
 
+// electron-builder 打包时需要下载 winCodeSign、nsis、7zip 等辅助工具，默认从 GitHub 取。
+// 这里显式设置镜像，避免依赖 npm 对 .npmrc 未知键的注入（npm 12 已提示未来将停止生效）。
+process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||=
+  'https://npmmirror.com/mirrors/electron-builder-binaries/'
+
 async function resolveOutputDirectory(baseDirectory) {
   const unpackedDir = join(appRoot, baseDirectory, 'win-unpacked')
   try {

@@ -10,6 +10,11 @@
     "node": ">=22.12.0"
   },
   "packageManager": "npm@11.12.1",
+  "config": {
+    "electron_mirror": "https://npmmirror.com/mirrors/electron/",
+    "electron_custom_dir": "{{ version }}",
+    "electron_builder_binaries_mirror": "https://npmmirror.com/mirrors/electron-builder-binaries/"
+  },
   "scripts": {
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -30,7 +35,7 @@
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "electron-builder install-app-deps && node scripts/install-electron.mjs",
     "build:unpack": "npm run legal:generate && npm run build && node scripts/build-release.mjs --dir",
     "build:win": "npm run legal:generate && npm run build && node scripts/build-release.mjs --win",
     "release:checksums": "node scripts/create-release-checksums.mjs",

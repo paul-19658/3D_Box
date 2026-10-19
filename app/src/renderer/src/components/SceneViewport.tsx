@@ -108,7 +108,13 @@ import {
   setImportedVariantVisibility,
   type LightweightPreviewReport
 } from '../optimizer/lightweight-preview'
+import {
+  FIXED_FILL_LIGHT,
+  FIXED_HEMISPHERE_LIGHT,
+  resolveShadowCasterIds
+} from '../scene-core/lighting-description'
 import { outputSize } from '../video/output-size'
+import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js'
 
 export type TransformMode = TransformControlsMode
 export type CutAxis = 'x' | 'y' | 'z'
@@ -557,6 +563,20 @@ function perpendicularModelingPoint(
     best = origin.clone().add(perpendicular.normalize().multiplyScalar(distance))
   }
   return best ? { point: best, perpendicular: true } : { point: candidate, perpendicular: false }
+}
+
+let rectAreaLightReady = false
+
+/**
+ * 面光（RectAreaLight）需要先初始化 LTC 查找表，否则 three.js 会静默渲染成纯环境光。
+ * 默认场景主光就是面光，因此必须在创建任何 RectAreaLight 之前调用。
+ *
+ * init() 会生成两张 64×64 数据纹理，重复调用会反复分配显存，所以只执行一次。
+ */
+function ensureRectAreaLightSupport(): void {
+  if (rectAreaLightReady) return
+  RectAreaLightUniformsLib.init()
+  rectAreaLightReady = true
 }
 
 function disposeObject(root: THREE.Object3D): void {
@@ -1648,6 +1668,8 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
     renderer.toneMappingExposure = theme === 'dark' ? 1.12 : 1
     rendererRef.current = renderer
 
+    ensureRectAreaLightSupport()
+
     const controls = new OrbitControls(camera, canvas)
     controls.enableDamping = true
     controls.dampingFactor = 0.07
@@ -1679,12 +1701,16 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
     controls.addEventListener('end', scheduleCameraChange)
     controlsRef.current = controls
 
+    // 地面是场景里真实存在的几何体，阴影直接落在它上面。
+    // 不再额外叠加“看不见的阴影承接面”，避免阴影凭空出现在没有实体的区域。
+    // 不透明度比早期版本略高，让地面上的投影更清楚；depthWrite 保持关闭，
+    // 避免把后绘制的无限网格线盖住。
     const groundMaterial = new THREE.MeshStandardMaterial({
       color: theme === 'dark' ? '#333a3b' : '#f4f6f6',
       roughness: 0.98,
       metalness: 0,
       transparent: true,
-      opacity: theme === 'dark' ? 0.2 : 0.34,
+      opacity: theme === 'dark' ? 0.26 : 0.42,
       depthWrite: false,
       side: THREE.DoubleSide
     })
@@ -1797,12 +1823,20 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
     scene.add(pivot)
     transformPivotRef.current = pivot
 
-    const hemisphere = new THREE.HemisphereLight('#ffffff', '#a9b0b1', 1.15)
+    const hemisphere = new THREE.HemisphereLight(
+      FIXED_HEMISPHERE_LIGHT.skyColor,
+      FIXED_HEMISPHERE_LIGHT.groundColor,
+      FIXED_HEMISPHERE_LIGHT.intensity
+    )
     scene.add(hemisphere)
     hemisphereRef.current = hemisphere
 
-    const fillLight = new THREE.DirectionalLight('#e5f4f1', 0.42)
-    fillLight.position.set(-5, 4, -3)
+    const fillLight = new THREE.DirectionalLight(FIXED_FILL_LIGHT.color, FIXED_FILL_LIGHT.intensity)
+    fillLight.position.set(
+      FIXED_FILL_LIGHT.position.x,
+      FIXED_FILL_LIGHT.position.y,
+      FIXED_FILL_LIGHT.position.z
+    )
     scene.add(fillLight)
     sceneFillRef.current = fillLight
 
@@ -2981,6 +3015,7 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
       delete canvas.dataset.cutPreview
       delete canvas.dataset.userLightCount
       delete canvas.dataset.lightGuideTone
+      delete canvas.dataset.lightShadowCasterCount
       delete canvas.dataset.cameraGuideTone
       delete canvas.dataset.surfacePick
       delete canvas.dataset.surfacePickHit
@@ -3258,11 +3293,15 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
     clearGroup(guideGroup)
     lightRootMapRef.current.clear()
 
-    lighting.lights.forEach((data, index) => {
+    // 阴影名额与实际渲染、文字描述共用同一份判定，避免“描述说投射阴影但画面没有”。
+    const shadowCasterIds = resolveShadowCasterIds(lighting.lights)
+
+    lighting.lights.forEach((data) => {
       const color = new THREE.Color(data.color)
       const guideColor = new THREE.Color(
         selectedLightId === data.id ? '#ffb020' : theme === 'dark' ? '#f3f6f5' : '#111820'
       )
+      const castShadow = shadowCasterIds.has(data.id)
       const target = new THREE.Object3D()
       target.position.set(data.target.x, data.target.y, data.target.z)
       target.visible = data.visible
@@ -3273,8 +3312,11 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
       if (data.kind === 'point') {
         const point = new THREE.PointLight(color, data.intensity, 0, 2)
         point.decay = 2
-        point.castShadow = index < 2
+        point.castShadow = castShadow
         point.shadow.mapSize.set(1024, 1024)
+        point.shadow.bias = -0.0006
+        point.shadow.normalBias = 0.02
+        point.shadow.radius = 2.4
         light = point
         helper = new THREE.PointLightHelper(point, Math.max(data.size, 0.24), guideColor)
       } else if (data.kind === 'spot') {
@@ -3287,26 +3329,30 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
           2
         )
         spot.target = target
-        spot.castShadow = index < 2
+        spot.castShadow = castShadow
         spot.shadow.mapSize.set(1024, 1024)
         spot.shadow.bias = -0.00035
+        spot.shadow.normalBias = 0.02
+        spot.shadow.radius = 2.2
         light = spot
         helper = new THREE.SpotLightHelper(spot, guideColor)
       } else if (data.kind === 'sun') {
         const sun = new THREE.DirectionalLight(color, data.intensity)
         sun.target = target
-        sun.castShadow = index < 2
-        sun.shadow.mapSize.set(1024, 1024)
-        sun.shadow.camera.left = -12
-        sun.shadow.camera.right = 12
-        sun.shadow.camera.top = 12
-        sun.shadow.camera.bottom = -12
+        sun.castShadow = castShadow
+        sun.shadow.mapSize.set(2048, 2048)
+        sun.shadow.camera.left = -16
+        sun.shadow.camera.right = 16
+        sun.shadow.camera.top = 16
+        sun.shadow.camera.bottom = -16
         sun.shadow.camera.near = 0.1
-        sun.shadow.camera.far = 60
-        sun.shadow.bias = -0.00035
+        sun.shadow.camera.far = 80
+        sun.shadow.bias = -0.0003
+        sun.shadow.normalBias = 0.02
         light = sun
         helper = new THREE.DirectionalLightHelper(sun, 1.2, guideColor)
       } else {
+        // 面光在 three.js 中不支持阴影；它的“可见性”由发光面板与方向射线表达。
         const area = new THREE.RectAreaLight(
           color,
           data.intensity,
@@ -3350,12 +3396,79 @@ const SceneViewport = forwardRef<SceneViewportHandle, SceneViewportProps>(functi
       })
       helper.renderOrder = 840
       guideGroup.add(helper)
+
+      // 光源本体标记：实心小球，用灯光颜色上色，直观表示“灯就在这里”。
+      const markerRadius = Math.max(Math.min(data.size, 0.5), 0.16)
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(markerRadius, 16, 12),
+        new THREE.MeshBasicMaterial({
+          color: data.color,
+          depthTest: false,
+          transparent: true,
+          opacity: selectedLightId === data.id ? 1 : 0.9
+        })
+      )
+      marker.position.set(data.position.x, data.position.y, data.position.z)
+      marker.visible = data.visible
+      marker.userData.lightId = data.id
+      marker.userData.lightMarker = true
+      marker.renderOrder = 845
+      guideGroup.add(marker)
+
+      // 方向射线：从光源指向被照目标，用灯光颜色画虚线，表达“光往哪照”。
+      const directionPoints = [
+        new THREE.Vector3(data.position.x, data.position.y, data.position.z),
+        new THREE.Vector3(data.target.x, data.target.y, data.target.z)
+      ]
+      const directionRay = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(directionPoints),
+        new THREE.LineDashedMaterial({
+          color: data.color,
+          dashSize: 0.28,
+          gapSize: 0.18,
+          transparent: true,
+          opacity: selectedLightId === data.id ? 1 : 0.78,
+          depthTest: false
+        })
+      )
+      directionRay.computeLineDistances()
+      directionRay.visible = data.visible
+      directionRay.userData.lightId = data.id
+      directionRay.userData.lightRay = true
+      directionRay.renderOrder = 844
+      guideGroup.add(directionRay)
+
+      // 落地投影线：从光源垂直落到地面，让高位光源的高度一眼可读。
+      if (data.position.y > 0.02) {
+        const dropPoints = [
+          new THREE.Vector3(data.position.x, data.position.y, data.position.z),
+          new THREE.Vector3(data.position.x, 0, data.position.z)
+        ]
+        const dropLine = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(dropPoints),
+          new THREE.LineDashedMaterial({
+            color: guideColor,
+            dashSize: 0.16,
+            gapSize: 0.14,
+            transparent: true,
+            opacity: 0.5,
+            depthTest: false
+          })
+        )
+        dropLine.computeLineDistances()
+        dropLine.visible = data.visible
+        dropLine.userData.lightId = data.id
+        dropLine.userData.lightDrop = true
+        dropLine.renderOrder = 843
+        guideGroup.add(dropLine)
+      }
     })
 
     const canvas = canvasRef.current
     if (canvas) {
       canvas.dataset.userLightCount = String(lighting.lights.length)
       canvas.dataset.lightGuideTone = theme === 'dark' ? 'light' : 'dark'
+      canvas.dataset.lightShadowCasterCount = String(shadowCasterIds.size)
     }
   }, [lighting, selectedLightId, theme])
 

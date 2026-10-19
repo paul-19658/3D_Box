@@ -1,6 +1,7 @@
 import type { SceneObjectData } from '../../../shared/project-document'
 import type { SceneState } from './scene'
 import { MANNEQUIN_PRESETS } from '../mannequin/mannequin'
+import { describeLighting } from './lighting-description'
 
 /**
  * 把当前场景整理成一段简短的中文描述，随用户消息一起发送给 AI。
@@ -62,6 +63,7 @@ export function summarizeScene(scene: SceneState): string {
   lines.push(
     `相机位置(${formatVector(scene.camera.position)})，看向(${formatVector(scene.camera.target)})。`
   )
+  lines.push(describeLighting(scene.lighting.lights).summaryLine)
   if (objects.length === 0) {
     lines.push('当前场景没有任何物体。')
   } else {

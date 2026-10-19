@@ -1,12 +1,19 @@
 import type {
   CameraState,
   PrimitiveKind,
+  SceneLightData,
   SceneObjectData,
   TimelineState,
   Vector3Value
 } from '../../../shared/project-document'
 import { MANNEQUIN_PRESETS } from '../mannequin/mannequin'
 import type { SceneState } from './scene'
+import {
+  describeLighting,
+  FIXED_FILL_LIGHT,
+  FIXED_HEMISPHERE_LIGHT,
+  type LightDescription
+} from './lighting-description'
 
 /**
  * 场景说明：把带描述的物体整理成带索引的清单，供导出 JSON 与 AI 参考。
@@ -15,7 +22,7 @@ import type { SceneState } from './scene'
  * 画面叠加层里显示的数字与这里导出的索引完全一致，方便 AI 把画面上的编号和描述对应起来。
  */
 
-export const SCENE_DESCRIPTOR_SCHEMA_VERSION = 1 as const
+export const SCENE_DESCRIPTOR_SCHEMA_VERSION = 2 as const
 
 export const KIND_LABELS: Record<PrimitiveKind, string> = {
   box: '方块',
@@ -47,6 +54,25 @@ export interface SceneDescriptionEntry {
   mannequinPreset: string | null
 }
 
+export interface FixedLightingEntry {
+  kind: 'hemisphere' | 'directional-fill'
+  description: string
+  producesShadow: false
+  color: string
+  intensity: number
+  position?: Vector3Value
+}
+
+export interface SceneLightingEntry {
+  lights: LightDescription[]
+  visibleCount: number
+  shadowCasterNames: string[]
+  /** 固定环境光（半球光 + 方向补光），始终存在，不产生阴影。 */
+  fixed: FixedLightingEntry[]
+  /** 供生成式模型直接使用的一段光照说明。 */
+  summary: string
+}
+
 export interface SceneDescriptorDocument {
   schemaVersion: typeof SCENE_DESCRIPTOR_SCHEMA_VERSION
   generatedAt: string
@@ -54,6 +80,7 @@ export interface SceneDescriptorDocument {
   units: 'meters'
   indexMeaning: string
   camera: CameraState & { aspectRatio: string }
+  lighting: SceneLightingEntry
   timeline: {
     durationSeconds: number
     cameraShotCount: number
@@ -124,13 +151,45 @@ function cameraDirectionText(camera: CameraState): string {
   return `镜头朝向约 ${round(degrees)} 度（水平方向，0 度为 +Z，顺时针为正）`
 }
 
+/** 把场景灯光整理成可直接序列化的光照条目。 */
+export function buildSceneLightingEntry(lights: SceneLightData[]): SceneLightingEntry {
+  const described = describeLighting(lights)
+  return {
+    lights: described.lights,
+    visibleCount: described.visibleLights.length,
+    shadowCasterNames: described.shadowCasterNames,
+    fixed: [
+      {
+        kind: 'hemisphere',
+        description: `半球环境光：天空 ${FIXED_HEMISPHERE_LIGHT.skyColor}，地面反射 ${FIXED_HEMISPHERE_LIGHT.groundColor}`,
+        producesShadow: false,
+        color: FIXED_HEMISPHERE_LIGHT.skyColor,
+        intensity: FIXED_HEMISPHERE_LIGHT.intensity
+      },
+      {
+        kind: 'directional-fill',
+        description: '方向补光，从物体左后方补充轮廓亮度',
+        producesShadow: false,
+        color: FIXED_FILL_LIGHT.color,
+        intensity: FIXED_FILL_LIGHT.intensity,
+        position: { ...FIXED_FILL_LIGHT.position }
+      }
+    ],
+    summary: described.summaryLine
+  }
+}
+
 /**
  * 生成建议提示词，可直接复制到生成视频的平台使用。
+ *
+ * 光照段落会明确说明主光方向、色调与阴影走向，帮助生成式模型还原
+ * “光从哪里来、影子往哪里倒”，而不是自行编造一套默认打光。
  */
 export function buildSuggestedPrompt(
   entries: SceneDescriptionEntry[],
   camera: CameraState,
-  timeline: TimelineState
+  timeline: TimelineState,
+  lights: SceneLightData[] = []
 ): string {
   if (entries.length === 0) {
     return '当前场景还没有填写任何物体描述。请先在物体属性中填写“物体描述”，再生成提示词。'
@@ -156,9 +215,12 @@ export function buildSuggestedPrompt(
     lines.push(`镜头时长约 ${round(timeline.durationSeconds)} 秒。`)
   }
   lines.push('')
+  lines.push(...describeLighting(lights).promptLines)
+  lines.push('')
   lines.push('要求：')
   lines.push('- 保持所有物体的材质、颜色和形状在整个镜头中前后一致。')
   lines.push('- 让物体的运动与参考视频保持一致，不要改变运动轨迹和节奏。')
+  lines.push('- 保持上述光照方向、色调与阴影走向在整个镜头中稳定，不要自行添加新的光源。')
   lines.push('- 不要出现任何数字编号、文字标记或参考用的辅助图形。')
   return lines.join('\n')
 }
@@ -205,13 +267,19 @@ export function buildSceneDescriptor(input: BuildSceneDescriptorInput): SceneDes
       ...scene.camera,
       aspectRatio: aspectRatioLabel(scene.camera.aspectWidth, scene.camera.aspectHeight)
     },
+    lighting: buildSceneLightingEntry(scene.lighting.lights),
     timeline: {
       durationSeconds: round(scene.timeline.durationSeconds),
       cameraShotCount: scene.timeline.cameraShots.length,
       objectKeyframeCount: scene.timeline.objectKeyframes.length
     },
     objects,
-    suggestedPrompt: buildSuggestedPrompt(objects, scene.camera, scene.timeline)
+    suggestedPrompt: buildSuggestedPrompt(
+      objects,
+      scene.camera,
+      scene.timeline,
+      scene.lighting.lights
+    )
   }
 }
 

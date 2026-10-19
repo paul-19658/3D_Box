@@ -67,6 +67,13 @@ describe('scene-summary', () => {
     expect(summary).toContain('其余 5 个物体未一一列出')
   })
 
+  it('摘要包含光照信息，让 AI 知道光从哪来', () => {
+    const scene = createInitialScene()
+    const summary = summarizeScene(scene)
+    expect(summary).toContain('光照')
+    expect(summary).toContain('固定半球环境光')
+  })
+
   it('有时间轴内容时补充说明', () => {
     const scene = createInitialScene()
     scene.timeline.durationSeconds = 8

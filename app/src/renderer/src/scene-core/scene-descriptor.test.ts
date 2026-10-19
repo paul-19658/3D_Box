@@ -53,7 +53,7 @@ describe('scene-descriptor', () => {
       scene,
       generatedAt: '2026-10-10T10:00:00.000Z'
     })
-    expect(document.schemaVersion).toBe(1)
+    expect(document.schemaVersion).toBe(2)
     expect(document.generatedAt).toBe('2026-10-10T10:00:00.000Z')
     expect(document.units).toBe('meters')
     expect(document.objects).toHaveLength(1)
@@ -98,5 +98,58 @@ describe('scene-descriptor', () => {
     const text = serializeSceneDescriptor(buildSceneDescriptor({ projectName: '测试', scene }))
     expect(text.endsWith('\n')).toBe(true)
     expect(() => JSON.parse(text)).not.toThrow()
+  })
+
+  it('文档包含光照段落，并标明固定环境光不产生阴影', () => {
+    const scene = createInitialScene()
+    scene.objects = [boxWith('冰箱')]
+    const document = buildSceneDescriptor({ projectName: '测试', scene })
+    expect(document.lighting.lights.length).toBeGreaterThan(0)
+    expect(document.lighting.fixed.map((entry) => entry.kind)).toEqual([
+      'hemisphere',
+      'directional-fill'
+    ])
+    expect(document.lighting.fixed.every((entry) => entry.producesShadow === false)).toBe(true)
+    expect(document.lighting.summary).toContain('光照')
+  })
+
+  it('默认场景的主光是面光，且不占用阴影名额', () => {
+    const scene = createInitialScene()
+    scene.objects = [boxWith('冰箱')]
+    const document = buildSceneDescriptor({ projectName: '测试', scene })
+    const area = document.lighting.lights.find((light) => light.kind === 'area')
+    expect(area).toBeDefined()
+    expect(area?.castShadow).toBe(false)
+    expect(document.lighting.shadowCasterNames).toEqual([])
+  })
+
+  it('新增聚光灯后，阴影灯名单随之更新', () => {
+    const scene = createInitialScene()
+    scene.objects = [boxWith('冰箱')]
+    scene.lighting.lights.push({
+      id: 'spot-1',
+      name: '聚光灯 01',
+      kind: 'spot',
+      position: { x: 4, y: 7, z: 5 },
+      target: { x: 0, y: 1, z: 0 },
+      color: '#fff8ee',
+      intensity: 4,
+      size: 0.3,
+      angleDegrees: 38,
+      visible: true,
+      locked: false
+    })
+    const document = buildSceneDescriptor({ projectName: '测试', scene })
+    expect(document.lighting.shadowCasterNames).toEqual(['聚光灯 01'])
+    expect(document.suggestedPrompt).toContain('聚光灯 01')
+  })
+
+  it('建议提示词包含光照方向与阴影要求', () => {
+    const scene = createInitialScene()
+    scene.objects = [boxWith('冰箱')]
+    const document = buildSceneDescriptor({ projectName: '测试', scene })
+    expect(document.suggestedPrompt).toContain('光照：')
+    expect(document.suggestedPrompt).toContain('固定环境光')
+    expect(document.suggestedPrompt).toContain('保持上述光照方向、色调与阴影走向')
   })
 })
