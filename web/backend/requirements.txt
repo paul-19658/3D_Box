@@ -1,0 +1,15 @@
+# Xiaobaihe Web backend dependencies
+# Target runtime: Python 3.10.20
+#
+# All versions are pinned so that every contributor builds the same
+# environment. Upgrading a dependency requires the process described in
+# docs/AI_DEV_GUIDE.md ("Dependency changes").
+#
+# NOTE: keep this file ASCII-only. Older pip releases on Windows decode it
+# with the system locale (GBK/cp936) and fail on non-ASCII characters.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+httpx==0.28.1
+python-multipart==0.0.20

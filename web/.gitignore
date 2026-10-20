@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 运行时数据：工程、导出产物、AI 配置（含密钥）
+workspace/
+!workspace/.gitkeep
+
+# Node
+node_modules/
+dist/
+*.log
+npm-debug.log*
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "rulesVersion": "2026.07",
+  "checkedAt": "2026-07-19",
+  "profiles": [
+    {
+      "id": "generic-16x9",
+      "name": "通用 16:9 参考视频",
+      "description": "大多数 AI 视频平台都接受的横版参考视频，适合运镜与人物动作参考。",
+      "verification": "generic",
+      "frameRate": 24,
+      "maxDimension": 1920,
+      "bitrate": 8000000,
+      "minDurationSeconds": 1,
+      "maxDurationSeconds": 30,
+      "maxFileSizeMb": 200,
+      "aspectRatios": ["16:9"],
+      "sourceUrl": "https://github.com/Amyliya-bot/xiaobaihe"
+    },
+    {
+      "id": "generic-9x16",
+      "name": "通用 9:16 竖版参考",
+      "description": "竖屏短视频常用的画幅，适合人物全身动作与手机端观看。",
+      "verification": "generic",
+      "frameRate": 24,
+      "maxDimension": 1920,
+      "bitrate": 8000000,
+      "minDurationSeconds": 1,
+      "maxDurationSeconds": 30,
+      "maxFileSizeMb": 200,
+      "aspectRatios": ["9:16"],
+      "sourceUrl": "https://github.com/Amyliya-bot/xiaobaihe"
+    },
+    {
+      "id": "generic-1x1",
+      "name": "通用 1:1 方版参考",
+      "description": "方版构图，适合产品与静态场景参考。",
+      "verification": "generic",
+      "frameRate": 24,
+      "maxDimension": 1440,
+      "bitrate": 6000000,
+      "minDurationSeconds": 1,
+      "maxDurationSeconds": 20,
+      "maxFileSizeMb": 150,
+      "aspectRatios": ["1:1"],
+      "sourceUrl": "https://github.com/Amyliya-bot/xiaobaihe"
+    },
+    {
+      "id": "controlnet-reference",
+      "name": "ControlNet 参考素材",
+      "description": "用于深度、边缘、法线等控制图上传；对画幅与时长无硬性限制。",
+      "verification": "partial",
+      "frameRate": 24,
+      "maxDimension": 2048,
+      "bitrate": 10000000,
+      "minDurationSeconds": 0.5,
+      "maxDurationSeconds": 60,
+      "maxFileSizeMb": 400,
+      "aspectRatios": ["16:9", "9:16", "1:1", "4:3"],
+      "sourceUrl": "https://github.com/lllyasviel/ControlNet"
+    },
+    {
+      "id": "first-last-frame",
+      "name": "首尾帧参考",
+      "description": "导出首帧与尾帧成对出现，供支持首尾帧驱动的平台使用。",
+      "verification": "generic",
+      "frameRate": 24,
+      "maxDimension": 1920,
+      "bitrate": 8000000,
+      "minDurationSeconds": 1,
+      "maxDurationSeconds": 15,
+      "maxFileSizeMb": 120,
+      "aspectRatios": ["16:9", "9:16"],
+      "sourceUrl": "https://github.com/Amyliya-bot/xiaobaihe"
+    }
+  ]
+}

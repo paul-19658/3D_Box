@@ -1,0 +1,737 @@
+/**
+ * 全局样式与设计令牌。
+ *
+ * 视觉参考 libTV：近黑底 + 细描边玻璃面板 + 单一蓝色主操作。
+ * 约定：
+ * - 颜色 / 圆角 / 阴影只允许通过变量引用，组件内不写死色值；
+ * - 组件私有布局放各自的 <style scoped>，这里只放"跨组件复用"的原子类；
+ * - 深色为默认，浅色通过 [data-theme="light"] 覆盖同一组变量。
+ */
+
+:root,
+[data-theme='dark'] {
+  --bg-0: #07090b;
+  --bg-1: #0d1114;
+  --bg-2: #131a1f;
+  --bg-3: #1a2228;
+  --panel-blur: rgba(13, 17, 20, 0.82);
+
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  --text-0: #e9eef1;
+  --text-1: #9aa5ad;
+  --text-2: #6a747b;
+
+  --accent: #2f7cf6;
+  --accent-strong: #4b93ff;
+  --accent-soft: rgba(47, 124, 246, 0.16);
+  --warn: #ffb020;
+  --danger: #ff5f6d;
+  --success: #37c98b;
+
+  --radius-s: 6px;
+  --radius-m: 10px;
+  --radius-l: 14px;
+  --radius-pill: 999px;
+
+  --shadow-panel: 0 16px 40px rgba(0, 0, 0, 0.48);
+  --shadow-pop: 0 24px 64px rgba(0, 0, 0, 0.62);
+
+  --rail-width: 60px;
+  --topbar-height: 48px;
+  --timeline-height: 132px;
+  --sidebar-width: 296px;
+}
+
+[data-theme='light'] {
+  --bg-0: #eef1f3;
+  --bg-1: #f7f9fa;
+  --bg-2: #ffffff;
+  --bg-3: #e8ecee;
+  --panel-blur: rgba(255, 255, 255, 0.86);
+
+  --line: rgba(16, 24, 32, 0.1);
+  --line-strong: rgba(16, 24, 32, 0.2);
+
+  --text-0: #10181f;
+  --text-1: #4c565e;
+  --text-2: #7b858c;
+
+  --accent-soft: rgba(47, 124, 246, 0.12);
+  --shadow-panel: 0 14px 32px rgba(16, 24, 32, 0.12);
+  --shadow-pop: 0 22px 56px rgba(16, 24, 32, 0.18);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--text-0);
+  font-family: 'Inter', 'HarmonyOS Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* 应用外壳                                                            */
+/* ------------------------------------------------------------------ */
+
+.app-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg-0);
+}
+
+/* ------------------------------------------------------------------ */
+/* 按钮                                                                */
+/* ------------------------------------------------------------------ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: var(--bg-2);
+  color: var(--text-0);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    color 0.14s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg-3);
+  border-color: var(--line-strong);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn--ghost {
+  background: transparent;
+  border-color: transparent;
+}
+
+.btn--ghost:hover:not(:disabled) {
+  background: var(--bg-3);
+  border-color: var(--line);
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+.btn--danger {
+  color: var(--danger);
+}
+
+/* 有错误待导出时给按钮一点提示色，让"该点这里"自己说得清楚。 */
+.btn.is-alert {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.btn--icon {
+  width: 28px;
+  padding: 0;
+}
+
+.btn--block {
+  width: 100%;
+}
+
+/* 胶囊按钮：顶栏中部的"场景调度 / 成片预演"。 */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--bg-2);
+  color: var(--text-1);
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.pill:hover {
+  color: var(--text-0);
+  border-color: var(--line-strong);
+}
+
+.pill.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+/* ------------------------------------------------------------------ */
+/* 面板                                                                */
+/* ------------------------------------------------------------------ */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-m);
+  background: var(--bg-1);
+}
+
+.panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  flex: none;
+}
+
+.panel__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.panel__section {
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel__section:last-child {
+  border-bottom: none;
+}
+
+.section-title {
+  margin: 0 0 8px;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ------------------------------------------------------------------ */
+/* 表单                                                                */
+/* ------------------------------------------------------------------ */
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.field__label {
+  flex: none;
+  width: 58px;
+  color: var(--text-1);
+  font-size: 12px;
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: var(--bg-0);
+  color: var(--text-0);
+  outline: none;
+}
+
+.textarea {
+  height: auto;
+  padding: 6px 8px;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.input:focus,
+.select:focus,
+.textarea:focus {
+  border-color: var(--accent);
+}
+
+.input[type='color'] {
+  padding: 2px;
+  cursor: pointer;
+}
+
+.input[type='range'] {
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.vector-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-1);
+  cursor: pointer;
+  user-select: none;
+}
+
+.swatch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.swatch {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------------------ */
+/* 列表                                                                */
+/* ------------------------------------------------------------------ */
+
+.list-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+.list-row:hover {
+  background: var(--bg-2);
+}
+
+.list-row.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.list-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-row__meta {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.empty-hint {
+  padding: 14px 8px;
+  color: var(--text-2);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ------------------------------------------------------------------ */
+/* 对话框                                                              */
+/* ------------------------------------------------------------------ */
+
+.dialog-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.56);
+  backdrop-filter: blur(3px);
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(520px, calc(100vw - 40px));
+  max-height: calc(100vh - 80px);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-l);
+  background: var(--bg-1);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+}
+
+.dialog--wide {
+  width: min(760px, calc(100vw - 40px));
+}
+
+.dialog__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
+}
+
+.dialog__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+}
+
+.dialog__foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+}
+
+/* ------------------------------------------------------------------ */
+/* 通知与忙碌遮罩                                                      */
+/* ------------------------------------------------------------------ */
+
+.notice-stack {
+  position: fixed;
+  top: 58px;
+  left: 50%;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.notice {
+  min-width: 220px;
+  max-width: 420px;
+  padding: 8px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--panel-blur);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-panel);
+  color: var(--text-0);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.notice--success {
+  border-color: var(--success);
+}
+
+.notice--error {
+  border-color: var(--danger);
+}
+
+.notice--info {
+  border-color: var(--accent);
+}
+
+.notice-enter-active,
+.notice-leave-active {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+
+.notice-enter,
+.notice-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.busy-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.42);
+}
+
+.busy-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--bg-1);
+  box-shadow: var(--shadow-pop);
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.fade-enter,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 滚动条                                                              */
+/* ------------------------------------------------------------------ */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 4px;
+  background-clip: content-box;
+  background-color: var(--line-strong);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.hidden-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* 三维视口                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 视口的模板写在 SceneViewport.js 的字符串模板里（没有 scoped 样式），
+ * 因此它的布局样式必须集中放在这里。
+ *
+ * 关键点：canvas 必须显式撑满容器。`<canvas>` 是替换元素，不给尺寸时会
+ * 退化成 300×150 的内联块——这是之前"场景一片黑"的直接原因，
+ * 因为渲染器拿到的画布尺寸和 CSS 布局尺寸完全不一致。
+ */
+.viewport {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.viewport-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* 关闭触摸手势，否则触控板拖拽会被浏览器当作滚动/缩放吞掉。 */
+  touch-action: none;
+  outline: none;
+}
+
+.viewport-hud {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.hud-pill {
+  padding: 4px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--panel-blur);
+  backdrop-filter: blur(10px);
+  color: var(--text-0);
+  font-size: 12px;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.hud-pill--hint {
+  color: var(--text-1);
+  cursor: default;
+}
+
+.hud-pill.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+/*
+ * 摄影机监视器：悬浮在视口里的独立小窗。
+ *
+ * 定位用 left/top（由组件按拖动结果写入），尺寸由 width/height 控制，
+ * 因此这里不设 width/height，避免和行内样式打架。
+ * 内部 canvas 同样是替换元素，必须显式给宽高，否则会退回 300×150。
+ */
+.monitor {
+  position: absolute;
+  z-index: 20;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-m);
+  background: var(--bg-0);
+  box-shadow: var(--shadow-panel);
+  overflow: hidden;
+  user-select: none;
+}
+
+.monitor__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 24px;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+  cursor: move;
+}
+
+.monitor__title {
+  color: var(--text-1);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+.monitor__meta {
+  flex: 1;
+  color: var(--text-2);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.monitor__close {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.monitor__close:hover {
+  background: var(--bg-2);
+  color: var(--text-0);
+}
+
+.monitor__canvas {
+  display: block;
+  width: 100%;
+  background: #000;
+}
+
+/* 右下角缩放柄：三角形暗示"可以拖"。 */
+.monitor__grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  background: linear-gradient(
+    135deg,
+    transparent 0 50%,
+    var(--line-strong) 50% 60%,
+    transparent 60% 72%,
+    var(--line-strong) 72% 82%,
+    transparent 82%
+  );
+}
+
+/*
+ * 内联 SVG 没有 width/height 时会被当成替换元素，按 300×150 渲染，
+ * 从而撑破按钮、互相重叠、把点击区域挤到相邻按钮上——
+ * 这就是"左侧工具栏点不了"的根因。这里统一钉死尺寸。
+ */
+.rail-btn__glyph svg {
+  display: block;
+  width: 19px;
+  height: 19px;
+}
