@@ -7,6 +7,8 @@
       :can-redo="canRedo"
       :theme="theme"
       :error-count="diagnosticsErrorCount"
+      :preview-active="previewMode"
+      @select-panel="setPreviewMode($event === 'preview')"
       @rename="renameProject"
       @undo="$store.commit('undoScene')"
       @redo="$store.commit('redoScene')"
@@ -23,8 +25,13 @@
       @export-diagnostics="exportDiagnostics"
     />
 
-    <div class="editor-body">
+    <!--
+      预演时收起编辑侧栏与浮动面板。
+      保留视口和时间轴：时间轴是"播到哪儿"的唯一指示，去掉它就成了黑盒。
+    -->
+    <div class="editor-body" :class="{ 'is-preview': previewMode }">
       <ToolRail
+        v-if="!previewMode"
         :tool="tool"
         :transform-mode="transformMode"
         @select="setTool"
@@ -40,6 +47,7 @@
           ref="viewport"
           :objects="displayedObjects"
           :camera-state="displayedCamera"
+          :preview-active="previewMode"
           :monitor-open="monitorOpen"
           :lighting="lighting"
           :selected-ids="selectedIds"
@@ -77,9 +85,15 @@
           @toggle-monitor="$store.commit('setMonitorOpen', !monitorOpen)"
         />
 
-        <CameraOverlay :camera="camera" @update-camera="updateCamera" @focus="$refs.viewport.focusView()" />
+        <CameraOverlay
+          v-if="!previewMode"
+          :camera="camera"
+          @update-camera="updateCamera"
+          @focus="$refs.viewport.focusView()"
+        />
 
         <AiComposer
+          v-if="!previewMode"
           :sending="aiSending"
           :settings="aiSettings"
           @send="sendAi"
@@ -87,13 +101,23 @@
           @open-settings="$store.commit('setAiSettingsOpen', true)"
         />
 
-        <div v-if="tool !== 'select'" class="stage-hint">
+        <div v-if="!previewMode && tool !== 'select'" class="stage-hint">
           <span>{{ toolHint }}</span>
           <button type="button" class="btn btn--ghost" @click="setTool('select')">退出工具</button>
         </div>
+
+        <!-- 预演 HUD：告诉用户"这是成片画幅"，并给一个明确的退出入口。 -->
+        <div v-if="previewMode" class="preview-hud" role="status">
+          <span class="preview-hud__badge">成片预演</span>
+          <span class="preview-hud__meta">
+            {{ camera.aspectWidth }}:{{ camera.aspectHeight }} ·
+            {{ Math.round(camera.fovDegrees) }}°
+          </span>
+          <button type="button" class="btn" @click="setPreviewMode(false)">退出预演 (Esc)</button>
+        </div>
       </main>
 
-      <aside class="editor-sidebar">
+      <aside v-if="!previewMode" class="editor-sidebar">
         <AssetPanel
           :objects="objects"
           :lights="lighting.lights"
@@ -266,6 +290,8 @@ export default {
     return {
       quickBuildKind: 'wall',
       playbackTimer: null,
+      /** 播放是否循环（仅成片预演会开启）。 */
+      playbackLoop: false,
       importedModels: new Map(),
       // 只用来给 diagnosticsErrorCount 提供响应式依赖，值本身无意义。
       diagnosticsTick: 0,
@@ -337,6 +363,9 @@ export default {
     },
     cameraViewMode() {
       return this.$store.state.cameraViewMode
+    },
+    previewMode() {
+      return this.$store.state.previewMode
     },
     cameraSelected() {
       return this.$store.state.cameraSelected
@@ -466,7 +495,14 @@ export default {
      * 用户会看到画面突然飞到一个莫名其妙的角度（之前就是这个症状）。
      */
     displayedCamera() {
-      if (this.timelinePlaying || this.timelineTime > 0) {
+      /*
+       * 预演必须**总是**走时间轴求值，不能只看 `timelineTime > 0`。
+       *
+       * 预演是从某一时刻开始的（通常是 0），如果它一开始停在 0，
+       * 那"是否求值"就会在 0 和 0.01 之间反复跳，相机在两种来源间切换，
+       * 画面会抖。预演期间统一由时间轴说了算，语义也更干净。
+       */
+      if (this.previewMode || this.timelinePlaying || this.timelineTime > 0) {
         return evaluateTimelineAtTime(this.timeline, this.camera, this.timelineTime).camera
       }
       return this.camera
@@ -490,6 +526,24 @@ export default {
         this.syncImportedMeshes()
       },
       deep: false
+    },
+    /*
+     * 进出预演时自动起停播放。
+     *
+     * 预演的意义就是"完整看一遍成片"，进去还得手动点播放是多余的。
+     * 退出时必须停掉——否则用户回到编辑态，播放头还在后台跑，
+     * 场景里的物体会一直动，看起来像"编辑状态坏了"。
+     */
+    previewMode(active) {
+      if (active) {
+        // 从头播，保证每次预演看到的都是完整成片。
+        this.$store.commit('setTimelineTime', 0)
+        this.startPlayback({ loop: true })
+        return
+      }
+      this.stopPlayback()
+      // 退出预演回到 0 时刻的编辑态，避免停在成片的某一帧上。
+      this.$store.commit('setTimelineTime', 0)
     }
   },
 
@@ -498,10 +552,12 @@ export default {
     this.diagnosticsTimer = window.setInterval(() => {
       this.diagnosticsTick += 1
     }, 2000)
+    window.addEventListener('keydown', this.handleGlobalKey)
   },
 
   beforeDestroy() {
     this.stopPlayback()
+    window.removeEventListener('keydown', this.handleGlobalKey)
     if (this.diagnosticsTimer) window.clearInterval(this.diagnosticsTimer)
   },
 
@@ -519,6 +575,30 @@ export default {
     },
     toggleTheme() {
       this.$store.commit('setTheme', this.theme === 'dark' ? 'light' : 'dark')
+    },
+
+    /**
+     * 进入 / 退出成片预演。
+     *
+     * 状态写在 store 里，因为"是否在预演"要影响多处：
+     * 顶栏高亮、视口渲染路径、时间轴自动循环、编辑面板收起。
+     * 放在组件 data 里的话，别的组件想读就得靠 prop 一层层传。
+     */
+    setPreviewMode(active) {
+      this.$store.commit('setPreviewMode', active)
+    },
+
+    /**
+     * 全局快捷键：预演时按 Esc 退出。
+     *
+     * 预演是全屏观看，鼠标可能不在任何按钮上；没有快捷键的话
+     * 用户得先找到顶栏那个按钮才能退出来。
+     */
+    handleGlobalKey(event) {
+      if (event.key !== 'Escape') return
+      if (!this.previewMode) return
+      event.preventDefault()
+      this.setPreviewMode(false)
     },
 
     // ------------------------------------------------------------------
@@ -1128,18 +1208,34 @@ export default {
       this.startPlayback()
     },
 
-    startPlayback() {
+    /**
+     * 开始播放时间轴。
+     *
+     * `loop` 只给成片预演用：预演是"看整段成片"，放完不该停在一个定格的尾帧上。
+     * 循环时把计时基准重置到当前轮起点，而不是让 `elapsed` 无限增长——
+     * 后者在播放几小时后会让浮点数精度明显下降，且 `startTime + elapsed`
+     * 一旦超出 duration 就需要取模，反而更容易算错。
+     */
+    startPlayback({ loop = false } = {}) {
       this.$store.commit('setTimelinePlaying', true)
+      if (this.playbackTimer) cancelAnimationFrame(this.playbackTimer)
+      this.playbackLoop = loop
       const duration = this.timeline.durationSeconds
-      const startedAt = performance.now()
-      const startTime = this.timelineTime >= duration ? 0 : this.timelineTime
+      let startedAt = performance.now()
+      let startTime = this.timelineTime >= duration ? 0 : this.timelineTime
       const step = () => {
         const elapsed = (performance.now() - startedAt) / 1000
-        const next = startTime + elapsed
+        let next = startTime + elapsed
         if (next >= duration) {
-          this.$store.commit('setTimelineTime', duration)
-          this.stopPlayback()
-          return
+          if (!this.playbackLoop) {
+            this.$store.commit('setTimelineTime', duration)
+            this.stopPlayback()
+            return
+          }
+          // 循环：把超出部分接回开头，避免丢掉这一帧的时间。
+          next -= duration
+          startedAt = performance.now()
+          startTime = next
         }
         this.$store.commit('setTimelineTime', next)
         this.playbackTimer = requestAnimationFrame(step)
@@ -1151,6 +1247,7 @@ export default {
       this.$store.commit('setTimelinePlaying', false)
       if (this.playbackTimer) cancelAnimationFrame(this.playbackTimer)
       this.playbackTimer = null
+      this.playbackLoop = false
     },
 
     recordCameraShot() {
@@ -1399,6 +1496,39 @@ export default {
   min-width: 0;
   min-height: 0;
   background: var(--bg-0);
+}
+
+/*
+ * 预演 HUD 浮在视口左下角。
+ * 放左下是因为成片画面居中、四周是黑边，左下角几乎不会压到主体内容。
+ */
+.preview-hud {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: rgba(12, 15, 17, 0.82);
+  color: var(--text-0);
+  font-size: 12px;
+  backdrop-filter: blur(6px);
+}
+
+.preview-hud__badge {
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-strong);
+  color: #fff;
+  font-weight: 600;
+}
+
+.preview-hud__meta {
+  color: var(--text-2);
 }
 
 .editor-sidebar {

@@ -500,8 +500,22 @@ export default {
   overflow-x: hidden;
 }
 
+/*
+ * 轨道区的外边距。
+ *
+ * **这里只留 12px，不要再把 label-width 加进来。**
+ * 每个 `.lane` 内部本来就有一个宽 label-width 的 `.lane__label`，
+ * 之前 padding-left 又加了一次 —— 结果是标尺的 0 秒刻度落在
+ * labelWidth+12 处，而关键帧轨道的 0% 落在 2×labelWidth+20 处。
+ * 两者差一整个标签列，这就是"时间轴和下方物体的轴对不齐"的根因。
+ *
+ * 现在标尺通过 --lane-gutter 让出与 `.lane` 相同的"标签 + 间隙"，
+ * 两条轨道从同一个 x 起点开始。
+ */
 .timeline__track {
-  padding: 0 12px 8px calc(var(--label-width, 48px) + 12px);
+  --lane-gap: 8px;
+  --lane-gutter: calc(var(--label-width, 48px) + var(--lane-gap));
+  padding: 0 12px 8px 12px;
   display: flex;
   flex-direction: column;
 }
@@ -513,6 +527,8 @@ export default {
   cursor: pointer;
   /* 刻度标签贴着边缘时会溢出，裁掉才不会压到相邻区域。 */
   overflow: hidden;
+  /* 与 `.lane__track` 共用同一条起点（标签列 + 间隙）。 */
+  margin-left: var(--lane-gutter);
 }
 
 .ruler__tick {

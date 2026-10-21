@@ -244,6 +244,57 @@ web/
    几乎从不等于视口宽高比，只改渲染器会把画面横向拉伸——而文件结构完全合法，
    只验容器是发现不了的。
 
+**逐帧必须同时应用相机与物体**
+
+`evaluateTimelineAtTime()` 返回的是 `{ camera, objectTransforms }`。
+只把 `camera` 推给视口、把 `objectTransforms` 丢掉，产出就是
+**一张静止画面加轻微运镜**——文件合法、能播放、时长也对，唯独物体不动。
+这个错误曾在三条产物路径（MP4 / 序列帧 / 首尾帧）里同时存在，
+所以现在统一收口到一个 `renderFrameAt()`：
+
+```js
+const renderFrameAt = async (time) => {
+  const frame = evaluateTimelineAtTime(timeline, camera, time)
+  viewport.applyCameraState(frame.camera)     // 相机
+  viewport.applyTimelineFrame(timeline, time) // 物体（含人台姿势）
+}
+```
+
+`applyTimelineFrame()` 内部重新调 `applyTimelinePreview()`，把
+position / rotation / scale 写进 three.js 根节点，再 `scene.updateMatrixWorld(true)`。
+导出结束必须 `restoreObjectTransforms()`——**不能**用"时间轴 0 时刻"复位，
+因为 0 时刻自己也有键值，未必等于用户编辑时的状态。
+
+### 成片预演
+
+顶栏中间的 **「成片预演」** 把视口切成"看成片"模式：画面按相机画幅等比缩放后居中，
+四周补黑边，内容由**时间轴求值**的相机渲染，时间轴自动循环播放。按 `Esc` 或顶栏按钮退出。
+
+**为什么要跟导出共用一套逻辑**：预演的价值就是"导出前先看一眼"。如果它自己另写一套
+渲染路径，用户看到的和最终拿到的迟早会分叉，而这个差异只能在成片里才发现，反馈链路太长。
+所以三样东西是共享的：
+
+| 共享项 | 来源 |
+| --- | --- |
+| 相机位姿 | `evaluateTimelineAtTime()`（与导出逐帧同一个函数） |
+| 画幅比 | `cameraState.aspectWidth : aspectHeight`（与 `outputSize()` 同源） |
+| 哪些对象算"辅助" | `editorOverlays()` 一份清单 |
+
+`editorOverlays()` 收的是**只属于编辑器、不属于成片**的对象：
+`guideGroup`（摄影机模型/灯光示意）、`grid`、`pathGroup`（导航线）、
+控制柄 helper、选中框。后两个没有挂在 `guideGroup` 下，而是直接 `add` 到 scene——
+这正是之前"选中物体后导出的成片里带着橙色线框和箭头"的根因。
+收成一份清单后，导出、六通道参考图、预演共用，不会再各自漏一个。
+
+**渲染用 scissor，不改相机 aspect**。视口的物理宽高比由窗口决定，
+要显示 16:9 的成片只能在视口里框一块 16:9 的区域，其余留黑边——
+这就是所有剪辑软件预览窗的做法。
+
+**预演专用相机**：单开一台 `previewCamera`，不复用 `this.camera`。
+编辑相机归 OrbitControls 管，复用的话每帧都要写它的位姿，
+退出后视角就回不去了（还得存快照、还原、处理阻尼残量）。
+单开一台成本极低，也让"预演不许动编辑视角"成为结构性事实。
+
 ### 三条不可违反的边界
 
 1. **`src/core/` 不许依赖 Vue、Vuex、DOM。**
@@ -376,6 +427,17 @@ npm rebuild <package-name>
 | **导出的视频体积是 0 或打不开** | moov 索引表被写到文件末尾，部分播放器/平台判定为损坏 | muxer 开 `fastStart: 'in-memory'`，让 moov 在 mdat 之前 |
 | **导出画面被横向拉伸** | 只改了渲染器尺寸，没改 `camera.aspect` | 导出画幅几乎从不等于视口宽高比，必须同时 `camera.updateProjectionMatrix()`；见 `withOutputSize()` |
 | **导完视频后视口画面变形** | 临时改的 `camera.aspect` 没在 `finally` 里还原 | `withOutputSize()` 的 `finally` 同时还原 aspect / pixelRatio / 尺寸 |
+| **导出的视频只有静态画面，物体不动** | `evaluateTimelineAtTime()` 的 `objectTransforms` 算完就丢了，只应用了 `camera` | 三条产物路径统一走 `renderFrameAt()`：`applyCameraState()` + `applyTimelineFrame()` |
+| **导完视频场景停在最后一帧** | 逐帧改写了物体根节点的 position/rotation/scale，导出后没复位 | `finally` 里调 `restoreObjectTransforms()` 按 store 数据复位（不是用 0 时刻） |
+| **时间轴标尺和下方轨道的 0 点错开一截** | `.timeline__track` 加了 `padding-left: label-width+12`，而每条 `.lane` 里**又**有一个 `label-width` 宽的行首标签，等于算了两遍 | 抽 `--lane-gutter`（= label-width + gap），轨道只留 12px 内边距，标尺复用同一个 gutter |
+| **拖拽造物时镜头跟着一起转** | quick-build 分支排在相机/物体拾取**之后**，且从没关过 OrbitControls，同一次左键拖拽既铺墙又转镜头 | 把 quick-build 提前到拾取之前，并用 `beginExclusiveGesture()` 关掉 controls |
+| **松手后镜头再也转不动** | 拖拽中指针移出 canvas，`pointerup` 落在别处，解锁代码没跑到 | `setPointerCapture` 把后续事件路由回 canvas；再加 `endExclusiveGesture()` 在 `handlePointerUp` 各分支兜底 |
+| 验证脚本说"拖拽时镜头没转"，其实是假通过 | 合成 `new PointerEvent()` 没有真实 pointer 关联，OrbitControls 内部 `setPointerCapture` 直接抛错中断处理 | 改用 CDP `Input.dispatchMouseEvent` 发真实输入，并加**反向对照**：选择工具下同样拖拽必须能转镜头 |
+| **导出的成片里带着橙色选中框和箭头** | 控制柄 helper 与 `selectionBox` 是直接 `add` 到 scene 的，不在 `guideGroup` 里，导出只隐藏了 `guideGroup` | 收成 `editorOverlays()` 一份清单，导出 / 六通道图 / 预演共用 |
+| **预演时控制柄又出现了** | 进预演改变了 `cameraState` → 重建摄影机模型 → `rebuildCameraHelper()` 末尾又调 `attachTransformControls()` 挂回去 | 在 `attachTransformControls()` **入口**判断预演并直接返回，而不是只在 watch 里 detach 一次 |
+| **预演掉到个位数帧率** | 渲染路径里每帧调 `applyTheme()`，而它会 `remove + dispose` 网格再重建 | 只推 `renderer.setClearColor()`；网格重建只在主题真正变化时做 |
+| 预演退出后镜头转不动 | 进预演时禁用了 controls，退出时没解锁 | `previewActive` watch 的两条分支对称处理：进则 `detach`，出则 `attachTransformControls()` + `controls.enabled = true` |
+| 预演退出后场景停在某一帧 | 预演是循环播放，退出时播放头还在跑 | 退出时 `stopPlayback()` 并把 `timelineTime` 归 0 |
 | 导出的视频没有声音 | 本工具只产出画面，不处理音频 | 音频在剪辑环节叠加 |
 
 ### 6.1 用户侧：一键导出日志（不需要开 devtools）
@@ -437,6 +499,8 @@ node scripts\diagnose.cjs http://127.0.0.1:8181/editor
 | `verify-mannequin.cjs` | 人台 GLB 外观是否真的加载（网格/骨骼数）、切换动作是否换片段、动作是否跟时间轴走 |
 | `verify-nav-path.cjs` | 时间轴是否还溢出、能不能拖高度、画出的导航线是否进时间轴、绑定物体是否沿路径走 |
 | `verify-mp4-export.cjs` | **导出的 MP4 是不是合法容器**（ftyp/moov/mdat、moov 在 mdat 前、stsd 里的真实宽高）、首尾帧是否还在 |
+| `verify-export-fixes.cjs` | **导出到底有没有动画**（比首尾帧 PNG 字节）、标尺与轨道是否同一起点、真实输入拖拽造物时镜头会不会跟着转 |
+| `verify-preview.cjs` | 成片预演：相机是否走时间轴、画幅比对不对、退出后编辑视角有没有被污染、辅助对象是否清干净 |
 | `probe-codecs.cjs` | 本机浏览器到底支持哪些 H.264 profile（写死 codec 前先跑这个） |
 
 `verify-gizmo.cjs` 是这两个需求的最终判据：它从

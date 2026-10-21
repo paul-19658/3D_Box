@@ -82,6 +82,7 @@ import {
   adjacentSegmentsFor,
   closestPointOnSegmentsToRay
 } from '@/core/nav-path'
+import { applyTimelinePreview } from '@/core/timeline'
 import { record } from '@/core/diagnostics'
 import { FIXED_FILL_LIGHT, FIXED_HEMISPHERE_LIGHT } from '@/core/project-document'
 import { resolveShadowCasterIds } from '@/core/lighting-description'
@@ -147,6 +148,14 @@ export default {
     /** 是否显示"摄影机监视器"小窗。 */
     monitorOpen: { type: Boolean, default: false },
     /**
+     * 成片预演：视口不再渲染编辑视角，而是按成片画幅渲染场景摄影机。
+     *
+     * 预演必须与导出画面**同源**——同一台相机、同一套求值、同一份画幅。
+     * 否则用户看到的"预演"和最终导出的视频对不上，
+     * 而这个差异只能在拿到成片时才发现，反馈链路太长了。
+     */
+    previewActive: { type: Boolean, default: false },
+    /**
      * 时间轴当前时间（秒）。人台动作靠它驱动：
      * 与原版一致，播放头一动，所选动作的循环画面就跟着走。
      */
@@ -168,8 +177,12 @@ export default {
       // 监视器窗体的位置与尺寸。位置是相对视口左上角的像素值。
       monitorRect: { x: 0, y: 0, w: 268, h: 151 },
       monitorReady: false,
+      /** 预演画面在视口里的实际像素区域（其余部分是黑边），供探针读取。 */
+      previewRect: null,
       /** 导出进行中：暂停主渲染循环，避免与逐帧导出互相踩。 */
-      exporting: false
+      exporting: false,
+      /** 当前是否处于"手势独占"（拖拽造物 / 画线）——期间 OrbitControls 必须禁用。 */
+      exclusiveGestureActive: false
     }
   },
 
@@ -205,6 +218,27 @@ export default {
     monitorOpen(value) {
       if (value) this.$nextTick(() => this.initMonitor())
       else this.disposeMonitor()
+    },
+    /*
+     * 进出预演时收回编辑手柄。
+     *
+     * 控制柄与选中框会在预演期间被 `withEditorOverlaysHidden()` 临时隐藏，
+     * 但 gizmo 仍然"挂"在物体上、仍然会在 pointerdown 时抢事件。
+     * 预演里不该有任何可拖动的东西，所以直接把挂钩摘掉，
+     * 退出时再由 attachTransformControls 按当前选中恢复。
+     */
+    previewActive(active) {
+      if (active) {
+        // 预演期间禁止一切编辑手势：拾取会选中物体、拖拽会改数据。
+        this.controls.enabled = false
+        this.transformControls?.detach()
+        this.updateSelectionHelper()
+        return
+      }
+      // 退出预演必须解锁，否则用户会觉得"镜头忽然不能转了"。
+      this.controls.enabled = true
+      this.attachTransformControls()
+      this.updateSelectionHelper()
     },
     /*
      * 时间轴一动就重放人台动作。
@@ -309,6 +343,16 @@ export default {
       // 拖拽过程中只发预览，不写历史。
       this.transformControls.addEventListener('objectChange', () => this.emitTransform(false))
       scene.add(this.transformControls.getHelper())
+
+      /*
+       * 预演专用相机。
+       *
+       * 为什么不复用 `this.camera`：编辑相机归 OrbitControls 管，
+       * 复用的话每帧都要写它的位姿，用户退出预演后视角就回不去了
+       * （还得额外存快照、还原、处理阻尼残量）。
+       * 单开一台成本极低，也让"预演不许动编辑视角"成为结构性事实。
+       */
+      this.previewCamera = new THREE.PerspectiveCamera(45, 16 / 9, 0.1, 2000)
 
       this.raycaster = new THREE.Raycaster()
       this.pointer = new THREE.Vector2()
@@ -439,7 +483,12 @@ export default {
         // 导出会临时改 aspect 再还原。把它暴露出来，验证脚本才能确认
         // "导完视频视口没有变形"——这是最容易漏掉且最难靠肉眼发现的回归。
         aspect: round(this.camera.aspect),
-        fov: round(this.camera.fov)
+        fov: round(this.camera.fov),
+        // 造物/画线手势期间会临时禁用 OrbitControls。合成 PointerEvent
+        // 驱动不了 OrbitControls（它依赖真实 pointer capture），所以
+        // "镜头有没有被锁死"只能靠读这两个字段判断，不能靠模拟拖拽。
+        controlsEnabled: Boolean(this.controls && this.controls.enabled),
+        exclusiveGesture: Boolean(this.exclusiveGestureActive)
       }
     },
 
@@ -637,6 +686,32 @@ export default {
         selectedIds: [...this.selectedIds],
         cameraSelected: this.cameraSelected,
         transformMode: this.transformMode,
+        /*
+         * 成片预演状态。
+         *
+         * 验证脚本不能靠"截图看起来像成片"来判断——黑边和画幅比
+         * 在缩略图里根本分不出来。这里直接给出：
+         *   - active：是否在预演；
+         *   - rect：预演画面在视口里的真实像素区域（由 renderPreviewFrame 写入）；
+         *   - expectedRatio：相机预设的画幅比，用来核对 rect 有没有按画幅裁切；
+         *   - camera：预演相机的位姿（用它对比"是不是场景摄影机的那台"）。
+         */
+        preview: {
+          active: Boolean(this.previewActive),
+          rect: this.previewRect ? { ...this.previewRect } : null,
+          expectedRatio: this.cameraState.aspectWidth / this.cameraState.aspectHeight,
+          camera: this.previewCamera
+            ? {
+                position: {
+                  x: round(this.previewCamera.position.x),
+                  y: round(this.previewCamera.position.y),
+                  z: round(this.previewCamera.position.z)
+                },
+                fov: round(this.previewCamera.fov),
+                aspect: round(this.previewCamera.aspect)
+              }
+            : null
+        },
         gizmoAttached: Boolean(this.transformControls?.object),
         gizmoDragging: Boolean(this.transformControls?.dragging),
         gizmoAxis: this.transformControls?.axis ?? null,
@@ -1747,6 +1822,22 @@ export default {
       if (!this.ready) return
       const controls = this.transformControls
       controls.detach()
+      /*
+       * 预演期间**绝不**挂控制柄。
+       *
+       * 这一条必须在最前面，而不是只在 previewActive 的 watch 里 detach 一次。
+       * 原因：进入预演会让 `cameraState` 变成时间轴求值的相机，
+       * 而 `cameraState` 的 watcher 会重建摄影机模型，`rebuildCameraHelper()`
+       * 末尾又会调 `attachTransformControls()` —— 于是刚摘掉的控制柄
+       * 又被挂回去了，成片里出现一组箭头。
+       *
+       * 在函数入口拦住，比在每个调用点加条件可靠得多：
+       * 以后新增任何调用 `attachTransformControls()` 的地方都自动安全。
+       */
+      if (this.previewActive) {
+        this.updateSelectionHelper()
+        return
+      }
 
       // 选中摄影机时把控制柄挂到摄影机模型上。
       // 平移改机位；旋转改朝向（把旋转量折算成新的 target），两者都写回场景相机。
@@ -1945,6 +2036,39 @@ export default {
     },
 
     /**
+     * 进入"手势独占"：锁住 OrbitControls，并捕获指针。
+     *
+     * 为什么需要指针捕获：
+     * 拖拽造物/画线时，指针很容易移出 canvas 边界（尤其是拖到画面边缘时）。
+     * 一旦移出，`pointerup` 会落在别的元素上，canvas 收不到，
+     * `controls.enabled` 就永久停在 false —— 用户会觉得"镜头突然不能转了"，
+     * 而且不刷新页面恢复不了。
+     *
+     * `setPointerCapture` 把后续事件强制路由回 canvas，松手必定能收到。
+     */
+    beginExclusiveGesture(event) {
+      this.controls.enabled = false
+      this.exclusiveGestureActive = true
+      try {
+        this.$refs.canvas?.setPointerCapture?.(event.pointerId)
+      } catch {
+        // 合成事件没有真实 pointerId，捕获会失败；此时靠 pointerup 兜底即可。
+      }
+    },
+
+    /** 退出"手势独占"：解锁镜头并释放捕获。可重复调用。 */
+    endExclusiveGesture(event) {
+      if (!this.exclusiveGestureActive) return
+      this.exclusiveGestureActive = false
+      this.controls.enabled = true
+      try {
+        if (event) this.$refs.canvas?.releasePointerCapture?.(event.pointerId)
+      } catch {
+        // 没捕获过就没什么可释放的。
+      }
+    },
+
+    /**
      * 指针按下。
      *
      * 左键同时承担两件事：拖拽环绕镜头、点击选择物体。
@@ -1952,6 +2076,14 @@ export default {
      * 否则每次转动视角都会顺手把选中项清空——这是上一版最影响手感的问题。
      */
     handlePointerDown(event) {
+      /*
+       * 预演期间视口只负责"播放成片"，不接受任何编辑手势。
+       *
+       * 这一条必须放在最前面：否则左键拖拽会转动编辑相机（预演用的是
+       * 另一台相机，转了也看不出来），点击还会悄悄改动选中项——
+       * 用户退出预演时发现选中的东西变了，却找不到是什么时候点的。
+       */
+      if (this.previewActive) return
       if (event.button === 2) {
         // 右键交给 OrbitControls 做平移，不参与拾取。
         return
@@ -1964,13 +2096,13 @@ export default {
       this.updatePointer(event)
 
       /*
-       * 导航线绘制优先于一切拾取。
+       * 一、导航线绘制优先于一切拾取。
        *
        * 同时必须把 OrbitControls 关掉：否则按住左键画线时视角会跟着转，
        * 用户看到的是"线在乱飞"。松手时（handlePointerUp）再打开。
        */
       if (this.pathDraft) {
-        this.controls.enabled = false
+        this.beginExclusiveGesture(event)
         this.pathDrafting = true
         const point = this.pickGround()
         this.pathDraftNodes = point ? [{ x: point.x, y: 0, z: point.z }] : []
@@ -1978,14 +2110,35 @@ export default {
         return
       }
 
-      // 点在导航线节点球上：进入"沿路径滑动"拖拽。
+      /*
+       * 二、拖拽造物（quick-build）同样要"手势独占"。
+       *
+       * 这里必须排在摄影机 / 物体拾取**之前**，理由有两个：
+       *
+       * 1. 用户按下左键的意图是"拉出墙体/地面"，不是"选东西"。
+       *    如果先走拾取，一旦指针下方正好是摄影机模型或某个物体，
+       *    就会变成选中它，顺手把手势打断——表现是"拖一半就没了"。
+       * 2. 必须 `controls.enabled = false`。OrbitControls 的左键是 ROTATE，
+       *    不禁用的话同一次拖拽会同时铺墙和转镜头，
+       *    用户看到的是"墙在生成，画面却在打转"。
+       *
+       * 松手时在 handlePointerUp 里统一恢复。
+       */
+      if (this.tool === 'quick-build' && this.quickBuildDraft) {
+        this.beginExclusiveGesture(event)
+        const point = this.pickGround()
+        if (point) this.$emit('quick-build-start', { x: point.x, y: 0, z: point.z })
+        return
+      }
+
+      // 三、点在导航线节点球上：进入"沿路径滑动"拖拽。
       const pathNode = this.pickPathNode()
       if (pathNode) {
         this.startPathNodeDrag(pathNode)
         return
       }
 
-      // 摄影机与物体按"谁离镜头更近"决定选中谁。
+      // 四、摄影机与物体按"谁离镜头更近"决定选中谁。
       //
       // 不能让摄影机无条件优先：用户把方块挡在摄影机前面时，
       // 点方块应该选中方块。也不能让物体优先：摄影机的机身往往
@@ -2001,12 +2154,6 @@ export default {
 
       if (cameraPoint && cameraDistance <= objectDistance) {
         this.$emit('camera-select')
-        return
-      }
-
-      if (this.tool === 'quick-build' && this.quickBuildDraft) {
-        const point = this.pickGround()
-        if (point) this.$emit('quick-build-start', { x: point.x, y: 0, z: point.z })
         return
       }
 
@@ -2251,7 +2398,7 @@ export default {
 
       if (this.pathDrafting) {
         this.pathDrafting = false
-        this.controls.enabled = true
+        this.endExclusiveGesture(event)
         this.updatePointer(event)
         const point = this.pickGround()
         if (point) this.appendPathDraftPoint({ x: point.x, y: 0, z: point.z })
@@ -2264,9 +2411,21 @@ export default {
       if (this.tool === 'quick-build' && this.quickBuildDraft) {
         this.updatePointer(event)
         const point = this.pickGround()
+        // 拖拽造物期间视角被锁住了，松手必须解锁，否则用户再也转不动镜头。
+        this.endExclusiveGesture(event)
         if (point) this.$emit('quick-build-end', { x: point.x, y: 0, z: point.z })
         return
       }
+
+      /*
+       * 兜底解锁。
+       *
+       * 正常情况下 quick-build / 画线分支已经在上面 return 掉了。
+       * 但如果用户在手势中切走了工具、或组件在拖拽途中被销毁，
+       * 这里必须把"手势独占"清掉——否则 OrbitControls 会一直是 disabled，
+       * 表现为"镜头彻底不能转"，而且没有任何提示，用户只能刷新页面。
+       */
+      this.endExclusiveGesture(event)
 
       // 拖拽过视角就不再重复拾取：松开鼠标时镜头已经移动，
       // 按当前位置再拾一次会误选到扫过的物体，体验上像是"乱选"。
@@ -2314,6 +2473,26 @@ export default {
       // 节点球按相机距离缩放：每帧一次很便宜（几个球），
       // 但缺了它拖动视角时节点大小会"随距离呼吸"，很难点中。
       if (this.pathGroup?.children.length) this.updatePathNodeScale()
+
+      /*
+       * 成片预演：不走编辑视角，按成片画幅渲染场景摄影机。
+       *
+       * 这里刻意**复用导出时的同一套东西**：
+       *   - 相机位姿来自 `cameraState`（父组件已用时间轴求值过）；
+       *   - 画幅来自 `aspectWidth : aspectHeight`（与 outputSize 同源）；
+       *   - 辅助对象用 `withEditorOverlaysHidden()`（与导出共用一个清单）。
+       * 所以"预演看到的"和"导出得到的"是同一张图，只是尺寸不同。
+       *
+       * 为什么用 scissor 而不是把相机 aspect 改成画幅：
+       * 视口的物理宽高比是固定的（用户窗口决定）。要显示 16:9 的成片，
+       * 只能"在视口里框出一块 16:9 的区域"，其余部分留黑边——
+       * 这正是所有剪辑软件的预览窗做法。
+       */
+      if (this.previewActive) {
+        this.renderPreviewFrame()
+        return
+      }
+
       this.renderer.render(this.scene, this.camera)
 
       // 监视器跟随主循环一起刷新。
@@ -2321,6 +2500,60 @@ export default {
       // 相机位姿每帧都可能被时间轴或 gizmo 改动，逐帧渲染最省心。
       // 窗口未打开时 monitorReady 为 false，这里是一次布尔判断，开销可忽略。
       if (this.monitorReady) this.renderMonitor()
+    },
+
+    /**
+     * 渲染一帧成片预演。
+     *
+     * 布局：画面按成片画幅等比缩放后居中，四周补黑边。
+     * 渲染内容与导出完全一致——不只是一台相机，连"哪些对象算辅助"
+     * 都走同一个 `editorOverlays()` 清单。
+     */
+    renderPreviewFrame() {
+      const renderer = this.renderer
+      if (!renderer) return
+      const camera = this.previewCamera
+      if (!camera) return
+
+      const state = this.cameraState
+      const ratio = state.aspectWidth / state.aspectHeight
+      const size = renderer.getSize(new THREE.Vector2())
+      const maxWidth = size.x * 0.96
+      const maxHeight = size.y * 0.96
+      const width = Math.round(Math.min(maxWidth, maxHeight * ratio))
+      const height = Math.round(width / ratio)
+      const left = Math.round((size.x - width) / 2)
+      const bottom = Math.round((size.y - height) / 2)
+      this.previewRect = { left, bottom, width, height }
+
+      // 相机与监视器同一套取位逻辑：position / target / fov / 画幅。
+      camera.position.set(state.position.x, state.position.y, state.position.z)
+      camera.up.set(0, 1, 0)
+      camera.lookAt(state.target.x, state.target.y, state.target.z)
+      camera.fov = state.fovDegrees
+      camera.aspect = ratio
+      camera.updateProjectionMatrix()
+
+      renderer.setScissorTest(false)
+      // 黑边用中性深色，浅色主题下也不会刺眼。
+      renderer.setClearColor(0x0b0e10, 1)
+      renderer.clear()
+      renderer.setViewport(left, bottom, width, height)
+      renderer.setScissor(left, bottom, width, height)
+      renderer.setScissorTest(true)
+      this.withEditorOverlaysHidden(() => renderer.render(this.scene, camera))
+      renderer.setScissorTest(false)
+      renderer.setViewport(0, 0, size.x, size.y)
+      /*
+       * 恢复主题清屏色。
+       *
+       * **不能调 `applyTheme()`**：它内部会 `remove + dispose` 旧网格、
+       * 再 `createGrid()` 建一个新的。放在每帧调用的渲染路径里，
+       * 等于每帧重建一次网格几何与材质——预演会立刻掉到个位数帧率，
+       * 而且显存在持续分配与释放。
+       * 这里只需要把清屏色推回主题值，一行就够。
+       */
+      renderer.setClearColor(this.theme === 'dark' ? 0x080a0c : 0xf4f6f7, 1)
     },
 
     // ------------------------------------------------------------------
@@ -2564,7 +2797,16 @@ export default {
       const originalFog = scene.fog
       const originalOverride = scene.overrideMaterial
       const originalGround = this.ground.visible
-      const guideVisibility = this.guideGroup.visible
+      /*
+       * 六通道图同样必须清掉编辑辅助。
+       *
+       * 这里之前手写 `guideGroup.visible = false`，漏掉了控制柄与选中框
+       * （它们直接挂在 scene 上，不在 guideGroup 里）。参考图是喂给 AI 的，
+       * 带着橙色选框和箭头会让模型把"编辑器 UI"当成场景内容学进去。
+       * 复用 editorOverlays() 这份清单，就不会再各漏一个。
+       */
+      const overlays = this.editorOverlays()
+      const overlayVisibility = overlays.map((overlay) => overlay.visible)
       // 相机的宽高比也要跟着导出尺寸走，否则六通道图会被横向拉伸。
       const originalAspect = camera.aspect
       const size = outputSize(this.cameraState, maxDimension)
@@ -2580,7 +2822,7 @@ export default {
       const idMaterials = new Map()
 
       try {
-        this.guideGroup.visible = false
+        for (const overlay of overlays) overlay.visible = false
         renderer.setPixelRatio(1)
         renderer.setSize(size.width, size.height, false)
         camera.aspect = size.width / size.height
@@ -2647,7 +2889,9 @@ export default {
         scene.fog = originalFog
         scene.overrideMaterial = originalOverride
         this.ground.visible = originalGround
-        this.guideGroup.visible = guideVisibility
+        overlays.forEach((overlay, index) => {
+          overlay.visible = overlayVisibility[index]
+        })
         camera.aspect = originalAspect
         camera.updateProjectionMatrix()
         renderer.setPixelRatio(originalPixelRatio)
@@ -2739,6 +2983,42 @@ export default {
      * 之前的 `renderToSize` 就漏了这一句：720×406 的视频里，
      * 方块看起来比编辑时胖了一圈。
      */
+    /**
+     * 收集"只属于编辑器、不属于成片"的对象。
+     *
+     * 为什么要单独收一份清单，而不是继续手写 `guideGroup.visible = false`：
+     * 有两个辅助对象**没有**挂在 guideGroup 下，而是直接 add 到 scene：
+     *
+     *   - 控制柄：`scene.add(this.transformControls.getHelper())`
+     *   - 选中框：`scene.add(this.selectionBox)`
+     *
+     * 之前导出只隐藏了 guideGroup / grid / pathGroup，于是"选中一个物体后
+     * 导出的成片里会带着一个橙色线框和一组箭头"。这个 bug 很难自查：
+     * 用户会以为是自己没取消选中，而导出的那一刻根本没机会看到。
+     * 收成一份清单后，导出与预演共用，不会再各自漏一个。
+     */
+    editorOverlays() {
+      const overlays = [this.guideGroup, this.grid, this.pathGroup]
+      const gizmoHelper = this.transformControls?.getHelper?.()
+      if (gizmoHelper) overlays.push(gizmoHelper)
+      if (this.selectionBox) overlays.push(this.selectionBox)
+      return overlays.filter(Boolean)
+    },
+
+    /** 临时隐藏所有编辑辅助，跑完自动还原。 */
+    withEditorOverlaysHidden(run) {
+      const overlays = this.editorOverlays()
+      const visibility = overlays.map((overlay) => overlay.visible)
+      for (const overlay of overlays) overlay.visible = false
+      try {
+        return run()
+      } finally {
+        overlays.forEach((overlay, index) => {
+          overlay.visible = visibility[index]
+        })
+      }
+    },
+
     withOutputSize(width, height, run) {
       const renderer = this.renderer
       const camera = this.camera
@@ -2747,26 +3027,19 @@ export default {
       const originalSize = renderer.getSize(new THREE.Vector2())
       const originalPixelRatio = renderer.getPixelRatio()
       const originalAspect = camera.aspect
-      const guideVisibility = this.guideGroup.visible
-      const gridVisibility = this.grid.visible
-      const pathVisibility = this.pathGroup?.visible
 
       try {
-        // 辅助图形（灯光标记、网格轴线、导航线）不应出现在导出画面里。
-        this.guideGroup.visible = false
-        this.grid.visible = false
-        if (this.pathGroup) this.pathGroup.visible = false
-
         renderer.setPixelRatio(1)
         renderer.setSize(width, height, false)
         camera.aspect = width / height
         camera.updateProjectionMatrix()
-        renderer.render(this.scene, camera)
-        return run(renderer.domElement, { width, height })
+        // 辅助图形（灯光标记、网格轴线、导航线、控制柄、选中框）
+        // 一律不进导出画面。清单见 editorOverlays()。
+        return this.withEditorOverlaysHidden(() => {
+          renderer.render(this.scene, camera)
+          return run(renderer.domElement, { width, height })
+        })
       } finally {
-        this.guideGroup.visible = guideVisibility
-        this.grid.visible = gridVisibility
-        if (this.pathGroup) this.pathGroup.visible = pathVisibility
         camera.aspect = originalAspect
         camera.updateProjectionMatrix()
         renderer.setPixelRatio(originalPixelRatio)
@@ -2777,6 +3050,64 @@ export default {
     renderToSize(maxDimension, read) {
       const size = outputSize(this.cameraState, maxDimension)
       return this.withOutputSize(size.width, size.height, (canvas) => read(canvas, size))
+    },
+
+    /**
+     * 按 store 里的原始数据复位所有物体节点。
+     *
+     * 导出流程会逐帧改写物体变换；导出结束后必须还原，
+     * 否则场景会停在最后一帧，用户会以为"导出把场景改坏了"。
+     */
+    restoreObjectTransforms() {
+      if (!this.ready || !this.rootMap) return
+      for (const object of this.objects) {
+        const root = this.rootMap.get(object.id)
+        if (!root) continue
+        this.applyObjectTransform(root, object)
+      }
+      this.scene?.updateMatrixWorld(true)
+      this.updateSelectionHelper()
+    },
+
+    /**
+     * 把时间轴某一时刻的**完整状态**应用到视口：相机位姿 + 所有物体变换。
+     *
+     * 这是导出流程的核心，也是最容易漏的一步。
+     *
+     * 之前的实现只有 `applyCameraState(frame.camera)`，
+     * 算出来的 `frame.objectTransforms` 从头到尾没人用——
+     * 于是每一帧的相机在动、物体却始终停在编辑时的位置，
+     * 导出来的视频就是"一张静态图配上轻微运镜"。
+     *
+     * 物体变换不能只改 store（那会触发重建、并且污染编辑态数据），
+     * 必须直接写 three.js 节点的 position / rotation / scale。
+     * 这里复用 `applyTimelinePreview`，保证与编辑时的预览走**同一套求值逻辑**，
+     * 否则"所见"和"所得"迟早会分叉。
+     */
+    applyTimelineFrame(timeline, timeSeconds) {
+      if (!this.ready || !this.rootMap) return
+      const objects = applyTimelinePreview(this.objects, timeline, timeSeconds)
+      for (const object of objects) {
+        const root = this.rootMap.get(object.id)
+        if (!root) continue
+        root.position.set(object.position.x, object.position.y, object.position.z)
+        root.rotation.set(
+          THREE.MathUtils.degToRad(object.rotation.x),
+          THREE.MathUtils.degToRad(object.rotation.y),
+          THREE.MathUtils.degToRad(object.rotation.z)
+        )
+        root.scale.set(object.size.x, object.size.y, object.size.z)
+        // 人台还要重放姿势，否则动作永远是静止的定格。
+        if (object.kind === 'mannequin' && object.mannequin) {
+          applyMannequinPose(
+            root,
+            object.mannequin.pose,
+            mannequinVisualState(object.mannequin, timeSeconds)
+          )
+        }
+      }
+      // 手动刷新矩阵：导出是逐帧手动 render，没有主循环帮我们更新世界矩阵。
+      this.scene.updateMatrixWorld(true)
     },
 
     /**

@@ -292,6 +292,18 @@ py -3.10 -m app.smoke http://127.0.0.1:8000   # 需要后端已启动
 | 把导航线节点做成自由三轴平移 | 破坏"节点沿路径走"的语义 | 用自定义射线投影拖拽，节点只能沿折线滑动 |
 | 给导航线也建 `rootMap` 根节点 | 选区框围着一个零尺寸盒子，看起来像误选中 | 导航线不建根节点，可视化全交给 `pathGroup` |
 | 导航线出现在导出模型里 | 导出只取 `objectGroup`，但辅助线也进了画面 | 路径单独放 `pathGroup`；`renderToSize` 期间隐藏它 |
+| **导出的视频只有静态画面** | `evaluateTimelineAtTime()` 的 `objectTransforms` 算完就丢，只应用了 `camera` | 三条产物路径统一走 `renderFrameAt()`：`applyCameraState()` + `applyTimelineFrame()` |
+| **导完视频场景停在最后一帧** | 逐帧改写了物体根节点的变换，导出后没复位 | `finally` 里 `restoreObjectTransforms()` 按 store 数据复位（**不能**用 0 时刻，那时自己也有键值） |
+| **标尺与轨道的 0 点错开** | `.timeline__track` 加了 `padding-left: label-width+12`，而每条 `.lane` 内**又**有一个 `label-width` 宽的行首标签，等于算两遍 | 抽 `--lane-gutter`（label-width + gap），轨道只留 12px 内边距，标尺复用同一 gutter |
+| **拖拽造物时镜头跟着转** | quick-build 分支排在拾取**之后**，且从没关过 OrbitControls，同一次左键既铺墙又转镜头 | quick-build 提到拾取之前，并 `beginExclusiveGesture()` 关掉 controls |
+| **松手后镜头再也转不动** | 指针拖出 canvas 后 `pointerup` 落在别处，解锁代码没跑到 | `setPointerCapture` 把事件路由回 canvas；`handlePointerUp` 各分支用 `endExclusiveGesture()` 兜底 |
+| **用合成 PointerEvent 验证"镜头没转"** | 合成事件没有真实 pointer 关联，OrbitControls 内部 `setPointerCapture` 抛错中断，于是"没转"既可能是隔离生效也可能是事件被打断 | 改用 CDP `Input.dispatchMouseEvent` 发真实输入；并加反向对照——选择工具下同样拖拽必须**能**转镜头 |
+| **导出的成片里有橙色选中框和箭头** | 控制柄 helper 与 `selectionBox` 直接挂在 `scene` 上，不在 `guideGroup` 里；导出只隐藏了 `guideGroup` | 收成 `editorOverlays()` 清单，导出 / 六通道图 / 预演共用同一份 |
+| **进了预演，控制柄又冒出来** | 预演会改 `cameraState` → 重建摄影机模型 → `rebuildCameraHelper()` 末尾又 `attachTransformControls()` | 在 `attachTransformControls()` 的**入口**判断预演并 return，别只在 watch 里 detach |
+| **预演帧率掉到个位数** | 渲染路径每帧调 `applyTheme()`，它内部会 `dispose` 网格再重建 | 每帧只推 `renderer.setClearColor()`；网格重建只在主题真变时做 |
+| **预演退出后镜头转不动** | 进预演禁用了 controls，退出时忘了解锁 | `previewActive` 的 watch 两侧对称：进则 detach + 禁用，出则 attach + 解锁 |
+| 预演退出后停在某一帧 | 预演是循环播放，退出时播放头还在跑 | 退出时 `stopPlayback()`，并把 `timelineTime` 归 0 |
+| **在 `data()` 里存"当前面板"** | 顶栏自己记 `panel`，别的组件读不到，也就无法被"按 Esc 退出"这类外部动作驱动 | "是否在预演"放 store；顶栏改成受控 prop + `select-panel` 事件 |
 
 ### 关于第一条：为什么 `template:` 字符串会静默失败
 

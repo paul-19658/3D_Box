@@ -75,6 +75,13 @@ export default new Vuex.Store({
     monitorOpen: false,
 
     cameraViewMode: 'none',
+    /**
+     * 成片预演：视口不再显示编辑视角，而是以成片画幅渲染场景摄影机。
+     *
+     * 与 `cameraViewMode` 刻意分开：后者是"临时切到某台摄影机看一眼"，
+     * 前者是"完整播放成片"。预演期间编辑工具、辅助线、拾取全部关闭。
+     */
+    previewMode: false,
 
     notices: [],
     busy: false,
@@ -185,6 +192,23 @@ export default new Vuex.Store({
     },
     setCameraViewMode(state, mode) {
       state.cameraViewMode = mode
+    },
+    /**
+     * 进出"成片预演"。
+     *
+     * 进入预演会顺手清掉编辑态的临时视图：切割平面、导航线草稿、
+     * 建模草稿都不该出现在成片里。这些状态留着不会自己消失，
+     * 用户退出预演后会看到一个"莫名其妙的切割面"，很难联想到是预演留下的。
+     */
+    setPreviewMode(state, active) {
+      state.previewMode = Boolean(active)
+      if (!state.previewMode) return
+      state.tool = 'select'
+      state.cutTool = null
+      state.quickBuildDraft = null
+      state.pathDraft = null
+      state.selectedPathNode = null
+      state.modelingDraft = null
     },
     setInspectorTarget(state, target) {
       state.inspectorTarget = target

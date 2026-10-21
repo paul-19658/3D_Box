@@ -73,20 +73,24 @@
       </div>
     </div>
 
-    <div class="topbar__center">
+    <div class="topbar__center" role="tablist" aria-label="工作模式">
       <button
         type="button"
+        role="tab"
         class="pill"
-        :class="{ 'is-active': panel === 'scene' }"
-        @click="setPanel('scene')"
+        :class="{ 'is-active': !previewActive }"
+        :aria-selected="!previewActive"
+        @click="$emit('select-panel', 'scene')"
       >
         场景调度
       </button>
       <button
         type="button"
+        role="tab"
         class="pill"
-        :class="{ 'is-active': panel === 'preview' }"
-        @click="setPanel('preview')"
+        :class="{ 'is-active': previewActive }"
+        :aria-selected="previewActive"
+        @click="$emit('select-panel', 'preview')"
       >
         成片预演
       </button>
@@ -159,12 +163,20 @@ export default {
     canRedo: { type: Boolean, default: false },
     theme: { type: String, default: 'dark' },
     /** 已捕获的错误条数，用来提示"这里可以导出日志"。 */
-    errorCount: { type: Number, default: 0 }
+    errorCount: { type: Number, default: 0 },
+    /**
+     * 是否处于"成片预演"。
+     *
+     * 这个状态由 store 持有、从父组件传进来，而不是顶栏自己记。
+     * 因为进入预演要做的事远不止换个高亮：视口要切成成片画幅、
+     * 时间轴要自动循环、编辑工具要全部收起。顶栏只是"开关的把手"，
+     * 真正的状态必须能被别处读取和驱动（例如按 Esc 退出预演）。
+     */
+    previewActive: { type: Boolean, default: false }
   },
 
   data() {
     return {
-      panel: 'scene',
       menuOpen: false,
       fileMenuOpen: false
     }
@@ -178,9 +190,6 @@ export default {
     },
     blurName(event) {
       event.target.blur()
-    },
-    setPanel(panel) {
-      this.panel = panel
     },
     pick(action) {
       this.menuOpen = false

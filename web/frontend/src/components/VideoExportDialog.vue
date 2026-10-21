@@ -291,6 +291,20 @@ export default {
       // 编码期间暂停主渲染循环，避免两处同时改渲染器尺寸。
       this.viewport.setExporting(true)
 
+      /*
+       * 逐帧渲染的统一步骤：把该时刻的相机与**所有物体**都摆到位，再取像素。
+       *
+       * 抽出来是因为三条产物路径（MP4 / 序列帧 / 首尾帧）必须走完全一样的
+       * 求值与应用流程。之前 MP4 与序列帧这两条只应用了相机，
+       * 物体变换算完就丢了，导出结果自然是一张静止画面。
+       */
+      const renderFrameAt = async (time) => {
+        const frame = evaluateTimelineAtTime(this.timeline, this.camera, time)
+        this.viewport.applyCameraState(frame.camera)
+        this.viewport.applyTimelineFrame(this.timeline, time)
+        return frame
+      }
+
       try {
         if (this.withVideo && this.support.ok) {
           this.progress = { done: 0, total: plan.totalFrames, label: '编码' }
@@ -306,9 +320,7 @@ export default {
           })
           try {
             for (let index = 0; index < plan.totalFrames; index += 1) {
-              const time = plan.sourceTimeSeconds(index)
-              const frame = evaluateTimelineAtTime(this.timeline, this.camera, time)
-              this.viewport.applyCameraState(frame.camera)
+              await renderFrameAt(plan.sourceTimeSeconds(index))
               this.viewport.captureFrameToCanvas(canvas, width, height)
               await session.addFrame(canvas, index)
               this.progress.done = index + 1
@@ -327,9 +339,7 @@ export default {
         if (this.withSequence) {
           this.progress = { done: 0, total: plan.totalFrames, label: '序列帧' }
           for (let index = 0; index < plan.totalFrames; index += 1) {
-            const time = plan.sourceTimeSeconds(index)
-            const frame = evaluateTimelineAtTime(this.timeline, this.camera, time)
-            this.viewport.applyCameraState(frame.camera)
+            await renderFrameAt(plan.sourceTimeSeconds(index))
             const base64 = this.viewport.captureImageBase64(this.maxDimension)
             const blob = this.dataUrlToBlob(`data:image/png;base64,${base64}`)
             const fileName = `${prefix}_frame_${String(index).padStart(4, '0')}.png`
@@ -346,8 +356,7 @@ export default {
             ['first', 0],
             ['last', this.timeline.durationSeconds]
           ]) {
-            const frame = evaluateTimelineAtTime(this.timeline, this.camera, time)
-            this.viewport.applyCameraState(frame.camera)
+            await renderFrameAt(time)
             const base64 = this.viewport.captureImageBase64(this.maxDimension)
             files.push(await api.exports.save(`${prefix}_${label}.png`, base64))
             done += 1
@@ -365,6 +374,16 @@ export default {
       } finally {
         this.viewport.setExporting(false)
         this.viewport.applyCameraState(originalCamera)
+        /*
+         * 把物体摆回编辑时的位置。
+         *
+         * 导出过程会逐帧改写物体节点的 position / rotation / scale。
+         * 不复位的话，导完视频场景就停在最后一帧上——用户会以为
+         * "导出把场景改坏了"。用时间轴求值取 0 时刻是不行的：
+         * 0 时刻也有自己的关键帧值，未必等于编辑态。
+         * 所以直接按 store 里的原始数据复位。
+         */
+        this.viewport.restoreObjectTransforms()
         this.progress = { done: 0, total: 0, label: '' }
         this.busy = false
       }
