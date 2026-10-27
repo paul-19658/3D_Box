@@ -303,3 +303,84 @@ export function summarizeScene(scene) {
   }
   return lines.join('\n')
 }
+
+function findSceneObject(objects, id, name) {
+  if (id) {
+    const byId = objects.find((object) => object.id === id)
+    if (byId) return byId
+  }
+  if (name) {
+    const exact = objects.find((object) => object.name === name)
+    if (exact) return exact
+    const normalized = name.replace(/\s+/g, '').toLowerCase()
+    const loose = objects.find(
+      (object) => object.name.replace(/\s+/g, '').toLowerCase() === normalized
+    )
+    if (loose) return loose
+    return objects.find((object) => object.name.includes(name)) || null
+  }
+  return null
+}
+
+/**
+ * Agent tool：分页列出资产（不截断到 40）。
+ * @returns {{ total, offset, limit, items }}
+ */
+export function listAssets(scene, options = {}) {
+  const objects = scene?.objects || []
+  const offset = Math.max(0, Math.floor(Number(options.offset) || 0))
+  const limit = Math.min(200, Math.max(1, Math.floor(Number(options.limit) || 100)))
+  const items = objects.slice(offset, offset + limit).map((object) => ({
+    id: object.id,
+    name: object.name,
+    kind: object.kind,
+    kindLabel: KIND_LABELS[object.kind] || object.kind,
+    visible: object.visible !== false,
+    locked: Boolean(object.locked),
+    color: object.color || null
+  }))
+  return { total: objects.length, offset, limit, items }
+}
+
+/**
+ * Agent tool：单个物体完整详情（含颜色、变换、人台等）。
+ */
+export function getObjectDetail(scene, { id, name } = {}) {
+  const objects = scene?.objects || []
+  const object = findSceneObject(objects, id, name)
+  if (!object) {
+    return { found: false, message: `找不到物体：${name || id || '未指定'}` }
+  }
+  const detail = {
+    found: true,
+    id: object.id,
+    name: object.name,
+    kind: object.kind,
+    kindLabel: KIND_LABELS[object.kind] || object.kind,
+    description: object.description || null,
+    visible: object.visible !== false,
+    locked: Boolean(object.locked),
+    color: object.color || null,
+    position: { ...object.position },
+    rotation: { ...object.rotation },
+    size: { ...object.size }
+  }
+  if (object.kind === 'mannequin' && object.mannequin) {
+    detail.mannequin = {
+      heightMeters: object.mannequin.heightMeters,
+      presetId: object.mannequin.presetId || null,
+      manualJoints: object.mannequin.manualJoints ? [...object.mannequin.manualJoints] : []
+    }
+  }
+  if (object.kind === PATH_KIND) {
+    detail.pathNodeCount = object.pathNodes?.length ?? 0
+  }
+  if (object.pathBinding) {
+    const path = objects.find((item) => item.id === object.pathBinding.pathId)
+    detail.pathBinding = {
+      pathId: object.pathBinding.pathId,
+      pathName: path ? path.name : null
+    }
+  }
+  return detail
+}

@@ -82,7 +82,7 @@ import {
   adjacentSegmentsFor,
   closestPointOnSegmentsToRay
 } from '@/core/nav-path'
-import { applyTimelinePreview } from '@/core/timeline'
+import { applyTimelinePreview, evaluateTimelineAtTime } from '@/core/timeline'
 import { record } from '@/core/diagnostics'
 import { FIXED_FILL_LIGHT, FIXED_HEMISPHERE_LIGHT } from '@/core/project-document'
 import { resolveShadowCasterIds } from '@/core/lighting-description'
@@ -1861,7 +1861,13 @@ export default {
         return
       }
 
-      const roots = this.selectedIds.map((id) => this.rootMap?.get(id)).filter((root) => root && root.visible)
+      const roots = this.selectedIds
+        .map((id) => {
+          const data = this.objects.find((item) => item.id === id)
+          if (!data || data.locked || !data.visible) return null
+          return this.rootMap?.get(id)
+        })
+        .filter((root) => root && root.visible)
       if (roots.length === 0) {
         this.updateSelectionHelper()
         return
@@ -2776,9 +2782,127 @@ export default {
       this.controls.update()
     },
 
-    /** 导出当前画面为 base64 PNG。 */
+    /** 导出当前编辑视角画面为 base64 PNG。 */
     captureImageBase64(maxDimension = 1920) {
       return this.renderToSize(maxDimension, (canvas) => canvas.toDataURL('image/png').split(',')[1])
+    },
+
+    /**
+     * 临时切到指定场景相机位姿拍一帧，再还原编辑视角。
+     * 用于 AI 复核：看「目标摄影机」成片构图，而不打乱用户当前的 Orbit 视角。
+     */
+    captureFromCameraState(state, maxDimension = 1024) {
+      if (!this.ready || !this.camera || !this.controls || !state?.position || !state?.target) {
+        return null
+      }
+      const saved = {
+        position: this.camera.position.clone(),
+        target: this.controls.target.clone(),
+        fov: this.camera.fov
+      }
+      try {
+        this.camera.position.set(state.position.x, state.position.y, state.position.z)
+        this.controls.target.set(state.target.x, state.target.y, state.target.z)
+        if (typeof state.fovDegrees === 'number' && Number.isFinite(state.fovDegrees)) {
+          this.camera.fov = state.fovDegrees
+        }
+        this.camera.updateProjectionMatrix()
+        this.controls.update()
+        this.camera.updateMatrixWorld(true)
+        return this.captureImageBase64(maxDimension)
+      } finally {
+        this.camera.position.copy(saved.position)
+        this.controls.target.copy(saved.target)
+        this.camera.fov = saved.fov
+        this.camera.updateProjectionMatrix()
+        this.controls.update()
+        this.camera.updateMatrixWorld(true)
+      }
+    },
+
+    /**
+     * AI 复核截图：沿时间轴均匀抽 N 个时刻，每个时刻各拍
+     *   1. 目标/成片摄影机（可能被墙挡住或拍空）
+     *   2. 主视角总览（框住该时刻物体，看整场站位）
+     *
+     * 只改渲染用的临时位姿，拍完还原编辑相机与物体变换。
+     *
+     * @param {object|number} options 兼容旧调用：数字当作 maxDimension
+     * @param {number} [options.maxDimension=768]
+     * @param {number} [options.sampleCount=5]
+     * @param {object} [options.timeline] 场景时间轴；缺省则只拍当前静止画面
+     * @param {object} [options.baseCamera] 场景相机底稿，默认用 cameraState
+     */
+    captureVerifyViews(options = {}) {
+      if (!this.ready || !this.camera || !this.controls) return []
+
+      const opts = typeof options === 'number' ? { maxDimension: options } : options || {}
+      const maxDimension = opts.maxDimension ?? 768
+      const sampleCount = Math.max(1, Math.min(opts.sampleCount ?? 5, 8))
+      const timeline = opts.timeline || null
+      const baseCamera = opts.baseCamera || this.cameraState
+      const duration = Math.max(0, Number(timeline?.durationSeconds) || 0)
+
+      const sampleTimes =
+        duration <= 0.05 || !timeline
+          ? [0]
+          : Array.from({ length: sampleCount }, (_, index) =>
+              sampleCount === 1 ? 0 : (duration * index) / (sampleCount - 1)
+            )
+
+      const savedEditor = {
+        position: this.camera.position.clone(),
+        target: this.controls.target.clone(),
+        fov: this.camera.fov
+      }
+
+      const images = []
+      try {
+        for (const timeSeconds of sampleTimes) {
+          if (timeline) {
+            this.applyTimelineFrame(timeline, timeSeconds)
+          }
+          const frameCamera = timeline
+            ? evaluateTimelineAtTime(timeline, baseCamera, timeSeconds).camera
+            : baseCamera
+          const timeLabel = `${timeSeconds.toFixed(1)}s`
+
+          const targetData = this.captureFromCameraState(frameCamera, maxDimension)
+          if (targetData) {
+            images.push({
+              mimeType: 'image/png',
+              base64Data: targetData,
+              role: 'target',
+              timeSeconds,
+              label: `t=${timeLabel} 目标摄影机`
+            })
+          }
+
+          const allIds = (this.objects || []).map((object) => object.id).filter(Boolean)
+          // focusView 基于当前 three 节点包围盒；物体已由 applyTimelineFrame 摆到该时刻。
+          this.focusView(allIds.length > 0 ? allIds : undefined)
+          const overviewData = this.captureImageBase64(maxDimension)
+          if (overviewData) {
+            images.push({
+              mimeType: 'image/png',
+              base64Data: overviewData,
+              role: 'overview',
+              timeSeconds,
+              label: `t=${timeLabel} 主视角总览`
+            })
+          }
+        }
+      } finally {
+        if (timeline) this.restoreObjectTransforms()
+        this.camera.position.copy(savedEditor.position)
+        this.controls.target.copy(savedEditor.target)
+        this.camera.fov = savedEditor.fov
+        this.camera.updateProjectionMatrix()
+        this.controls.update()
+        this.camera.updateMatrixWorld(true)
+      }
+
+      return images
     },
 
     /**

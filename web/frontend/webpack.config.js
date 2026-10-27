@@ -100,7 +100,7 @@ module.exports = (env, argv) => {
         {
           // 前端只调用 /api，开发期由 dev-server 转发到 FastAPI，避免跨域配置分散。
           context: ['/api'],
-          target: 'http://127.0.0.1:8000',
+          target: 'http://127.0.0.1:8003',
           changeOrigin: true
         }
       ]

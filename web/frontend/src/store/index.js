@@ -17,8 +17,67 @@ import { createHistory, commitHistory, undoHistory, redoHistory } from '@/core/h
 import { createInitialScene } from '@/core/scene'
 import { migrateProjectDocument, sceneFingerprint, createProjectDocument } from '@/core/project-document'
 import { applyAiSceneCommands } from '@/core/apply-ai-scene-commands'
-import { extractCommandsFromReply, isVerificationPass } from '@/core/ai-commands'
+import { AI_MAX_HISTORY_MESSAGES } from '@/core/ai-defaults'
+import {
+  AI_AGENT_MAX_STEPS,
+  AI_TOOL_DEFINITIONS,
+  executeAiTool,
+  summarizeToolResult
+} from '@/core/ai-tools'
 import { summarizeScene } from '@/core/scene'
+
+const MAX_PENDING_IMAGES = 4
+
+function sanitizeChatImages(images) {
+  if (!Array.isArray(images) || images.length === 0) return []
+  return images
+    .filter(
+      (image) =>
+        image &&
+        typeof image.mimeType === 'string' &&
+        image.mimeType.startsWith('image/') &&
+        typeof image.base64Data === 'string' &&
+        image.base64Data.trim().length > 0
+    )
+    .slice(0, MAX_PENDING_IMAGES)
+    .map((image) => ({
+      mimeType: image.mimeType.trim().slice(0, 64),
+      base64Data: image.base64Data.replace(/\s+/g, '').slice(0, 8_000_000)
+    }))
+}
+
+function trimAiHistory(messages) {
+  if (!Array.isArray(messages) || messages.length <= AI_MAX_HISTORY_MESSAGES) return messages || []
+  return messages.slice(messages.length - AI_MAX_HISTORY_MESSAGES)
+}
+
+/** 发给模型的 tool 结果：去掉 base64，避免把截图塞进 JSON 文本。 */
+function toolResultForModel(result) {
+  if (!result || typeof result !== 'object') return result
+  const copy = { ...result }
+  if (Array.isArray(copy.images) && copy.images.length > 0) {
+    copy.images = copy.images.map((image) => ({
+      role: image.role,
+      label: image.label,
+      note: '截图已作为多模态附件上传，请直接查看图片。'
+    }))
+  }
+  delete copy.display
+  return copy
+}
+
+function waitFrames(count = 2) {
+  return new Promise((resolve) => {
+    const step = (left) => {
+      if (left <= 0) {
+        resolve()
+        return
+      }
+      requestAnimationFrame(() => step(left - 1))
+    }
+    step(count)
+  })
+}
 
 Vue.use(Vuex)
 
@@ -99,6 +158,8 @@ export default new Vuex.Store({
     aiSending: false,
     aiSettingsOpen: false,
     aiVerifying: false,
+    pendingAiImages: [],
+    aiPanelOpen: true,
 
     platformProfiles: null,
     videoProfileId: 'generic-16x9',
@@ -261,11 +322,19 @@ export default new Vuex.Store({
     },
 
     pushNotice(state, notice) {
-      const entry = { id: `${Date.now()}-${Math.random()}`, ...notice }
-      state.notices = [...state.notices, entry]
+      // id 必须由调用方传入（notify action），否则定时 dismiss 对不上号。
+      const entry = {
+        id: notice.id || `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        kind: notice.kind || 'info',
+        message: notice.message || ''
+      }
+      state.notices = [...state.notices, entry].slice(-5)
     },
     dismissNotice(state, id) {
       state.notices = state.notices.filter((notice) => notice.id !== id)
+    },
+    clearNotices(state) {
+      state.notices = []
     },
     setBusy(state, busy) {
       state.busy = busy
@@ -296,10 +365,10 @@ export default new Vuex.Store({
     },
 
     pushAiMessage(state, message) {
-      state.aiMessages = [...state.aiMessages, message]
+      state.aiMessages = trimAiHistory([...state.aiMessages, message])
     },
     setAiMessages(state, messages) {
-      state.aiMessages = messages
+      state.aiMessages = trimAiHistory(messages)
     },
     setAiSettings(state, settings) {
       state.aiSettings = settings
@@ -312,6 +381,19 @@ export default new Vuex.Store({
     },
     setAiVerifying(state, verifying) {
       state.aiVerifying = verifying
+    },
+    setPendingAiImages(state, images) {
+      state.pendingAiImages = Array.isArray(images) ? images.slice(0, MAX_PENDING_IMAGES) : []
+    },
+    addPendingAiImages(state, images) {
+      const next = [...state.pendingAiImages, ...(images || [])].slice(0, MAX_PENDING_IMAGES)
+      state.pendingAiImages = next
+    },
+    removePendingAiImage(state, index) {
+      state.pendingAiImages = state.pendingAiImages.filter((_, i) => i !== index)
+    },
+    setAiPanelOpen(state, open) {
+      state.aiPanelOpen = Boolean(open)
     },
 
     setPlatformProfiles(state, profiles) {
@@ -330,9 +412,9 @@ export default new Vuex.Store({
 
   actions: {
     notify({ commit }, notice) {
-      commit('pushNotice', notice)
-      const delay = notice.kind === 'error' ? 6000 : 3200
-      const id = `${Date.now()}-${Math.random()}`
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+      commit('pushNotice', { ...notice, id })
+      const delay = notice.kind === 'error' ? 6000 : 2800
       setTimeout(() => commit('dismissNotice', id), delay)
     },
 
@@ -546,55 +628,205 @@ export default new Vuex.Store({
     },
 
     // ------------------------------------------------------------------
-    // AI
+    // AI（前端驱动的 Agent Loop）
     // ------------------------------------------------------------------
 
-    async sendAiMessage({ state, commit, dispatch, getters }, content) {
-      if (!content || !content.trim()) return
-      commit('pushAiMessage', { role: 'user', content })
-      commit('setAiSending', true)
-      try {
-        const response = await api.ai.chat({
-          messages: state.aiMessages.map(({ role, content: text }) => ({ role, content: text })),
-          sceneSummary: getters.sceneSummary
-        })
-        if (response.status !== 'ok') {
-          commit('pushAiMessage', { role: 'assistant', content: `（出错）${response.message}` })
-          await dispatch('notify', { kind: 'error', message: response.message })
-          return
-        }
-        commit('pushAiMessage', { role: 'assistant', content: response.content })
+    async sendAiMessage({ state, commit, dispatch, getters }, payload) {
+      const options = typeof payload === 'string' ? { content: payload } : payload || {}
+      const text = (options.content || '').trim()
+      const viewport = options.viewport || null
+      const attached = sanitizeChatImages(options.images || state.pendingAiImages)
+      if (!text && attached.length === 0) return
 
-        if (isVerificationPass(response.content)) {
-          await dispatch('notify', { kind: 'success', message: 'AI 复核通过，场景与描述一致。' })
-          return
+      const content =
+        text ||
+        (attached.length > 0
+          ? '请根据我附带的参考图，搭建对应的白膜场景（构图、站位与镜头尽量贴近参考）。'
+          : '')
+      const displayContent =
+        attached.length > 0 ? `${content}\n\n[已附带 ${attached.length} 张参考图]` : content
+      const apiUserContent =
+        attached.length > 0
+          ? `${content}\n\n（用户附带了 ${attached.length} 张参考图，请据此搭建。）`
+          : content
+
+      commit('pushAiMessage', { role: 'user', content: displayContent })
+      commit('setPendingAiImages', [])
+      commit('setAiSending', true)
+      commit('setAiVerifying', false)
+
+      // 协议消息（含 tool 角色）；UI 历史只展示可读文本。
+      const loopMessages = [
+        ...state.aiMessages
+          .slice(0, -1)
+          .filter((message) => message.role === 'user' || message.role === 'assistant')
+          .filter((message) => !String(message.content || '').startsWith('⚙ '))
+          .map(({ role, content: textContent }) => ({ role, content: textContent })),
+        { role: 'user', content: apiUserContent }
+      ]
+
+      const budget = { capturesUsed: 0 }
+      const toolContext = {
+        getScene: () => getters.scene,
+        commitScene: (scene) => {
+          commit('commitScene', scene)
+          commit('setSelection', [])
+          dispatch('scheduleAutosave')
+        },
+        viewport,
+        budget
+      }
+
+      let nextImages = attached.length > 0 ? attached : []
+      let finishedSummary = ''
+      let appliedAnything = false
+
+      try {
+        for (let step = 0; step < AI_AGENT_MAX_STEPS; step += 1) {
+          const response = await api.ai.chat({
+            messages: loopMessages,
+            sceneSummary: getters.sceneSummary,
+            images: nextImages.length > 0 ? nextImages : undefined,
+            tools: AI_TOOL_DEFINITIONS,
+            toolChoice: 'auto'
+          })
+          nextImages = []
+
+          if (response.status !== 'ok') {
+            commit('pushAiMessage', { role: 'assistant', content: `（出错）${response.message}` })
+            await dispatch('notify', { kind: 'error', message: response.message })
+            return
+          }
+
+          const toolCalls = Array.isArray(response.toolCalls) ? response.toolCalls : []
+          const replyText = (response.content || '').trim()
+
+          if (toolCalls.length === 0) {
+            if (replyText) {
+              commit('pushAiMessage', { role: 'assistant', content: replyText })
+            }
+            await dispatch('notify', {
+              kind: appliedAnything ? 'success' : 'info',
+              message: appliedAnything
+                ? 'AI 已完成场景操作，可用撤销回退。'
+                : replyText || 'AI 未调用工具。'
+            })
+            return
+          }
+
+          loopMessages.push({
+            role: 'assistant',
+            content: replyText || null,
+            toolCalls
+          })
+          if (replyText) {
+            commit('pushAiMessage', { role: 'assistant', content: replyText })
+          }
+
+          // 截图前等几帧，确保 apply 后的 three.js 节点已刷新。
+          const needsCapture = toolCalls.some((call) => String(call.name || '').startsWith('capture_'))
+          if (needsCapture) {
+            commit('setAiVerifying', true)
+            await waitFrames(3)
+          }
+
+          const stepImages = []
+          let calledDone = false
+
+          for (const call of toolCalls) {
+            const name = call.name || ''
+            const args = call.arguments || {}
+            if (typeof console !== 'undefined' && console.debug) {
+              console.debug('[ai-agent] tool call', name, args)
+            }
+            const result = executeAiTool(name, args, toolContext)
+            const display = summarizeToolResult(name, result)
+            commit('pushAiMessage', { role: 'assistant', content: `⚙ ${display}` })
+
+            if (name === 'apply_scene_commands' && result.ok) {
+              appliedAnything = true
+              if (result.hasTimelineAnimation) {
+                commit('setTimelineTime', 0)
+                commit('setTimelinePlaying', true)
+              }
+            }
+            if (Array.isArray(result.images)) {
+              for (const image of result.images) {
+                if (image?.base64Data) stepImages.push(image)
+              }
+            }
+            if (result.done) {
+              calledDone = true
+              finishedSummary = result.summary || display
+            }
+
+            loopMessages.push({
+              role: 'tool',
+              toolCallId: call.id || `tool-${step}-${name}`,
+              content: JSON.stringify(toolResultForModel(result))
+            })
+          }
+
+          commit('setAiVerifying', false)
+
+          if (stepImages.length > 0) {
+            nextImages = sanitizeChatImages(stepImages).slice(0, 4)
+            const legend = stepImages
+              .map((image, index) => `图${index + 1}：${image.label || image.role || '截图'}`)
+              .join('；')
+            loopMessages.push({
+              role: 'user',
+              content: `（系统）已附上截图：${legend}。请结合图片继续观察或修正，完成后调用 done。`
+            })
+          }
+
+          if (calledDone) {
+            if (finishedSummary) {
+              commit('pushAiMessage', { role: 'assistant', content: finishedSummary })
+            }
+            await dispatch('notify', {
+              kind: 'success',
+              message: finishedSummary || 'AI 任务完成。'
+            })
+            return
+          }
         }
-        const commands = extractCommandsFromReply(response.content)
-        if (commands.length === 0) {
-          await dispatch('notify', { kind: 'info', message: 'AI 没有返回可执行的场景命令。' })
-          return
-        }
-        await dispatch('applyAiCommands', commands)
+
+        commit('pushAiMessage', {
+          role: 'assistant',
+          content: '已达到最大工具步数，停止本轮 Agent。可用撤销回退场景改动。'
+        })
+        await dispatch('notify', { kind: 'info', message: 'AI 达到最大步数已停止。' })
       } catch (error) {
         await dispatch('notify', { kind: 'error', message: `AI 请求失败：${error.message}` })
       } finally {
         commit('setAiSending', false)
+        commit('setAiVerifying', false)
       }
     },
 
-    async applyAiCommands({ commit, dispatch, getters }, commands) {
+    async applyAiCommands({ commit, dispatch, getters }, payload) {
+      const commands = Array.isArray(payload) ? payload : payload?.commands || []
+      const silent = Boolean(payload && !Array.isArray(payload) && payload.silent)
       const result = applyAiSceneCommands(getters.scene, commands)
       commit('commitScene', result.scene)
       commit('setSelection', [])
+      if (result.hasTimelineAnimation) {
+        commit('setTimelineTime', 0)
+        commit('setTimelinePlaying', true)
+      }
       dispatch('scheduleAutosave')
-      const message =
-        result.skipped.length > 0
-          ? `已执行 ${result.applied} 条命令，跳过 ${result.skipped.length} 条：${result.skipped[0]}`
-          : `已执行 ${result.applied} 条命令，可用撤销回退。`
-      await dispatch('notify', {
-        kind: result.skipped.length > 0 ? 'info' : 'success',
-        message
-      })
+      if (!silent) {
+        const message =
+          result.skipped.length > 0
+            ? `已执行 ${result.applied} 条命令，跳过 ${result.skipped.length} 条：${result.skipped[0]}`
+            : `已执行 ${result.applied} 条命令，可用撤销回退。`
+        await dispatch('notify', {
+          kind: result.skipped.length > 0 ? 'info' : 'success',
+          message
+        })
+      }
+      return result
     },
 
     async saveAiSettings({ commit, dispatch }, payload) {
@@ -605,6 +837,23 @@ export default new Vuex.Store({
       } catch (error) {
         await dispatch('notify', { kind: 'error', message: `保存设置失败：${error.message}` })
       }
+    },
+
+    /** 在输入条直接切换当前服务商（密钥沿用，空 apiKey 表示不改）。 */
+    async setActiveAiProvider({ state, dispatch }, providerId) {
+      const settings = state.aiSettings
+      if (!settings || !providerId || settings.activeProviderId === providerId) return
+      const provider = (settings.providers || []).find((item) => item.id === providerId)
+      if (!provider) return
+      await dispatch('saveAiSettings', {
+        activeProviderId: providerId,
+        systemPrompt: settings.systemPrompt,
+        providers: (settings.providers || []).map((item) => {
+          const copy = { ...item }
+          delete copy.hasApiKey
+          return { ...copy, apiKey: '' }
+        })
+      })
     },
 
     async clearAiMessages({ commit }) {

@@ -95,10 +95,18 @@
         <AiComposer
           v-if="!previewMode"
           :sending="aiSending"
+          :verifying="aiVerifying"
           :settings="aiSettings"
+          :pending-images="pendingAiImages"
+          :messages="aiMessages"
+          :selected-object="selectedObject"
           @send="sendAi"
           @attach-images="handleAiImages"
+          @remove-image="(index) => $store.commit('removePendingAiImage', index)"
+          @switch-provider="(id) => $store.dispatch('setActiveAiProvider', id)"
           @open-settings="$store.commit('setAiSettingsOpen', true)"
+          @clear-messages="$store.dispatch('clearAiMessages')"
+          @error="(message) => $store.dispatch('notify', { kind: 'info', message })"
         />
 
         <div v-if="!previewMode && tool !== 'select'" class="stage-hint">
@@ -144,6 +152,7 @@
           :paint-scope="paintScope"
           :paths="paths"
           :timeline-duration="timeline.durationSeconds"
+          :object-keyframe-count="selectedObjectKeyframeCount"
           :selected-node-index="selectedNodeIndex"
           @update-object="updateObject"
           @update-light="updateLight"
@@ -164,6 +173,7 @@
           @path-select-node="selectPathNode"
           @path-bind="bindPath"
           @path-draw-again="beginPathDrawFor"
+          @clear-object-keyframes="clearObjectKeyframes"
         />
       </aside>
     </div>
@@ -322,6 +332,11 @@ export default {
       const selected = this.$store.getters.selectedObjects
       return selected.length === 1 ? selected[0] : null
     },
+    selectedObjectKeyframeCount() {
+      const object = this.selectedObject
+      if (!object) return 0
+      return this.timeline.objectKeyframes.filter((keyframe) => keyframe.objectId === object.id).length
+    },
     selectedLightId() {
       return this.$store.state.selectedLightId
     },
@@ -385,8 +400,17 @@ export default {
     aiSending() {
       return this.$store.state.aiSending
     },
+    aiVerifying() {
+      return this.$store.state.aiVerifying
+    },
     aiSettings() {
       return this.$store.state.aiSettings
+    },
+    aiMessages() {
+      return this.$store.state.aiMessages
+    },
+    pendingAiImages() {
+      return this.$store.state.pendingAiImages
     },
     timelineTime() {
       return this.$store.state.timelineTime
@@ -884,10 +908,12 @@ export default {
      * 不写撤销栈。松手时才 commit 一次，保证"拖一次 = 撤销一次"。
      */
     handleObjectTransform({ id, position, rotation, size, commit = true }) {
+      const target = this.objects.find((object) => object.id === id)
+      if (target?.locked) return
       const apply = (scene) => ({
         ...scene,
         objects: scene.objects.map((object) =>
-          object.id === id ? { ...object, position, rotation, size } : object
+          object.id === id && !object.locked ? { ...object, position, rotation, size } : object
         )
       })
       if (commit) {
@@ -904,6 +930,19 @@ export default {
         (rotation.z * Math.PI) / 180
       )
       root.scale.set(size.x, size.y, size.z)
+    },
+
+    clearObjectKeyframes(objectId) {
+      if (!objectId) return
+      this.edit((scene) => ({
+        ...scene,
+        timeline: {
+          ...scene.timeline,
+          objectKeyframes: scene.timeline.objectKeyframes.filter(
+            (keyframe) => keyframe.objectId !== objectId
+          )
+        }
+      }))
     },
 
     handleObjectsTransform({ delta, commit = true }) {
@@ -1437,19 +1476,18 @@ export default {
     // ------------------------------------------------------------------
 
     async sendAi(content) {
-      await this.$store.dispatch('sendAiMessage', content)
+      await this.$store.dispatch('sendAiMessage', {
+        content,
+        // Agent 截图 / 时间轴工具在浏览器视口上执行。
+        viewport: this.$refs.viewport || null
+      })
     },
 
-    /**
-     * 参考图目前只做"暂存 + 提示"，不随消息发送。
-     *
-     * 原因：并非所有服务商都支持视觉输入，静默失败会让用户以为图生效了。
-     * 等后端能按服务商能力判定后再接上真正的多模态消息。
-     */
     handleAiImages(images) {
+      this.$store.commit('addPendingAiImages', images)
       this.$store.dispatch('notify', {
         kind: 'info',
-        message: `已附加 ${images.length} 张参考图，将在支持视觉的服务商上随下一条消息发送。`
+        message: `已附加 ${images.length} 张参考图，将随下一条消息发送。`
       })
     },
 
@@ -1563,4 +1601,5 @@ export default {
   height: 22px;
   font-size: 11px;
 }
+
 </style>

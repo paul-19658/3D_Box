@@ -35,8 +35,10 @@
           <label class="field">
             <span class="field__label">协议</span>
             <select v-model="current.kind" class="select">
-              <option value="openai">OpenAI 兼容（含自建网关）</option>
+              <option value="openai">OpenAI 官方</option>
+              <option value="openai-compatible">OpenAI 兼容接口</option>
               <option value="anthropic">Anthropic Messages</option>
+              <option value="custom">自定义（高级）</option>
             </select>
           </label>
 

@@ -15,20 +15,28 @@ function cloneObject(object) {
   return JSON.parse(JSON.stringify(object))
 }
 
-function findObject(objects, id, name) {
+/**
+ * 按 id / 名称定位物体。
+ * 可选 kind：人台姿势等场景下，若该类型只剩一个物体则兜底选中（复核常写错 id）。
+ */
+function findObject(objects, id, name, kind) {
+  const pool = kind ? objects.filter((object) => object.kind === kind) : objects
   if (id) {
-    const byId = objects.find((object) => object.id === id)
+    const byId = pool.find((object) => object.id === id) ?? objects.find((object) => object.id === id)
     if (byId) return byId
   }
   if (name) {
-    // 先精确匹配，再忽略大小写与空格匹配，最后按包含关系匹配。
-    const exact = objects.find((object) => object.name === name)
+    const exact = pool.find((object) => object.name === name)
     if (exact) return exact
     const normalized = name.replace(/\s+/g, '').toLowerCase()
-    const loose = objects.find((object) => object.name.replace(/\s+/g, '').toLowerCase() === normalized)
+    const loose = pool.find(
+      (object) => object.name.replace(/\s+/g, '').toLowerCase() === normalized
+    )
     if (loose) return loose
-    return objects.find((object) => object.name.includes(name)) ?? null
+    const partial = pool.find((object) => object.name.includes(name))
+    if (partial) return partial
   }
+  if (kind && pool.length === 1) return pool[0]
   return null
 }
 
@@ -41,113 +49,171 @@ function mergeVector(base, update) {
   }
 }
 
-/** 让物体朝向路径前进方向（-Z 为模型正面，与 three.js 约定一致）。 */
+/** 模型默认朝 -Z；按水平位移计算朝向角（度）。 */
 function facingDegrees(from, to) {
-  const deltaX = to.x - from.x
-  const deltaZ = to.z - from.z
-  if (Math.hypot(deltaX, deltaZ) < 1e-6) return null
-  return (Math.atan2(deltaX, deltaZ) * 180) / Math.PI + 180
+  const dx = to.x - from.x
+  const dz = to.z - from.z
+  if (Math.hypot(dx, dz) < 1e-4) return 0
+  return (Math.atan2(dx, -dz) * 180) / Math.PI
 }
 
-function cameraFollowShots(follow, path, durationSeconds, baseCamera, objectName) {
-  if (!follow) return []
-  const mode = follow.mode || 'side'
-  const start = path[0]
-  const end = path[path.length - 1]
-  const center = { x: (start.x + end.x) / 2, z: (start.z + end.z) / 2 }
-  const spanX = end.x - start.x
-  const spanZ = end.z - start.z
-  const span = Math.max(Math.hypot(spanX, spanZ), 1)
-  const height = follow.height ?? 2.2
-  const lookAtHeight = follow.lookAtHeight ?? 1.2
+function normalizeFollow(value) {
+  if (value === false || value === undefined) return null
+  const source = value === true ? {} : value
+  const mode = source.mode || 'side'
+  return {
+    mode,
+    sideOffset: source.sideOffset ?? 4,
+    backOffset: source.backOffset ?? 1.5,
+    radius: source.radius ?? (mode === 'orbit' ? 5 : 4),
+    orbitDegrees: source.orbitDegrees ?? 360,
+    orbitDirection: source.orbitDirection ?? 'ccw',
+    startAngleDegrees: source.startAngleDegrees ?? 0,
+    height: source.height ?? 2.2,
+    lookAtHeight: source.lookAtHeight ?? 1.2
+  }
+}
 
-  const describe = (position) => ({
-    position: { x: position.x, y: height, z: position.z },
-    target: { x: position.lookAtX ?? center.x, y: lookAtHeight, z: position.lookAtZ ?? center.z },
-    fovDegrees: baseCamera.fovDegrees,
-    aspectWidth: baseCamera.aspectWidth,
-    aspectHeight: baseCamera.aspectHeight
-  })
+function samplePathAt(points, progress) {
+  const clamped = Math.min(Math.max(progress, 0), 1)
+  if (points.length === 1) {
+    return { position: { ...points[0] }, direction: { x: 0, z: -1 } }
+  }
+  const segmentCount = points.length - 1
+  const scaled = clamped * segmentCount
+  const index = Math.min(Math.floor(scaled), segmentCount - 1)
+  const local = scaled - index
+  const from = points[index]
+  const to = points[index + 1]
+  const position = {
+    x: from.x + (to.x - from.x) * local,
+    y: from.y + (to.y - from.y) * local,
+    z: from.z + (to.z - from.z) * local
+  }
+  let dx = to.x - from.x
+  let dz = to.z - from.z
+  const len = Math.hypot(dx, dz)
+  if (len < 1e-4) {
+    dx = 0
+    dz = -1
+  } else {
+    dx /= len
+    dz /= len
+  }
+  return { position, direction: { x: dx, z: dz } }
+}
 
-  if (mode === 'orbit') {
-    const radius = follow.radius ?? 5
-    const total = follow.orbitDegrees ?? 360
-    const direction = follow.orbitDirection === 'cw' ? -1 : 1
-    const startAngle = follow.startAngleDegrees ?? 0
-    const steps = Math.max(2, Math.min(8, Math.round(Math.abs(total) / 90) + 1))
-    return Array.from({ length: steps }, (_, index) => {
-      const amount = index / (steps - 1)
-      const angle = ((startAngle + direction * total * amount) * Math.PI) / 180
-      return {
-        id: createId(),
-        name: `跟拍镜头 ${index + 1}`,
-        timeSeconds: durationSeconds * amount,
-        transition: index === 0 ? 'cut' : 'smooth',
-        camera: describe({
-          x: center.x + Math.sin(angle) * radius,
-          z: center.z + Math.cos(angle) * radius
-        })
-      }
-    })
+function cameraPoseForFollow(follow, subject, direction, progress) {
+  const target = {
+    x: subject.x,
+    y: follow.lookAtHeight,
+    z: subject.z
   }
 
-  const sideOffset = follow.sideOffset ?? 4
-  const backOffset = follow.backOffset ?? 1.5
-  const radius = follow.radius ?? 5
-  const normalX = span / 1 > 0 ? -spanZ / span : 1
-  const normalZ = span / 1 > 0 ? spanX / span : 0
-
-  const offsets = {
-    side: { x: normalX * sideOffset, z: normalZ * sideOffset },
-    chase: { x: (-spanX / span) * backOffset, z: (-spanZ / span) * backOffset },
-    front: { x: (spanX / span) * radius, z: (spanZ / span) * radius }
-  }
-  const offset = offsets[mode] ?? offsets.side
-  const at = (timeAmount) => ({
-    x: start.x + spanX * timeAmount + offset.x,
-    z: start.z + spanZ * timeAmount + offset.z,
-    lookAtX: start.x + spanX * timeAmount,
-    lookAtZ: start.z + spanZ * timeAmount
-  })
-
-  return [
-    {
-      id: createId(),
-      name: `${objectName || '物体'}跟拍开始`,
-      timeSeconds: 0,
-      transition: 'cut',
-      camera: describe(at(0))
-    },
-    {
-      id: createId(),
-      name: `${objectName || '物体'}跟拍结束`,
-      timeSeconds: durationSeconds,
-      transition: 'smooth',
-      camera: describe(at(1))
+  if (follow.mode === 'orbit') {
+    const sign = follow.orbitDirection === 'cw' ? -1 : 1
+    const angleDeg = follow.startAngleDegrees + progress * follow.orbitDegrees * sign
+    const angle = (angleDeg * Math.PI) / 180
+    return {
+      position: {
+        x: subject.x + Math.cos(angle) * follow.radius,
+        y: follow.height,
+        z: subject.z + Math.sin(angle) * follow.radius
+      },
+      target
     }
-  ]
+  }
+
+  const dx = direction.x
+  const dz = direction.z
+  const sideX = dz
+  const sideZ = -dx
+
+  if (follow.mode === 'chase') {
+    return {
+      position: {
+        x: subject.x - dx * follow.radius,
+        y: follow.height,
+        z: subject.z - dz * follow.radius
+      },
+      target
+    }
+  }
+  if (follow.mode === 'front') {
+    return {
+      position: {
+        x: subject.x + dx * follow.radius,
+        y: follow.height,
+        z: subject.z + dz * follow.radius
+      },
+      target
+    }
+  }
+
+  return {
+    position: {
+      x: subject.x + sideX * follow.sideOffset - dx * follow.backOffset,
+      y: follow.height,
+      z: subject.z + sideZ * follow.sideOffset - dz * follow.backOffset
+    },
+    target
+  }
 }
 
-function keyframesForMove(object, path, durationSeconds) {
-  const points = path.map((point) => ({
+function cameraFollowShots(follow, path, durationSeconds, baseCamera) {
+  if (!follow) return []
+  const orbitSteps = Math.ceil(Math.abs(follow.orbitDegrees) / 20)
+  const sampleCount =
+    follow.mode === 'orbit'
+      ? Math.max(path.length, orbitSteps + 1, Math.ceil(durationSeconds * 3) + 1, 9)
+      : Math.max(path.length, Math.ceil(durationSeconds * 2) + 1, 3)
+
+  return Array.from({ length: sampleCount }, (_, index) => {
+    const progress = sampleCount === 1 ? 0 : index / (sampleCount - 1)
+    const sample = samplePathAt(path, progress)
+    const pose = cameraPoseForFollow(follow, sample.position, sample.direction, progress)
+    return {
+      id: createId(),
+      name: `跟拍 ${String(index + 1).padStart(2, '0')}`,
+      timeSeconds: durationSeconds * progress,
+      transition: index === 0 ? 'cut' : 'smooth',
+      camera: {
+        position: { ...pose.position },
+        target: { ...pose.target },
+        fovDegrees: baseCamera.fovDegrees,
+        aspectWidth: baseCamera.aspectWidth,
+        aspectHeight: baseCamera.aspectHeight
+      }
+    }
+  })
+}
+
+function resolvePathPoints(object, path) {
+  return path.map((point) => ({
     x: point.x ?? object.position.x,
     y: point.y ?? object.position.y,
     z: point.z ?? object.position.z
   }))
+}
+
+function keyframesForMove(object, path, durationSeconds, faceAlongPath) {
+  const points = resolvePathPoints(object, path)
   return points.map((point, index) => {
-    const previous = index > 0 ? points[index - 1] : null
     const next = index < points.length - 1 ? points[index + 1] : null
-    const heading = next ? facingDegrees(point, next) : previous ? facingDegrees(previous, point) : null
+    const previous = index > 0 ? points[index - 1] : null
+    const facingFrom = next ? point : previous || point
+    const facingTo = next || point
+    const rotationY = faceAlongPath ? facingDegrees(facingFrom, facingTo) : object.rotation.y
     return {
       id: createId(),
       objectId: object.id,
       timeSeconds: (durationSeconds * index) / (points.length - 1),
-      interpolation: 'linear',
+      interpolation: 'smooth',
       transform: {
         position: { ...point },
         rotation: {
           x: object.rotation.x,
-          y: heading === null ? object.rotation.y : heading,
+          y: rotationY,
           z: object.rotation.z
         },
         size: { ...object.size },
@@ -159,17 +225,20 @@ function keyframesForMove(object, path, durationSeconds) {
   })
 }
 
+function sortedByTime(items) {
+  return [...items].sort((a, b) => a.timeSeconds - b.timeSeconds)
+}
+
 /**
  * 应用命令数组。
  *
- * 返回 `{ scene, applied, skipped }`：
+ * 返回 `{ scene, applied, skipped, hasTimelineAnimation }`：
  * - `applied` 是成功应用的命令数，用于提示用户；
  * - `skipped` 记录被跳过的原因，便于排查模型输出问题。
  */
 export function applyAiSceneCommands(scene, commands) {
   let objects = scene.objects.map(cloneObject)
   let camera = cloneObject(scene.camera)
-  // 光照与灯光列表在命令集里没有对应的修改类型，因此整个流程中保持不变。
   const lighting = cloneObject(scene.lighting)
   let timeline = cloneObject(scene.timeline)
   let applied = 0
@@ -256,8 +325,36 @@ export function applyAiSceneCommands(scene, commands) {
       continue
     }
 
-    if (command.type === 'set_mannequin_pose') {
+    if (command.type === 'remove_object') {
       const target = findObject(objects, command.id, command.name)
+      if (!target) {
+        skipped.push(`找不到要删除的物体：${command.name || command.id}`)
+        continue
+      }
+      const removedId = target.id
+      objects = objects
+        .filter((object) => object.id !== removedId)
+        .map((object) => {
+          // 其他物体若绑在被删导航线上，清掉绑定，避免悬空引用。
+          if (object.pathBinding?.pathId === removedId) {
+            const next = { ...object }
+            delete next.pathBinding
+            return next
+          }
+          return object
+        })
+      timeline = {
+        ...timeline,
+        objectKeyframes: timeline.objectKeyframes.filter(
+          (keyframe) => keyframe.objectId !== removedId
+        )
+      }
+      applied += 1
+      continue
+    }
+
+    if (command.type === 'set_mannequin_pose') {
+      const target = findObject(objects, command.id, command.name, 'mannequin')
       if (!target || target.kind !== 'mannequin') {
         skipped.push(`找不到人台：${command.name || command.id}`)
         continue
@@ -298,16 +395,40 @@ export function applyAiSceneCommands(scene, commands) {
         continue
       }
       const duration = command.durationSeconds ?? 4
-      const keyframes = keyframesForMove(target, command.path, duration)
+      const faceAlongPath = command.faceAlongPath !== false
+      const points = resolvePathPoints(target, command.path)
+      if (points.length < 2) {
+        skipped.push('animate_move 至少需要 2 个路径点')
+        continue
+      }
+      const follow = normalizeFollow(command.cameraFollow)
+      const keyframes = keyframesForMove(target, command.path, duration, faceAlongPath)
+      const followShots = cameraFollowShots(follow, points, duration, camera)
+
+      const start = points[0]
+      const startFacing = faceAlongPath ? facingDegrees(points[0], points[1]) : target.rotation.y
+      objects = objects.map((object) =>
+        object.id === target.id
+          ? {
+              ...object,
+              position: { ...start },
+              rotation: { ...object.rotation, y: startFacing }
+            }
+          : object
+      )
+
       timeline = {
         durationSeconds: Math.max(timeline.durationSeconds, duration),
-        cameraShots: command.cameraFollow
-          ? cameraFollowShots(command.cameraFollow, command.path, duration, camera, target.name)
-          : timeline.cameraShots,
-        objectKeyframes: [
+        cameraShots: follow
+          ? sortedByTime(followShots)
+          : sortedByTime(timeline.cameraShots),
+        objectKeyframes: sortedByTime([
           ...timeline.objectKeyframes.filter((keyframe) => keyframe.objectId !== target.id),
           ...keyframes
-        ]
+        ])
+      }
+      if (follow && followShots[0]) {
+        camera = cloneObject(followShots[0].camera)
       }
       hasTimelineAnimation = true
       applied += 1
@@ -335,6 +456,7 @@ export function applyAiSceneCommands(scene, commands) {
   return {
     scene: { objects, camera, lighting, timeline },
     applied,
-    skipped
+    skipped,
+    hasTimelineAnimation
   }
 }

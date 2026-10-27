@@ -61,6 +61,39 @@
 
         <div class="panel__section">
           <p class="section-title">变换</p>
+          <div v-if="object.locked" class="drive-notice">
+            <p>物体已锁定。请先在资产列表点开锁图标，再拖拽或改坐标。</p>
+          </div>
+          <div v-else-if="transformDriven" class="drive-notice">
+            <p>
+              <template v-if="objectKeyframeCount > 0">
+                时间轴上有 {{ objectKeyframeCount }} 个该物体关键帧，视口位置由关键帧（及播放头时刻）决定，手动改 XYZ
+                会被盖掉。
+              </template>
+              <template v-if="object.pathBinding">
+                <template v-if="objectKeyframeCount > 0"> </template>
+                当前还绑定了导航线，位置/朝向由路径接管。
+              </template>
+            </p>
+            <div class="drive-notice__actions">
+              <button
+                v-if="objectKeyframeCount > 0"
+                type="button"
+                class="btn btn--ghost"
+                @click="$emit('clear-object-keyframes', object.id)"
+              >
+                清除该物体关键帧
+              </button>
+              <button
+                v-if="object.pathBinding"
+                type="button"
+                class="btn btn--ghost"
+                @click="bindPath({ target: { value: '' } })"
+              >
+                取消路径绑定
+              </button>
+            </div>
+          </div>
           <div class="field">
             <span class="field__label">位置</span>
             <div class="vector-row">
@@ -70,6 +103,7 @@
                 class="input"
                 type="number"
                 step="0.1"
+                :disabled="object.locked"
                 :value="round(object.position[axis])"
                 @change="patchVector('position', axis, $event)"
               />
@@ -84,6 +118,7 @@
                 class="input"
                 type="number"
                 step="1"
+                :disabled="object.locked"
                 :value="round(object.rotation[axis])"
                 @change="patchVector('rotation', axis, $event)"
               />
@@ -99,6 +134,7 @@
                 type="number"
                 step="0.1"
                 min="0.1"
+                :disabled="object.locked"
                 :value="round(object.size[axis])"
                 @change="patchVector('size', axis, $event)"
               />
@@ -524,6 +560,8 @@ export default {
     paths: { type: Array, default: () => [] },
     /** 时间轴总时长：用于展示节点会被分配到哪一刻。 */
     timelineDuration: { type: Number, default: 5 },
+    /** 当前选中物体在时间轴上的关键帧数量（>0 时变换由关键帧驱动）。 */
+    objectKeyframeCount: { type: Number, default: 0 },
     /** 当前选中的导航线节点索引（仅当 object 是 path 时有意义）。 */
     selectedNodeIndex: { type: Number, default: null }
   },
@@ -599,6 +637,9 @@ export default {
     },
     bindingPathId() {
       return this.object?.pathBinding?.pathId ?? ''
+    },
+    transformDriven() {
+      return this.objectKeyframeCount > 0 || Boolean(this.object?.pathBinding)
     }
   },
 
@@ -752,6 +793,28 @@ export default {
   color: var(--text-2);
   font-size: 11px;
   line-height: 1.6;
+}
+
+.drive-notice {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn, #e0a14a) 45%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn, #e0a14a) 12%, transparent);
+}
+
+.drive-notice p {
+  margin: 0;
+  color: var(--text-1, var(--text-0));
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.drive-notice__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 /* 导航线节点序号：固定宽度的方框，让数字列对齐。 */

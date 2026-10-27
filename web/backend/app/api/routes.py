@@ -327,8 +327,16 @@ class AiChatRequest(BaseModel):
     messages: list[dict[str, Any]]
     sceneSummary: Optional[str] = None
     images: Optional[list[dict[str, str]]] = None
+    tools: Optional[list[dict[str, Any]]] = None
+    toolChoice: Optional[Any] = None
 
 
 @router.post("/ai/chat")
 async def ai_chat(request: AiChatRequest) -> dict[str, Any]:
-    return await ai_service.chat(request.messages, request.sceneSummary, request.images)
+    return await ai_service.chat(
+        request.messages,
+        request.sceneSummary,
+        request.images,
+        request.tools,
+        request.toolChoice,
+    )

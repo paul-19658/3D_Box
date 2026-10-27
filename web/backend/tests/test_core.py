@@ -311,6 +311,285 @@ def test_scene_descriptor_includes_lighting(client: TestClient) -> None:
     assert payload["lighting"]["fixed"][0]["producesShadow"] is False
 
 
+def test_compose_system_prompt_embeds_schema_for_legacy_prompt() -> None:
+    from app.services.ai_service import (
+        AI_DEFAULT_SYSTEM_PROMPT,
+        AI_SCENE_COMMAND_SCHEMA_HINT,
+        compose_system_prompt,
+        sanitize_images,
+    )
+
+    assert "list_assets" in AI_DEFAULT_SYSTEM_PROMPT
+    assert "apply_scene_commands" in AI_DEFAULT_SYSTEM_PROMPT
+    assert "animate_move" in AI_DEFAULT_SYSTEM_PROMPT
+    assert AI_SCENE_COMMAND_SCHEMA_HINT[:20] in AI_DEFAULT_SYSTEM_PROMPT
+
+    # 旧版「一次吐 JSON」提示 → 回落默认 agent 提示。
+    legacy_json = "你必须输出可被软件自动执行的 JSON 命令数组。"
+    composed_legacy = compose_system_prompt(legacy_json)
+    assert "list_assets" in composed_legacy
+    assert "能力提醒" in composed_legacy
+
+    # 缺 remove_object 的旧自定义提示 → 追加 schema。
+    legacy = "你是助手。可以用 clear_scene 清场。"
+    composed = compose_system_prompt(legacy)
+    assert "remove_object" in composed
+    assert "能力提醒" in composed
+
+    cleaned = sanitize_images(
+        [
+            {"mimeType": "image/png", "base64Data": "abcd"},
+            {"mimeType": "text/plain", "base64Data": "nope"},
+            {"mimeType": "image/jpeg", "base64Data": ""},
+        ]
+    )
+    assert cleaned == [{"mimeType": "image/png", "base64Data": "abcd"}]
+
+
+def test_ai_tools_pack_and_parse_openai_and_anthropic() -> None:
+    from app.services.ai_service import AiProviderConfig, AiService, sanitize_tools
+
+    tools = sanitize_tools(
+        [
+            {
+                "name": "list_assets",
+                "description": "列出资产",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {"name": "", "description": "应被丢弃"},
+            "not-a-dict",
+        ]
+    )
+    assert len(tools) == 1
+    assert tools[0]["name"] == "list_assets"
+
+    service = AiService(settings_path=__import__("pathlib").Path("unused.json"))
+    openai_provider = AiProviderConfig(
+        id="o1",
+        name="OpenAI",
+        kind="openai",
+        apiKey="sk-test",
+        model="gpt-4o-mini",
+    )
+    anthropic_provider = AiProviderConfig(
+        id="a1",
+        name="Anthropic",
+        kind="anthropic",
+        apiKey="sk-ant",
+        model="claude-3-5-sonnet-latest",
+    )
+
+    messages = [
+        {"role": "user", "content": "搭个房间"},
+        {
+            "role": "assistant",
+            "content": "先查资产",
+            "toolCalls": [
+                {"id": "call_1", "name": "list_assets", "arguments": {"limit": 10}}
+            ],
+        },
+        {
+            "role": "tool",
+            "toolCallId": "call_1",
+            "content": '{"total":0,"items":[]}',
+        },
+    ]
+
+    _, _, openai_body = service._build_openai(
+        openai_provider,
+        "system",
+        messages,
+        None,
+        None,
+        tools,
+        "auto",
+    )
+    assert "tools" in openai_body
+    assert openai_body["tools"][0]["type"] == "function"
+    assert openai_body["tools"][0]["function"]["name"] == "list_assets"
+    assert openai_body["tool_choice"] == "auto"
+    assert openai_body["messages"][2]["tool_calls"][0]["id"] == "call_1"
+    assert openai_body["messages"][3]["role"] == "tool"
+    assert openai_body["messages"][3]["tool_call_id"] == "call_1"
+
+    _, _, anthropic_body = service._build_anthropic(
+        anthropic_provider,
+        "system",
+        messages,
+        None,
+        None,
+        tools,
+        "auto",
+    )
+    assert anthropic_body["tools"][0]["name"] == "list_assets"
+    assert anthropic_body["tools"][0]["input_schema"]["type"] == "object"
+    assert anthropic_body["tool_choice"] == {"type": "auto"}
+    assistant_blocks = anthropic_body["messages"][1]["content"]
+    assert any(block.get("type") == "tool_use" for block in assistant_blocks)
+    tool_user = anthropic_body["messages"][2]
+    assert tool_user["role"] == "user"
+    assert tool_user["content"][0]["type"] == "tool_result"
+
+    openai_calls = AiService._extract_tool_calls(
+        "openai",
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "type": "function",
+                                "function": {
+                                    "name": "done",
+                                    "arguments": '{"summary":"完成"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+    )
+    assert openai_calls == [{"id": "tc1", "name": "done", "arguments": {"summary": "完成"}}]
+
+    anthropic_calls = AiService._extract_tool_calls(
+        "anthropic",
+        {
+            "content": [
+                {"type": "text", "text": "好的"},
+                {
+                    "type": "tool_use",
+                    "id": "tu1",
+                    "name": "apply_scene_commands",
+                    "input": {"commands": [{"type": "clear_scene"}]},
+                },
+            ]
+        },
+    )
+    assert anthropic_calls[0]["name"] == "apply_scene_commands"
+    assert anthropic_calls[0]["arguments"]["commands"][0]["type"] == "clear_scene"
+
+    # 无 tools 时请求体不含 tools 字段（兼容旧纯文本）。
+    _, _, plain = service._build_openai(
+        openai_provider, "system", [{"role": "user", "content": "hi"}], None, None, None, None
+    )
+    assert "tools" not in plain
+    assert AiService._extract_tool_calls(
+        "openai", {"choices": [{"message": {"content": "你好"}}]}
+    ) == []
+
+
+def test_openai_tool_transport_and_responses_packaging() -> None:
+    from app.services.ai_service import (
+        AiProviderConfig,
+        AiService,
+        looks_like_tools_reasoning_conflict,
+        openai_tool_transport,
+        sanitize_tools,
+    )
+
+    assert openai_tool_transport("gpt-6-astra", True) == "responses"
+    assert openai_tool_transport("gpt-6.1-sol", True) == "responses"
+    assert openai_tool_transport("gpt-5.6-luna", True) == "chat_none"
+    assert openai_tool_transport("gpt-4o-mini", True) == "chat"
+    assert openai_tool_transport("gpt-6-astra", False) == "chat"
+    assert looks_like_tools_reasoning_conflict(
+        "Function tools with reasoning_effort are not supported ... use /v1/responses"
+    )
+
+    tools = sanitize_tools(
+        [
+            {
+                "name": "list_assets",
+                "description": "列出资产",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+    )
+    service = AiService(settings_path=__import__("pathlib").Path("unused.json"))
+    astra = AiProviderConfig(
+        id="a",
+        name="Astra",
+        kind="openai-compatible",
+        apiKey="sk",
+        model="gpt-6-astra",
+        baseUrl="https://example.com/v1",
+    )
+    luna = AiProviderConfig(
+        id="l",
+        name="Luna",
+        kind="openai-compatible",
+        apiKey="sk",
+        model="gpt-5.6-luna",
+        baseUrl="https://example.com/v1",
+    )
+
+    url, _, responses_body = service._build_openai_responses(
+        astra,
+        "system",
+        [
+            {"role": "user", "content": "搭个房间"},
+            {
+                "role": "assistant",
+                "content": None,
+                "toolCalls": [{"id": "call_1", "name": "list_assets", "arguments": {}}],
+            },
+            {"role": "tool", "toolCallId": "call_1", "content": '{"total":0}'},
+        ],
+        None,
+        None,
+        tools,
+        "auto",
+    )
+    assert url.endswith("/responses")
+    assert responses_body["tools"][0]["name"] == "list_assets"
+    assert "function" not in responses_body["tools"][0]
+    assert responses_body["input"][1]["type"] == "function_call"
+    assert responses_body["input"][2]["type"] == "function_call_output"
+
+    _, _, chat_body = service._build_openai(
+        luna,
+        "system",
+        [{"role": "user", "content": "搭个房间"}],
+        None,
+        None,
+        tools,
+        "auto",
+        reasoning_effort="none",
+    )
+    assert chat_body["reasoning_effort"] == "none"
+    assert chat_body["tools"][0]["type"] == "function"
+
+    calls = AiService._extract_tool_calls(
+        "openai-responses",
+        {
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_9",
+                    "name": "done",
+                    "arguments": '{"summary":"完成"}',
+                }
+            ]
+        },
+    )
+    assert calls == [{"id": "call_9", "name": "done", "arguments": {"summary": "完成"}}]
+    text = AiService._extract_content(
+        "openai-responses",
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "好的"}],
+                }
+            ]
+        },
+    )
+    assert text == "好的"
+
+
 def test_ai_settings_never_returns_api_key(client: TestClient) -> None:
     client.put(
         "/api/ai/settings",

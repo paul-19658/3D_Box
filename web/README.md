@@ -385,10 +385,12 @@ npm rebuild <package-name>
 | 逻辑 | 前端 | 后端 |
 | --- | --- | --- |
 | 光照描述 | `core/lighting-description.js` | `services/scene_output.py` |
-| AI 系统提示词 | `core/ai-defaults.js`（仅占位） | `services/ai_service.py`（权威） |
+| AI 系统提示词（含命令 schema） | `core/ai-defaults.js`（仅占位） | `services/ai_service.py`（权威） |
 
 **为什么必须一致**：导出的场景说明由后端生成，画布里的提示由前端生成。
 两边措辞不一致，用户会怀疑"软件说的和做的不一样"。
+AI 控制链路（对话 → 命令 → 应用 → 截图复核）见
+[`docs/AI_DEV_GUIDE.md`](docs/AI_DEV_GUIDE.md)「AI 场景控制链路」。
 
 详细的协作规范、评审清单与 AI 启动提示词见
 [`docs/AI_DEV_GUIDE.md`](docs/AI_DEV_GUIDE.md)。

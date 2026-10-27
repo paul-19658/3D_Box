@@ -147,7 +147,27 @@ data() { return { renderer: null } }
 | 逻辑 | 前端 | 后端 | 一致性要求 |
 | --- | --- | --- | --- |
 | 光照描述 | `core/lighting-description.js` | `services/scene_output.py` | **措辞逐字一致** |
-| AI 系统提示词 | `core/ai-defaults.js` | `services/ai_service.py` | 后端是权威，前端仅占位 |
+| AI 系统提示词 | `core/ai-defaults.js` | `services/ai_service.py` | 后端是权威，前端仅占位；**必须逐字一致**（含内嵌的命令 schema） |
+| AI 命令 schema 提示 | `core/ai-defaults.js` → `AI_SCENE_COMMAND_SCHEMA_HINT` | `services/ai_service.py` 同名常量 | 默认 prompt 内嵌；旧版自定义 prompt 缺 `animate_move` 时后端仍会补全 |
+
+### AI 场景控制链路（Agent Loop + Tools）
+
+```
+AiComposer（文字 + 参考图）
+  → store.sendAiMessage（前端 Agent Loop，maxSteps≈12）
+  → POST /api/ai/chat（messages + tools；密钥不出浏览器）
+  → 若有 toolCalls：本地执行 list_assets / get_object / capture_* / apply_scene_commands / done
+  → 结果回灌 messages（截图作多模态附件）→ 下一轮，直到 done 或无 tool
+```
+
+| 能力 | 状态 | 关键文件 |
+| --- | --- | --- |
+| Agent 工具定义与执行 | ✅ | `core/ai-tools.js` |
+| 资产列表 / 物体详情 | ✅ | `scene.js` → `listAssets` / `getObjectDetail` |
+| 场景命令解析/应用（含 remove_object） | ✅ | `ai-commands.js` / `apply-ai-scene-commands.js` |
+| 目标机 / 总览 / 时间轴双视角截图 | ✅ | `SceneViewport` + capture_* tools |
+| 后端 tools 协议（OpenAI + Anthropic） | ✅ | `ai_service.py` |
+| Composer 展开收起 + 服务商切换 | ✅ | `AiComposer.vue` |
 
 **当前版本：schema 13**（12 → 13 只是新增 `kind: "path"` 的导航线对象与
 `pathNodes` / `pathBinding` 字段，旧工程原样保留即可，无需改写）。
