@@ -8,6 +8,10 @@
       :theme="theme"
       :error-count="diagnosticsErrorCount"
       :preview-active="previewMode"
+      :username="currentUsername"
+      :is-admin="isAdmin"
+      :read-only="isReadOnly"
+      :read-only-banner="readOnlyBanner"
       @select-panel="setPreviewMode($event === 'preview')"
       @rename="renameProject"
       @undo="$store.commit('undoScene')"
@@ -22,6 +26,8 @@
       @export-model="$store.commit('setModelExportOpen', true)"
       @open-ai-settings="$store.commit('setAiSettingsOpen', true)"
       @open-projects="$router.push('/projects')"
+      @open-admin="$router.push('/admin')"
+      @logout="handleLogout"
       @export-diagnostics="exportDiagnostics"
     />
 
@@ -397,6 +403,19 @@ export default {
     canRedo() {
       return this.$store.getters.canRedo
     },
+    currentUsername() {
+      return this.$store.state.currentUser?.username || ''
+    },
+    isAdmin() {
+      return this.$store.getters.isAdmin
+    },
+    isReadOnly() {
+      return this.$store.getters.isReadOnly
+    },
+    readOnlyBanner() {
+      const info = this.$store.state.readOnlyProject
+      return info ? `正在只读查看 ${info.ownerUsername} 的工程` : ''
+    },
     aiSending() {
       return this.$store.state.aiSending
     },
@@ -586,6 +605,12 @@ export default {
   },
 
   methods: {
+    async handleLogout() {
+      const { resetAuthProbe } = await import('@/router')
+      await this.$store.dispatch('logout')
+      resetAuthProbe()
+      this.$router.replace('/login')
+    },
     edit(update) {
       this.$store.dispatch('editScene', update)
     },

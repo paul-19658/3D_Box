@@ -1,7 +1,7 @@
 """端到端冒烟验证。
 
 用途：在真实启动的 uvicorn 上跑一遍关键链路，
-覆盖"保存 -> 列出 -> 打开 -> 描述 -> 恢复 -> 删除"。
+覆盖"登录 -> 保存 -> 列出 -> 打开 -> 描述 -> 恢复 -> 删除"。
 与 `tests/test_core.py` 的区别：那里用 TestClient 打进进程内，
 这里走真实 HTTP，能顺带验证静态资源托管与 SPA 回落。
 
@@ -11,47 +11,52 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import sys
 import urllib.parse
 import urllib.request
 
 
-def call(base: str, path: str, method: str = "GET", payload: dict | None = None) -> dict:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    # projectId 可能包含中文（工程名直接作为文件名），必须按段编码，
-    # 否则 http.client 会用 ascii 编码请求行并抛 UnicodeEncodeError。
-    safe_path = "/".join(
-        urllib.parse.quote(segment, safe="") if index > 0 else segment
-        for index, segment in enumerate(path.split("/"))
-    )
-    request = urllib.request.Request(
-        f"{base}{safe_path}", data=data, headers=headers, method=method
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        body = response.read().decode("utf-8")
-        return json.loads(body) if body else {}
-
-
 def main() -> int:
     base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
     checks: list[tuple[str, bool, str]] = []
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    def call(path: str, method: str = "GET", payload: dict | None = None) -> dict:
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        # projectId 可能包含中文（工程名直接作为文件名），必须按段编码，
+        # 否则 http.client 会用 ascii 编码请求行并抛 UnicodeEncodeError。
+        safe_path = "/".join(
+            urllib.parse.quote(segment, safe="") if index > 0 else segment
+            for index, segment in enumerate(path.split("/"))
+        )
+        request = urllib.request.Request(
+            f"{base}{safe_path}", data=data, headers=headers, method=method
+        )
+        with opener.open(request, timeout=20) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else {}
 
     def check(label: str, condition: bool, detail: str = "") -> None:
         checks.append((label, condition, detail))
 
-    health = call(base, "/api/health")
+    health = call("/api/health")
     check("health 可用", health.get("status") == "ok", str(health))
 
-    meta = call(base, "/api/meta")
+    meta = call("/api/meta")
     check("appName 中文未损坏", meta.get("appName") == "小白盒", repr(meta.get("appName")))
     check("schema 版本为 13", meta.get("projectSchemaVersion") == 13)
 
-    profiles = call(base, "/api/platform-profiles")
+    login = call("/api/auth/login", "POST", {"username": "smoke-user"})
+    check("登录成功", bool(login.get("user", {}).get("id")), str(login))
+
+    profiles = call("/api/platform-profiles")
     check("平台预设 5 条", len(profiles.get("profiles", [])) == 5)
 
     document = {
@@ -102,24 +107,24 @@ def main() -> int:
         },
     }
 
-    saved = call(base, "/api/projects", "POST", {"document": document, "projectId": None})
+    saved = call("/api/projects", "POST", {"document": document, "projectId": None})
     project_id = saved.get("projectId")
     check("保存返回 projectId", bool(project_id), str(saved))
 
-    listed = call(base, "/api/projects")
+    listed = call("/api/projects")
     check(
         "工程出现在列表里",
         any(item.get("projectId") == project_id for item in listed.get("projects", [])),
     )
 
-    opened = call(base, f"/api/projects/{project_id}")
+    opened = call(f"/api/projects/{project_id}")
     check("打开后物体数量一致", len(opened.get("document", {}).get("scene", {}).get("objects", [])) == 1)
 
-    descriptor = call(base, "/api/scene-descriptor", "POST", {"projectName": "冒烟场景", "scene": document["scene"]})
+    descriptor = call("/api/scene-descriptor", "POST", {"projectName": "冒烟场景", "scene": document["scene"]})
     check("场景说明 schemaVersion 为 2", descriptor.get("schemaVersion") == 2)
     check("场景说明含光照段", "lighting" in descriptor)
 
-    prompt = call(base, "/api/suggested-prompt", "POST", {"projectName": "冒烟场景", "scene": document["scene"]})
+    prompt = call("/api/suggested-prompt", "POST", {"projectName": "冒烟场景", "scene": document["scene"]})
     prompt_text = prompt.get("prompt", "")
     check("建议提示词带出物体描述", "白色长桌" in prompt_text)
     check("建议提示词包含光照段落", "光照：" in prompt_text)
@@ -127,7 +132,6 @@ def main() -> int:
     check("建议提示词禁止新增光源", "不要自行添加新的光源" in prompt_text)
 
     empty_prompt = call(
-        base,
         "/api/suggested-prompt",
         "POST",
         {
@@ -142,18 +146,17 @@ def main() -> int:
     )
     check("未填描述时给出引导文案", "物体描述" in empty_prompt.get("prompt", ""))
 
-    call(base, "/api/recovery", "POST", {"document": document, "projectId": project_id})
-    recovery = call(base, "/api/recovery")
+    call("/api/recovery", "POST", {"document": document, "projectId": project_id})
+    recovery = call("/api/recovery")
     check("恢复快照可读回", recovery.get("status") == "found")
 
-    recent = call(base, "/api/recent")
+    recent = call("/api/recent")
     check(
         "最近工程已记录",
         any(item.get("projectId") == project_id for item in recent.get("entries", [])),
     )
 
     validation = call(
-        base,
         "/api/platform-profiles/validate",
         "POST",
         {
@@ -167,23 +170,23 @@ def main() -> int:
     )
     check("平台校验无错误", validation.get("errors") == [], str(validation.get("errors")))
 
-    settings = call(base, "/api/ai/settings")
+    settings = call("/api/ai/settings")
     check("AI 设置不回传密钥明文", "apiKey" not in json.dumps(settings.get("settings", {})))
 
     text_export = call(
-        base, "/api/exports/text", "POST", {"fileName": "冒烟说明.md", "content": "# 冒烟\n"}
+        "/api/exports/text", "POST", {"fileName": "冒烟说明.md", "content": "# 冒烟\n"}
     )
     check("文本导出成功", text_export.get("byteLength", 0) > 0, str(text_export))
 
-    call(base, "/api/recovery", "DELETE")
-    check("恢复快照可清除", call(base, "/api/recovery").get("status") == "empty")
+    call("/api/recovery", "DELETE")
+    check("恢复快照可清除", call("/api/recovery").get("status") == "empty")
 
-    call(base, f"/api/projects/{project_id}", "DELETE")
+    call(f"/api/projects/{project_id}", "DELETE")
     check(
         "工程可删除",
         not any(
             item.get("projectId") == project_id
-            for item in call(base, "/api/projects").get("projects", [])
+            for item in call("/api/projects").get("projects", [])
         ),
     )
 

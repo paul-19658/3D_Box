@@ -114,6 +114,19 @@ describe('executeAiTool', () => {
     expect(invalid.error).toContain('add_object/dragon')
   })
 
+  it('apply_scene_commands 对截断的 raw JSON 给出明确错误', () => {
+    const result = executeAiTool(
+      'apply_scene_commands',
+      {
+        raw: '{"commands":[{"type":"clear_scene"},{"type":"add_object","kind":"cylinder","position":{"x":'
+      },
+      makeCtx(createInitialScene())
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('截断')
+    expect(result.display).toContain('maxTokens')
+  })
+
   it('apply_scene_commands 兼容别名、字符串数字与字符串化 commands', () => {
     const ctx = makeCtx(createInitialScene())
     const aliased = executeAiTool(

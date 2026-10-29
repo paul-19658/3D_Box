@@ -285,32 +285,56 @@ function executeCaptureTimelinePair(ctx, input) {
  * 兼容模型常见的 tool 参数形态：
  * - { commands: [...] }
  * - { commands: "[{...}]" }（字符串化数组）
+ * - { raw: "{...}" }（后端在 JSON 解析失败时的兜底；多为输出截断）
  * - 直接传命令数组
  * - { command: {...} } / 单条命令对象
+ *
+ * @returns {{ commands: any[], truncated: boolean }}
  */
 function normalizeCommandsArg(input) {
-  if (Array.isArray(input)) return input
-  if (!input || typeof input !== 'object') return []
+  if (Array.isArray(input)) return { commands: input, truncated: false }
+  if (!input || typeof input !== 'object') return { commands: [], truncated: false }
+
   let raw = input.commands
   if (raw === undefined && input.command !== undefined) raw = input.command
+  if (raw === undefined && typeof input.raw === 'string') raw = input.raw
+
   if (typeof raw === 'string') {
     try {
       raw = JSON.parse(raw)
     } catch {
-      return []
+      // 非法 JSON 多半是 maxTokens 截断；不要静默当成空 commands。
+      return { commands: [], truncated: true }
     }
   }
-  if (Array.isArray(raw)) return raw
-  if (raw && typeof raw === 'object') return [raw]
+  if (Array.isArray(raw)) {
+    if (raw.length === 1 && raw[0] && typeof raw[0] === 'object' && Array.isArray(raw[0].commands)) {
+      return { commands: raw[0].commands, truncated: false }
+    }
+    return { commands: raw, truncated: false }
+  }
+  if (raw && typeof raw === 'object') {
+    if (Array.isArray(raw.commands)) return { commands: raw.commands, truncated: false }
+    return { commands: [raw], truncated: false }
+  }
   // 有的模型把 type/kind 直接放在 arguments 根上。
-  if (typeof input.type === 'string') return [input]
-  return []
+  if (typeof input.type === 'string') return { commands: [input], truncated: false }
+  return { commands: [], truncated: false }
 }
 
 function executeApplyCommands(ctx, input) {
-  const raw = normalizeCommandsArg(input)
+  const { commands: raw, truncated } = normalizeCommandsArg(input)
   if (typeof console !== 'undefined' && console.debug) {
-    console.debug('[ai-tools] apply_scene_commands raw:', raw)
+    console.debug('[ai-tools] apply_scene_commands raw:', raw, truncated ? '(truncated)' : '')
+  }
+  if (truncated) {
+    return {
+      ok: false,
+      error:
+        '场景命令 JSON 被截断（多为 maxTokens 不足）。请提高 AI 设置中的 maxTokens（建议 ≥ 8192），或分多轮、每次少量命令搭建。',
+      rejected: ['truncated_json'],
+      display: '命令被截断（请提高 maxTokens）'
+    }
   }
   const { commands, rejected } = parseCommandList(raw)
   if (commands.length === 0) {

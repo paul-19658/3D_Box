@@ -1,0 +1,2 @@
+Alembic migrations for Xiaobaihe Web. Models live in app.db.models.
+Runtime auto-upgrade is invoked from app.main lifespan.

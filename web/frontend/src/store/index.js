@@ -165,7 +165,15 @@ export default new Vuex.Store({
     videoProfileId: 'generic-16x9',
     videoValidation: null,
 
-    meta: null
+    meta: null,
+
+    /** 当前登录用户 { id, username, role }；未登录为 null。 */
+    currentUser: null,
+    /**
+     * 管理员只读打开他人工程时非 null：
+     * { projectId, ownerUsername }
+     */
+    readOnlyProject: null
   },
 
   getters: {
@@ -174,8 +182,10 @@ export default new Vuex.Store({
     camera: (state) => state.history.present.camera,
     lighting: (state) => state.history.present.lighting,
     timeline: (state) => state.history.present.timeline,
-    canUndo: (state) => state.history.past.length > 0,
-    canRedo: (state) => state.history.future.length > 0,
+    isAdmin: (state) => state.currentUser?.role === 'admin',
+    isReadOnly: (state) => Boolean(state.readOnlyProject),
+    canUndo: (state) => !state.readOnlyProject && state.history.past.length > 0,
+    canRedo: (state) => !state.readOnlyProject && state.history.future.length > 0,
     selectedObjects: (state) =>
       state.history.present.objects.filter((object) => state.selectedIds.includes(object.id)),
     selectedLight: (state) =>
@@ -191,14 +201,23 @@ export default new Vuex.Store({
   },
 
   mutations: {
+    setCurrentUser(state, user) {
+      state.currentUser = user
+    },
+    setReadOnlyProject(state, info) {
+      state.readOnlyProject = info
+    },
     commitScene(state, nextScene) {
+      if (state.readOnlyProject) return
       state.history = commitHistory(state.history, nextScene)
       state.savedFingerprint ||= ''
     },
     undoScene(state) {
+      if (state.readOnlyProject) return
       state.history = undoHistory(state.history)
     },
     redoScene(state) {
+      if (state.readOnlyProject) return
       state.history = redoHistory(state.history)
     },
     resetScene(state, scene) {
@@ -212,6 +231,7 @@ export default new Vuex.Store({
     },
     /** 工程改名。走 mutation 而不是直接赋值，保证 devtools 里可追踪。 */
     setProjectName(state, name) {
+      if (state.readOnlyProject) return
       state.projectName = (name || '').trim() || '未命名场景'
     },
 
@@ -418,7 +438,7 @@ export default new Vuex.Store({
       setTimeout(() => commit('dismissNotice', id), delay)
     },
 
-    async bootstrap({ commit, dispatch }) {
+    async bootstrap({ state, commit, dispatch }) {
       try {
         commit('setMeta', await api.meta())
       } catch (error) {
@@ -433,28 +453,70 @@ export default new Vuex.Store({
         // 平台规则不是核心功能，取不到时不阻塞启动。
       }
 
+      const theme = window.localStorage.getItem('xiaobaihe-theme')
+      if (theme === 'light' || theme === 'dark') commit('setTheme', theme)
+
+      // AI / recovery / recent 需要登录；由 login / fetchCurrentUser 成功后加载。
+      if (state.currentUser) {
+        await dispatch('loadUserWorkspace')
+      }
+    },
+
+    async fetchCurrentUser({ commit, dispatch }) {
+      try {
+        const result = await api.auth.me()
+        commit('setCurrentUser', result.user)
+        await dispatch('loadUserWorkspace')
+        return result.user
+      } catch {
+        commit('setCurrentUser', null)
+        return null
+      }
+    },
+
+    async login({ commit, dispatch }, username) {
+      const result = await api.auth.login(username)
+      commit('setCurrentUser', result.user)
+      await dispatch('loadUserWorkspace')
+      return result.user
+    },
+
+    async logout({ commit, dispatch }) {
+      try {
+        await api.auth.logout()
+      } catch {
+        // 即使后端失败也清本地会话。
+      }
+      commit('setCurrentUser', null)
+      commit('setRecentProjects', [])
+      commit('setRecoverySnapshot', null)
+      commit('setReadOnlyProject', null)
+      commit('setAiMessages', [])
+      commit('setAiSettings', null)
+      dispatch('newProject')
+    },
+
+    async loadUserWorkspace({ commit }) {
       try {
         const settings = await api.ai.settings()
         commit('setAiSettings', settings.settings)
       } catch {
-        // 同上。
+        // 未登录或无权时忽略。
       }
-
-      const theme = window.localStorage.getItem('xiaobaihe-theme')
-      if (theme === 'light' || theme === 'dark') commit('setTheme', theme)
 
       try {
         const recovery = await api.recovery.load()
         if (recovery.status === 'found') commit('setRecoverySnapshot', recovery.snapshot)
+        else commit('setRecoverySnapshot', null)
       } catch {
-        // 恢复快照读取失败不阻塞启动。
+        commit('setRecoverySnapshot', null)
       }
 
       try {
         const recent = await api.recent.list()
         commit('setRecentProjects', recent.entries)
       } catch {
-        // 同上。
+        commit('setRecentProjects', [])
       }
     },
 
@@ -471,8 +533,10 @@ export default new Vuex.Store({
     },
 
     scheduleAutosave({ state }) {
+      if (state.readOnlyProject) return
       if (autosaveTimer) window.clearTimeout(autosaveTimer)
       autosaveTimer = window.setTimeout(() => {
+        if (state.readOnlyProject) return
         const scene = state.history.present
         api.recovery
           .save(
@@ -492,6 +556,10 @@ export default new Vuex.Store({
     },
 
     async saveProject({ state, commit, dispatch }, { saveAs = false } = {}) {
+      if (state.readOnlyProject) {
+        await dispatch('notify', { kind: 'info', message: '只读模式下不能保存。' })
+        return false
+      }
       commit('setBusy', true)
       try {
         const scene = state.history.present
@@ -525,6 +593,7 @@ export default new Vuex.Store({
       try {
         const result = await api.projects.open(projectId)
         const document = migrateProjectDocument(result.document)
+        commit('setReadOnlyProject', null)
         commit('resetScene', {
           objects: document.scene.objects,
           camera: document.scene.camera,
@@ -553,8 +622,47 @@ export default new Vuex.Store({
       }
     },
 
+    async openProjectReadOnly({ commit, dispatch }, projectId) {
+      commit('setBusy', true)
+      try {
+        const result = await api.admin.openProject(projectId)
+        const document = migrateProjectDocument(result.document)
+        commit('resetScene', {
+          objects: document.scene.objects,
+          camera: document.scene.camera,
+          lighting: document.scene.lighting,
+          timeline: document.scene.timeline
+        })
+        commit('markSaved', {
+          fingerprint: sceneFingerprint(
+            document.scene.objects,
+            document.scene.camera,
+            document.scene.lighting,
+            document.scene.timeline
+          ),
+          savedAt: document.savedAt,
+          projectId,
+          projectName: document.name
+        })
+        commit('setSelection', document.scene.objects[0] ? [document.scene.objects[0].id] : [])
+        commit('setReadOnlyProject', {
+          projectId,
+          ownerUsername: result.ownerUsername || '未知用户'
+        })
+        await dispatch('notify', {
+          kind: 'info',
+          message: `正在只读查看 ${result.ownerUsername || '未知用户'} 的工程。`
+        })
+      } catch (error) {
+        await dispatch('notify', { kind: 'error', message: `打开失败：${error.message}` })
+      } finally {
+        commit('setBusy', false)
+      }
+    },
+
     newProject({ commit, dispatch }) {
       const scene = createInitialScene()
+      commit('setReadOnlyProject', null)
       commit('resetScene', scene)
       // 用初始场景指纹打底，新建后不应显示"有未保存修改"。
       commit('markSaved', {
@@ -571,6 +679,7 @@ export default new Vuex.Store({
       const snapshot = state.recoverySnapshot
       if (!snapshot) return
       const document = migrateProjectDocument(snapshot.document)
+      commit('setReadOnlyProject', null)
       commit('resetScene', {
         objects: document.scene.objects,
         camera: document.scene.camera,
@@ -643,14 +752,17 @@ export default new Vuex.Store({
         (attached.length > 0
           ? '请根据我附带的参考图，搭建对应的白膜场景（构图、站位与镜头尽量贴近参考）。'
           : '')
-      const displayContent =
-        attached.length > 0 ? `${content}\n\n[已附带 ${attached.length} 张参考图]` : content
       const apiUserContent =
         attached.length > 0
           ? `${content}\n\n（用户附带了 ${attached.length} 张参考图，请据此搭建。）`
           : content
 
-      commit('pushAiMessage', { role: 'user', content: displayContent })
+      // 图片只挂在消息对象上供 UI 展示；对话本身不落盘，无需服务端存图。
+      commit('pushAiMessage', {
+        role: 'user',
+        content,
+        images: attached.length > 0 ? attached : undefined
+      })
       commit('setPendingAiImages', [])
       commit('setAiSending', true)
       commit('setAiVerifying', false)
@@ -688,7 +800,8 @@ export default new Vuex.Store({
             sceneSummary: getters.sceneSummary,
             images: nextImages.length > 0 ? nextImages : undefined,
             tools: AI_TOOL_DEFINITIONS,
-            toolChoice: 'auto'
+            toolChoice: 'auto',
+            providerId: state.aiSettings?.activeProviderId || undefined
           })
           nextImages = []
 
@@ -839,21 +952,19 @@ export default new Vuex.Store({
       }
     },
 
-    /** 在输入条直接切换当前服务商（密钥沿用，空 apiKey 表示不改）。 */
-    async setActiveAiProvider({ state, dispatch }, providerId) {
+    /**
+     * 在输入条直接切换当前服务商。
+     * 只改当前浏览器会话里的 activeProviderId，不写全局 ai-environment.json
+     *（全局配置仍仅管理员可改）。真正发对话时会把 providerId 带给后端。
+     */
+    async setActiveAiProvider({ state, commit, dispatch }, providerId) {
       const settings = state.aiSettings
       if (!settings || !providerId || settings.activeProviderId === providerId) return
       const provider = (settings.providers || []).find((item) => item.id === providerId)
       if (!provider) return
-      await dispatch('saveAiSettings', {
-        activeProviderId: providerId,
-        systemPrompt: settings.systemPrompt,
-        providers: (settings.providers || []).map((item) => {
-          const copy = { ...item }
-          delete copy.hasApiKey
-          return { ...copy, apiKey: '' }
-        })
-      })
+      commit('setAiSettings', { ...settings, activeProviderId: providerId })
+      const label = provider.name || provider.model || providerId
+      await dispatch('notify', { kind: 'info', message: `已切换到「${label}」。` })
     },
 
     async clearAiMessages({ commit }) {

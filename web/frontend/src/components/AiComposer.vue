@@ -21,7 +21,21 @@
           class="msg"
           :class="message.role === 'user' ? 'msg--user' : 'msg--assistant'"
         >
-          <pre class="msg__text">{{ displayMessage(message.content) }}</pre>
+          <pre v-if="displayMessage(message.content)" class="msg__text">{{
+            displayMessage(message.content)
+          }}</pre>
+          <div v-if="messageImages(message).length > 0" class="msg__images">
+            <button
+              v-for="(image, imageIndex) in messageImages(message)"
+              :key="imageIndex"
+              type="button"
+              class="msg__image"
+              :title="image.name || `参考图 ${imageIndex + 1}`"
+              @click.stop="openImagePreview(image)"
+            >
+              <img :src="thumbSrc(image)" :alt="image.name || `参考图 ${imageIndex + 1}`" />
+            </button>
+          </div>
         </article>
         <div v-if="verifying || sending" class="msg msg--assistant msg--pending">
           <pre class="msg__text">{{
@@ -95,7 +109,7 @@
           <span v-if="sending || verifying" class="spinner spinner--sm"></span>
           <svg v-else viewBox="0 0 16 16" aria-hidden="true">
             <path
-              d="M8 2.2 8.9 5.4 12 4.2 10 7l3 1-3 1 2 2.8-3.1-1.2L8 13.8l-.9-3.2L4 11.8 6 9l-3-1 3-1-2-2.8 3.1 1.2z"
+              d="M8 2.8 3.6 7.2a.75.75 0 0 0 1.06 1.06L7.25 5.67V12.5a.75.75 0 0 0 1.5 0V5.67l2.59 2.59A.75.75 0 1 0 12.4 7.2L8 2.8Z"
               fill="currentColor"
             />
           </svg>
@@ -179,7 +193,7 @@
           <span v-if="sending || verifying" class="spinner spinner--sm"></span>
           <svg v-else viewBox="0 0 16 16" aria-hidden="true">
             <path
-              d="M8 2.2 8.9 5.4 12 4.2 10 7l3 1-3 1 2 2.8-3.1-1.2L8 13.8l-.9-3.2L4 11.8 6 9l-3-1 3-1-2-2.8 3.1 1.2z"
+              d="M8 2.8 3.6 7.2a.75.75 0 0 0 1.06 1.06L7.25 5.67V12.5a.75.75 0 0 0 1.5 0V5.67l2.59 2.59A.75.75 0 1 0 12.4 7.2L8 2.8Z"
               fill="currentColor"
             />
           </svg>
@@ -308,7 +322,10 @@ export default {
       return model
     },
     displayMessage(content) {
-      return String(content || '').replace(/```json\s*[\s\S]*?```/gi, '```json\n[场景命令已折叠]\n```')
+      return String(content || '')
+        .replace(/```json\s*[\s\S]*?```/gi, '```json\n[场景命令已折叠]\n```')
+        .replace(/\n\n\[已附带 \d+ 张参考图\]\s*$/u, '')
+        .trim()
     },
     scrollTranscript() {
       const list = this.$refs.transcriptList
@@ -377,7 +394,17 @@ export default {
       this.$emit('remove-image', index)
     },
     thumbSrc(image) {
-      return `data:${image.mimeType};base64,${image.base64Data}`
+      if (!image) return ''
+      if (image.dataUrl) return image.dataUrl
+      return `data:${image.mimeType || 'image/png'};base64,${image.base64Data || ''}`
+    },
+    messageImages(message) {
+      return Array.isArray(message?.images) ? message.images : []
+    },
+    openImagePreview(image) {
+      const src = this.thumbSrc(image)
+      if (!src) return
+      window.open(src, '_blank', 'noopener')
     },
     async handleImages(event) {
       const files = [...event.target.files]
@@ -465,10 +492,125 @@ export default {
 }
 
 .composer.is-sending .composer__card {
-  border-color: color-mix(in srgb, var(--ai-cyan) 45%, var(--ai-border));
+  position: relative;
+  isolation: isolate;
+  border-color: color-mix(in srgb, var(--ai-cyan) 75%, transparent);
   box-shadow:
     0 18px 48px rgba(0, 0, 0, 0.45),
-    0 0 0 1px color-mix(in srgb, var(--ai-cyan) 20%, transparent);
+    0 0 0 1px color-mix(in srgb, var(--ai-cyan) 40%, transparent),
+    0 0 28px color-mix(in srgb, var(--ai-cyan) 42%, transparent),
+    0 0 56px color-mix(in srgb, var(--ai-cyan) 22%, transparent);
+  animation: composer-glow-pulse 1.6s ease-in-out infinite;
+}
+
+/* 外圈柔光：不旋转元素本身，避免胶囊形被拧歪 */
+.composer.is-sending .composer__card::before {
+  content: '';
+  position: absolute;
+  inset: -40%;
+  z-index: -1;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in srgb, var(--ai-cyan) 55%, transparent),
+    color-mix(in srgb, var(--ai-cyan) 18%, transparent) 42%,
+    transparent 72%
+  );
+  opacity: 0.55;
+  animation: composer-halo-breathe 1.8s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* 横向扫光 */
+.composer.is-sending .composer__card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    105deg,
+    transparent 18%,
+    color-mix(in srgb, var(--ai-cyan) 14%, transparent) 42%,
+    color-mix(in srgb, var(--ai-cyan-strong) 36%, transparent) 50%,
+    color-mix(in srgb, #fff 22%, var(--ai-cyan)) 52%,
+    color-mix(in srgb, var(--ai-cyan) 14%, transparent) 58%,
+    transparent 82%
+  );
+  background-size: 220% 100%;
+  animation: composer-shimmer 1.9s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.composer.is-sending .composer__card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.composer.is-sending .composer__placeholder {
+  color: color-mix(in srgb, var(--ai-cyan-strong) 78%, #fff);
+  text-shadow: 0 0 12px color-mix(in srgb, var(--ai-cyan) 55%, transparent);
+  animation: composer-text-pulse 1.4s ease-in-out infinite;
+}
+
+.composer.is-sending .composer__input::placeholder {
+  color: color-mix(in srgb, var(--ai-cyan-strong) 72%, #fff);
+}
+
+@keyframes composer-glow-pulse {
+  0%,
+  100% {
+    border-color: color-mix(in srgb, var(--ai-cyan) 55%, transparent);
+    box-shadow:
+      0 18px 48px rgba(0, 0, 0, 0.45),
+      0 0 0 1px color-mix(in srgb, var(--ai-cyan) 35%, transparent),
+      0 0 22px color-mix(in srgb, var(--ai-cyan) 32%, transparent),
+      0 0 44px color-mix(in srgb, var(--ai-cyan) 16%, transparent);
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--ai-cyan-strong) 90%, #fff);
+    box-shadow:
+      0 18px 48px rgba(0, 0, 0, 0.45),
+      0 0 0 1px color-mix(in srgb, var(--ai-cyan-strong) 65%, transparent),
+      0 0 38px color-mix(in srgb, var(--ai-cyan) 62%, transparent),
+      0 0 76px color-mix(in srgb, var(--ai-cyan) 34%, transparent);
+  }
+}
+
+@keyframes composer-halo-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 0.75;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes composer-shimmer {
+  0% {
+    background-position: 140% 0;
+    opacity: 0.4;
+  }
+  45%,
+  55% {
+    opacity: 0.95;
+  }
+  100% {
+    background-position: -140% 0;
+    opacity: 0.4;
+  }
+}
+
+@keyframes composer-text-pulse {
+  0%,
+  100% {
+    opacity: 0.72;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .composer__prompt {
@@ -784,6 +926,18 @@ export default {
   box-shadow: none;
 }
 
+.composer.is-sending .send-btn:disabled {
+  opacity: 1;
+  cursor: wait;
+  filter: none;
+  background: linear-gradient(180deg, #b8f7ff, var(--ai-cyan-strong) 40%, var(--ai-cyan));
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--ai-cyan-strong) 45%, transparent),
+    0 0 22px color-mix(in srgb, var(--ai-cyan) 70%, transparent),
+    0 0 40px color-mix(in srgb, var(--ai-cyan) 40%, transparent);
+  animation: send-busy-pulse 1.2s ease-in-out infinite;
+}
+
 .send-btn svg {
   width: 16px;
   height: 16px;
@@ -794,6 +948,33 @@ export default {
   height: 14px;
   border-width: 2px;
   border-top-color: #0b1218;
+}
+
+.composer.is-sending .spinner--sm {
+  width: 16px;
+  height: 16px;
+  border-color: rgba(11, 18, 24, 0.22);
+  border-top-color: #061018;
+  border-right-color: rgba(11, 18, 24, 0.55);
+  animation: spin 0.55s linear infinite;
+}
+
+@keyframes send-busy-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--ai-cyan-strong) 40%, transparent),
+      0 0 18px color-mix(in srgb, var(--ai-cyan) 55%, transparent),
+      0 0 32px color-mix(in srgb, var(--ai-cyan) 28%, transparent);
+  }
+  50% {
+    transform: scale(1.06);
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--ai-cyan-strong) 65%, transparent),
+      0 0 28px color-mix(in srgb, var(--ai-cyan) 85%, transparent),
+      0 0 52px color-mix(in srgb, var(--ai-cyan) 48%, transparent);
+  }
 }
 
 .composer__thumbs {
@@ -906,6 +1087,30 @@ export default {
 .msg--user .msg__text {
   border-color: color-mix(in srgb, var(--ai-cyan) 28%, transparent);
   background: color-mix(in srgb, var(--ai-cyan) 10%, rgba(255, 255, 255, 0.04));
+}
+
+.msg__images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.msg__image {
+  display: block;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.25);
+  cursor: zoom-in;
+}
+
+.msg__image img {
+  display: block;
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
 }
 
 .msg--pending .msg__text {

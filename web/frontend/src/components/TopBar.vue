@@ -97,6 +97,9 @@
     </div>
 
     <div class="topbar__right">
+      <span v-if="readOnlyBanner" class="readonly-banner" :title="readOnlyBanner">
+        {{ readOnlyBanner }}
+      </span>
       <button type="button" class="btn btn--ghost" title="切换主题" @click="$emit('toggle-theme')">
         {{ theme === 'dark' ? '浅色' : '深色' }}
       </button>
@@ -112,7 +115,15 @@
       >
         诊断{{ errorCount > 0 ? ` (${errorCount})` : '' }}
       </button>
-      <button type="button" class="btn" @click="$emit('save')">保存</button>
+      <button
+        type="button"
+        class="btn"
+        :disabled="readOnly"
+        :title="readOnly ? '只读模式下不能保存' : '保存'"
+        @click="$emit('save')"
+      >
+        保存
+      </button>
 
       <div class="menu-wrap">
         <button type="button" class="btn" @click="menuOpen = !menuOpen">
@@ -138,8 +149,16 @@
         </button>
         <div v-if="fileMenuOpen" class="menu" @mouseleave="fileMenuOpen = false">
           <button type="button" class="menu__item" @click="pick('new')">新建场景</button>
-          <button type="button" class="menu__item" @click="pick('save-as')">另存为…</button>
+          <button type="button" class="menu__item" :disabled="readOnly" @click="pick('save-as')">
+            另存为…
+          </button>
           <button type="button" class="menu__item" @click="pick('open-recent')">最近工程…</button>
+          <button v-if="isAdmin" type="button" class="menu__item" @click="pick('open-admin')">
+            管理…
+          </button>
+          <button type="button" class="menu__item" @click="pick('logout')">
+            退出（{{ username || '未登录' }}）
+          </button>
         </div>
       </div>
     </div>
@@ -172,7 +191,11 @@ export default {
      * 时间轴要自动循环、编辑工具要全部收起。顶栏只是"开关的把手"，
      * 真正的状态必须能被别处读取和驱动（例如按 Esc 退出预演）。
      */
-    previewActive: { type: Boolean, default: false }
+    previewActive: { type: Boolean, default: false },
+    username: { type: String, default: '' },
+    isAdmin: { type: Boolean, default: false },
+    readOnly: { type: Boolean, default: false },
+    readOnlyBanner: { type: String, default: '' }
   },
 
   data() {
@@ -345,7 +368,25 @@ export default {
   cursor: pointer;
 }
 
-.menu__item:hover {
+.menu__item:hover:not(:disabled) {
   background: var(--bg-3);
+}
+
+.menu__item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.readonly-banner {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 10px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+  font-size: 12px;
 }
 </style>

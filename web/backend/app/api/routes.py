@@ -5,34 +5,52 @@
 - 成功返回业务数据本身，不额外包一层 `{code, data}`；
 - 失败统一抛 HTTPException，由 FastAPI 输出 `{detail}`；
 - 路径参数一律使用字符串 id，不暴露服务端真实文件路径。
+- 用户数据接口需要 Cookie 会话；公开接口：health / meta / platform-profiles / scene-descriptor。
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from app.db.models import User
+from app.db.session import get_db
+from app.services import project_repo
 from app.services.ai_service import (
+    AI_DEFAULT_MAX_TOKENS,
+    AI_DEFAULT_SYSTEM_PROMPT,
     AiProviderConfig,
     AiService,
     AiSettings,
-    AI_DEFAULT_SYSTEM_PROMPT,
+)
+from app.services.auth import (
+    clear_session_cookie,
+    current_user,
+    login_or_create,
+    require_admin,
+    set_session_cookie,
+    user_public,
 )
 from app.services.platform_profiles import load_rules, validate_video_profile
-from app.services.project_store import ProjectFileService, DEFAULT_WORKSPACE
+from app.services.project_store import DEFAULT_WORKSPACE, ProjectFileService, user_workspace
 from app.services.scene_output import build_scene_descriptor, build_suggested_prompt
+from app.services.workspace_log import logs_dir, write_log_event
 
 router = APIRouter(prefix="/api")
 
-store = ProjectFileService()
 ai_service = AiService(settings_path=DEFAULT_WORKSPACE / "ai-environment.json")
 
 
+def _store_for(user: User) -> ProjectFileService:
+    return ProjectFileService(workspace=user_workspace(user.id))
+
+
 # ----------------------------------------------------------------------
-# 元信息
+# 元信息 / 鉴权
 # ----------------------------------------------------------------------
 
 
@@ -45,10 +63,49 @@ def health() -> dict[str, str]:
 def meta() -> dict[str, Any]:
     return {
         "appName": "小白盒",
-        "appVersion": store.app_version,
+        "appVersion": "0.22.0",
         "projectExtension": "block3d",
         "projectSchemaVersion": 13,
     }
+
+
+class LoginRequest(BaseModel):
+    username: str
+    # 预留字段：一期忽略，即使传入也不校验。
+    password: Optional[str] = None
+
+
+@router.post("/auth/login")
+def auth_login(
+    request: LoginRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    user = login_or_create(db, request.username)
+    set_session_cookie(response, user.id)
+    write_log_event(
+        logs_dir(DEFAULT_WORKSPACE),
+        kind="auth.login",
+        message=f"login {user.username}",
+        payload={"userId": user.id, "username": user.username},
+    )
+    return {"user": user_public(user)}
+
+
+@router.post("/auth/logout")
+def auth_logout(response: Response) -> dict[str, str]:
+    write_log_event(
+        logs_dir(DEFAULT_WORKSPACE),
+        kind="auth.logout",
+        message="logout",
+    )
+    clear_session_cookie(response)
+    return {"status": "ok"}
+
+
+@router.get("/auth/me")
+def auth_me(user: User = Depends(current_user)) -> dict[str, Any]:
+    return {"user": user_public(user)}
 
 
 # ----------------------------------------------------------------------
@@ -67,31 +124,78 @@ class AutosaveRequest(BaseModel):
 
 
 @router.get("/projects")
-def list_projects() -> dict[str, Any]:
-    return {"projects": store.list_projects()}
+def list_projects(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    rows = project_repo.list_owned(db, user.id)
+    return {"projects": [project_repo.project_to_list_entry(row) for row in rows]}
 
 
 @router.post("/projects")
-def save_project(request: SaveProjectRequest) -> dict[str, Any]:
+def save_project(
+    request: SaveProjectRequest,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    store = _store_for(user)
+    if request.projectId:
+        existing = project_repo.get_owned(db, user.id, request.projectId)
+        if existing is None and store.path_for(request.projectId).exists():
+            # 文件在别人目录里不会出现在这里；这里防止伪造他人 id 写入自己目录后串号。
+            pass
+        if existing is None and request.projectId:
+            # 允许新建带指定 id，或覆盖自己已有工程；若库中无记录但 id 已被他人占用则 404。
+            foreign = project_repo.get_any(db, request.projectId)
+            if foreign is not None and foreign.owner_id != user.id:
+                raise HTTPException(status_code=404, detail=f"找不到工程：{request.projectId}")
     try:
-        return store.save(request.document, request.projectId)
+        result = store.save(request.document, request.projectId)
     except OSError as error:
         raise HTTPException(status_code=500, detail=f"保存失败：{error}") from error
 
+    project_repo.upsert_after_save(
+        db,
+        project_id=result["projectId"],
+        owner_id=user.id,
+        name=str(result.get("name") or result["projectId"]),
+        schema_version=int(result.get("schemaVersion") or 13),
+        file_size_bytes=int(result.get("fileSizeBytes") or 0),
+    )
+    return result
+
 
 @router.get("/projects/{project_id}")
-def open_project(project_id: str) -> dict[str, Any]:
+def open_project(
+    project_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    row = project_repo.get_owned(db, user.id, project_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"找不到工程：{project_id}")
+    store = _store_for(user)
     try:
-        return store.open(project_id)
+        result = store.open(project_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=f"工程文件损坏：{error}") from error
+    project_repo.mark_opened(db, user.id, project_id)
+    return result
 
 
 @router.delete("/projects/{project_id}")
-def delete_project(project_id: str) -> dict[str, str]:
-    store.delete(project_id)
+def delete_project(
+    project_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    row = project_repo.get_owned(db, user.id, project_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"找不到工程：{project_id}")
+    _store_for(user).delete(project_id)
+    project_repo.delete_owned(db, user.id, project_id)
     return {"status": "deleted"}
 
 
@@ -101,34 +205,45 @@ def delete_project(project_id: str) -> dict[str, str]:
 
 
 @router.post("/recovery")
-def save_recovery(request: AutosaveRequest) -> dict[str, str]:
-    store.save_recovery(request.document, request.projectId)
+def save_recovery(
+    request: AutosaveRequest,
+    user: User = Depends(current_user),
+) -> dict[str, str]:
+    _store_for(user).save_recovery(request.document, request.projectId)
     return {"status": "saved"}
 
 
 @router.get("/recovery")
-def load_recovery() -> dict[str, Any]:
-    snapshot = store.load_recovery()
+def load_recovery(user: User = Depends(current_user)) -> dict[str, Any]:
+    snapshot = _store_for(user).load_recovery()
     if snapshot is None:
         return {"status": "empty"}
     return {"status": "found", "snapshot": snapshot}
 
 
 @router.delete("/recovery")
-def clear_recovery() -> dict[str, str]:
-    store.clear_recovery()
+def clear_recovery(user: User = Depends(current_user)) -> dict[str, str]:
+    _store_for(user).clear_recovery()
     return {"status": "cleared"}
 
 
 @router.get("/recent")
-def list_recent() -> dict[str, Any]:
-    return {"entries": store.list_recent()}
+def list_recent(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    rows = project_repo.list_recent(db, user.id)
+    return {"entries": [project_repo.project_to_recent_entry(row) for row in rows]}
 
 
 @router.delete("/recent/{project_id}")
-def remove_recent(project_id: str) -> dict[str, Any]:
-    store.remove_recent(project_id)
-    return {"entries": store.list_recent()}
+def remove_recent(
+    project_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    rows = project_repo.forget_recent(db, user.id, project_id)
+    return {"entries": [project_repo.project_to_recent_entry(row) for row in rows]}
 
 
 # ----------------------------------------------------------------------
@@ -142,21 +257,27 @@ class ExportFileRequest(BaseModel):
 
 
 @router.post("/exports")
-def save_export(request: ExportFileRequest) -> dict[str, Any]:
+def save_export(
+    request: ExportFileRequest,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
     import base64
 
     try:
         data = base64.b64decode(request.base64Data)
     except Exception as error:
         raise HTTPException(status_code=400, detail="导出数据不是有效的 base64。") from error
-    return store.write_export(request.fileName, data)
+    return _store_for(user).write_export(request.fileName, data)
 
 
 @router.post("/exports/upload")
-async def upload_export(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_export(
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
     """二进制直传（序列帧 / MP4 这类大文件走这里，避免 base64 膨胀 33%）。"""
     data = await file.read()
-    return store.write_export(file.filename or "export.bin", data)
+    return _store_for(user).write_export(file.filename or "export.bin", data)
 
 
 # 下载时显式声明 MIME。
@@ -180,9 +301,12 @@ EXPORT_MEDIA_TYPES = {
 
 
 @router.get("/exports/{file_name}")
-def download_export(file_name: str) -> FileResponse:
+def download_export(
+    file_name: str,
+    user: User = Depends(current_user),
+) -> FileResponse:
     try:
-        path = store.resolve_export(f"exports/{file_name}")
+        path = _store_for(user).resolve_export(f"exports/{file_name}")
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except PermissionError as error:
@@ -200,8 +324,11 @@ class ExportTextRequest(BaseModel):
 
 
 @router.post("/exports/text")
-def save_export_text(request: ExportTextRequest) -> dict[str, Any]:
-    return store.write_export(request.fileName, request.content.encode("utf-8"))
+def save_export_text(
+    request: ExportTextRequest,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    return _store_for(user).write_export(request.fileName, request.content.encode("utf-8"))
 
 
 # ----------------------------------------------------------------------
@@ -272,7 +399,8 @@ def validate_video(request: ValidateVideoRequest) -> dict[str, Any]:
 
 
 @router.get("/ai/settings")
-def ai_settings() -> dict[str, Any]:
+def ai_settings(user: User = Depends(current_user)) -> dict[str, Any]:
+    _ = user
     return {"settings": ai_service.public_settings()}
 
 
@@ -284,7 +412,7 @@ class ProviderInput(BaseModel):
     apiKey: str = ""
     model: str = ""
     temperature: float = 0.4
-    maxTokens: int = 2048
+    maxTokens: int = AI_DEFAULT_MAX_TOKENS
 
 
 class SaveAiSettingsRequest(BaseModel):
@@ -294,7 +422,11 @@ class SaveAiSettingsRequest(BaseModel):
 
 
 @router.put("/ai/settings")
-def save_ai_settings(request: SaveAiSettingsRequest) -> dict[str, Any]:
+def save_ai_settings(
+    request: SaveAiSettingsRequest,
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    _ = user
     existing = ai_service.load_settings()
     existing_by_id = {provider.id: provider for provider in existing.providers}
     providers = []
@@ -329,14 +461,21 @@ class AiChatRequest(BaseModel):
     images: Optional[list[dict[str, str]]] = None
     tools: Optional[list[dict[str, Any]]] = None
     toolChoice: Optional[Any] = None
+    # 会话级选用的服务商；不写全局配置，普通用户也可切换。
+    providerId: Optional[str] = None
 
 
 @router.post("/ai/chat")
-async def ai_chat(request: AiChatRequest) -> dict[str, Any]:
+async def ai_chat(
+    request: AiChatRequest,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
     return await ai_service.chat(
         request.messages,
         request.sceneSummary,
         request.images,
         request.tools,
         request.toolChoice,
+        request.providerId,
+        log_context={"userId": user.id, "username": user.username},
     )

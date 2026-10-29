@@ -14,11 +14,20 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+
+from app.services.workspace_log import (
+    logs_dir,
+    summarize_images,
+    write_agent_call_log,
+)
 
 AI_ENVIRONMENT_FILE_NAME = "ai-environment.json"
 
@@ -64,12 +73,14 @@ AI_DEFAULT_SYSTEM_PROMPT = f"""你是“小白盒”场景搭建 Agent。小白�
 3. 改完后用截图工具自检：capture_target_camera（成片机位）、capture_overview_camera（总览）；动画中途问题用 capture_timeline_pair。
 4. 截图要省着调用：每轮尽量少拍；发现问题再用 apply_scene_commands 修正（重复人台用 remove_object）。
 5. 全部完成后调用 done，并用一两句中文说明结果；不要只闲聊。
+6. 单次 apply_scene_commands 建议不超过约 20 条；复杂场景（多塔/树林/大量散件）必须分多轮搭建，避免输出被截断。
 
 {AI_SCENE_COMMAND_SCHEMA_HINT}"""
 
 AI_AGENT_CAPABILITY_HINT = """【能力提醒】
 - 用 list_assets / get_object 查资产，不要臆造场景里不存在的物体。
 - 改场景只能通过 apply_scene_commands；命令必须合法 JSON 字段。
+- 单次 commands 宜短：复杂场景拆成多轮 apply，避免一次输出过长被截断。
 - 跑步/走路禁止只用 run/walk 姿势原地摆拍，必须 animate_move；跟拍用 cameraFollow；环绕用 mode:"orbit"。
 - 树林用多个 cylinder + floor 表达，人物用 add_mannequin（presetId 可用 raise-hand 表示伸展姿态）。
 - 目标机拍空或被墙挡住时，结合 overview / timeline_pair 再修正。
@@ -89,6 +100,10 @@ def compose_system_prompt(settings_prompt: str) -> str:
 
 
 AI_CHAT_MAX_IMAGES = 12
+# 复杂白膜场景一次会吐很长的 apply_scene_commands；2048 极易截断工具参数。
+AI_DEFAULT_MAX_TOKENS = 8192
+AI_LEGACY_LOW_MAX_TOKENS = 2048
+AI_MAX_TOKENS_CAP = 128_000
 
 
 def sanitize_images(images: Optional[list[dict[str, str]]]) -> list[dict[str, str]]:
@@ -154,6 +169,21 @@ def looks_like_tools_reasoning_conflict(detail: str) -> bool:
     )
 
 
+def resolve_max_tokens(configured: int | None) -> int:
+    """解析实际上游 max_tokens。
+
+    历史默认 2048 对 Agent 搭建不够，会把 tool arguments 截断成非法 JSON；
+    仍写着 ≤2048 的配置自动抬到 AI_DEFAULT_MAX_TOKENS。
+    """
+    try:
+        value = int(configured or AI_DEFAULT_MAX_TOKENS)
+    except (TypeError, ValueError):
+        value = AI_DEFAULT_MAX_TOKENS
+    if value <= AI_LEGACY_LOW_MAX_TOKENS:
+        value = AI_DEFAULT_MAX_TOKENS
+    return max(1, min(value, AI_MAX_TOKENS_CAP))
+
+
 @dataclass
 class AiProviderConfig:
     id: str
@@ -163,7 +193,7 @@ class AiProviderConfig:
     apiKey: str = ""
     model: str = ""
     temperature: float = 0.4
-    maxTokens: int = 2048
+    maxTokens: int = AI_DEFAULT_MAX_TOKENS
 
     def resolved_base_url(self) -> str:
         base = (self.baseUrl or "").strip() or AI_DEFAULT_BASE_URLS.get(self.kind, "")
@@ -171,6 +201,9 @@ class AiProviderConfig:
 
     def resolved_model(self) -> str:
         return (self.model or "").strip() or AI_DEFAULT_MODELS.get(self.kind, "")
+
+    def resolved_max_tokens(self) -> int:
+        return resolve_max_tokens(self.maxTokens)
 
 
 @dataclass
@@ -181,10 +214,16 @@ class AiSettings:
     systemPrompt: str = AI_DEFAULT_SYSTEM_PROMPT
 
     def active_provider(self) -> Optional[AiProviderConfig]:
+        matched = self.provider_by_id(self.activeProviderId) if self.activeProviderId else None
+        return matched or (self.providers[0] if self.providers else None)
+
+    def provider_by_id(self, provider_id: Optional[str]) -> Optional[AiProviderConfig]:
+        if not provider_id:
+            return None
         for provider in self.providers:
-            if provider.id == self.activeProviderId:
+            if provider.id == provider_id:
                 return provider
-        return self.providers[0] if self.providers else None
+        return None
 
 
 def describe_provider_problem(provider: Optional[AiProviderConfig]) -> Optional[str]:
@@ -201,6 +240,11 @@ def describe_provider_problem(provider: Optional[AiProviderConfig]) -> Optional[
 @dataclass
 class AiService:
     settings_path: Path
+
+    @property
+    def agent_log_dir(self) -> Path:
+        """固定目录：`{workspace}/logs/`（与其它必要日志同一目录）。"""
+        return logs_dir(self.settings_path.parent)
 
     def load_settings(self) -> AiSettings:
         if not self.settings_path.exists():
@@ -219,7 +263,7 @@ class AiService:
                 apiKey=str(entry.get("apiKey") or ""),
                 model=str(entry.get("model") or ""),
                 temperature=float(entry.get("temperature") or 0.4),
-                maxTokens=int(entry.get("maxTokens") or 2048),
+                maxTokens=int(entry.get("maxTokens") or AI_DEFAULT_MAX_TOKENS),
             )
             for entry in settings_raw.get("providers", [])
             if isinstance(entry, dict)
@@ -261,7 +305,8 @@ class AiService:
                     "baseUrl": provider.baseUrl,
                     "model": provider.model,
                     "temperature": provider.temperature,
-                    "maxTokens": provider.maxTokens,
+                    # 对外展示实际生效值（旧 2048 会显示为抬升后的默认）。
+                    "maxTokens": provider.resolved_max_tokens(),
                     "hasApiKey": bool(provider.apiKey.strip()),
                 }
                 for provider in settings.providers
@@ -275,34 +320,72 @@ class AiService:
         images: Optional[list[dict[str, str]]] = None,
         tools: Optional[list[dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
+        provider_id: Optional[str] = None,
+        log_context: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """转发一次对话。返回 {status, content, toolCalls} 或 {status:'error', message}。"""
-        settings = self.load_settings()
-        provider = settings.active_provider()
-        problem = describe_provider_problem(provider)
-        if problem or provider is None:
-            return {"status": "error", "message": problem or "AI 接口不可用。"}
+        """转发一次对话。返回 {status, content, toolCalls} 或 {status:'error', message}。
 
-        system_prompt = compose_system_prompt(settings.systemPrompt)
-        cleaned_images = sanitize_images(images)
-        cleaned_tools = sanitize_tools(tools)
-        response_kind = provider.kind
+        `provider_id` 可选：指定本次请求使用的服务商（会话级切换）。
+        未传时退回全局 activeProviderId。不会改写 ai-environment.json。
 
-        if provider.kind == "anthropic":
-            url, headers, body = self._build_anthropic(
-                provider,
-                system_prompt,
-                messages,
-                scene_summary,
-                cleaned_images,
-                cleaned_tools,
-                tool_choice,
-            )
-        else:
-            transport = openai_tool_transport(provider.resolved_model(), bool(cleaned_tools))
-            if transport == "responses":
-                response_kind = "openai-responses"
-                url, headers, body = self._build_openai_responses(
+        每次调用会向 `{workspace}/logs/YYYY-MM-DD.log` 追加一条完整记录。
+        """
+        started = time.perf_counter()
+        call_id = uuid.uuid4().hex[:12]
+        entry: dict[str, Any] = {
+            "id": call_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "context": dict(log_context or {}),
+            "request": {
+                "providerId": provider_id,
+                "messageCount": len(messages or []),
+                "messages": messages or [],
+                "sceneSummary": scene_summary,
+                "images": summarize_images(images),
+                "tools": [
+                    {"name": t.get("name"), "description": t.get("description")}
+                    for t in (tools or [])
+                    if isinstance(t, dict)
+                ],
+                "toolChoice": tool_choice,
+            },
+            "upstream": None,
+            "result": None,
+        }
+        result: dict[str, Any] = {"status": "error", "message": "未知错误"}
+
+        try:
+            settings = self.load_settings()
+            if provider_id:
+                provider = settings.provider_by_id(provider_id)
+                if provider is None:
+                    result = {"status": "error", "message": "所选 AI 服务不存在或已被删除。"}
+                    return result
+            else:
+                provider = settings.active_provider()
+            problem = describe_provider_problem(provider)
+            if problem or provider is None:
+                result = {"status": "error", "message": problem or "AI 接口不可用。"}
+                return result
+
+            entry["provider"] = {
+                "id": provider.id,
+                "name": provider.name,
+                "kind": provider.kind,
+                "model": provider.resolved_model(),
+                "baseUrl": provider.resolved_base_url(),
+            }
+
+            system_prompt = compose_system_prompt(settings.systemPrompt)
+            cleaned_images = sanitize_images(images)
+            cleaned_tools = sanitize_tools(tools)
+            response_kind = provider.kind
+            url = ""
+            body: dict[str, Any] = {}
+            headers: dict[str, str] = {}
+
+            if provider.kind == "anthropic":
+                url, headers, body = self._build_anthropic(
                     provider,
                     system_prompt,
                     messages,
@@ -312,28 +395,8 @@ class AiService:
                     tool_choice,
                 )
             else:
-                url, headers, body = self._build_openai(
-                    provider,
-                    system_prompt,
-                    messages,
-                    scene_summary,
-                    cleaned_images,
-                    cleaned_tools,
-                    tool_choice,
-                    reasoning_effort="none" if transport == "chat_none" else None,
-                )
-
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(url, headers=headers, json=body)
-                # 部分网关/新模型在 chat+tools 上仍会因 reasoning 默认值报 400，自动改走 Responses。
-                if (
-                    provider.kind != "anthropic"
-                    and cleaned_tools
-                    and response_kind != "openai-responses"
-                    and response.status_code >= 400
-                    and looks_like_tools_reasoning_conflict(response.text)
-                ):
+                transport = openai_tool_transport(provider.resolved_model(), bool(cleaned_tools))
+                if transport == "responses":
                     response_kind = "openai-responses"
                     url, headers, body = self._build_openai_responses(
                         provider,
@@ -344,26 +407,106 @@ class AiService:
                         cleaned_tools,
                         tool_choice,
                     )
+                else:
+                    url, headers, body = self._build_openai(
+                        provider,
+                        system_prompt,
+                        messages,
+                        scene_summary,
+                        cleaned_images,
+                        cleaned_tools,
+                        tool_choice,
+                        reasoning_effort="none" if transport == "chat_none" else None,
+                    )
+
+            entry["upstream"] = {
+                "kind": response_kind,
+                "url": url,
+                "requestBody": body,
+                "retriedAsResponses": False,
+            }
+
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
                     response = await client.post(url, headers=headers, json=body)
-        except httpx.TimeoutException:
-            return {"status": "error", "message": "AI 接口响应超时，请稍后重试。"}
-        except httpx.HTTPError as error:
-            return {"status": "error", "message": f"无法连接 AI 接口：{error}"}
+                    # 部分网关/新模型在 chat+tools 上仍会因 reasoning 默认值报 400，自动改走 Responses。
+                    if (
+                        provider.kind != "anthropic"
+                        and cleaned_tools
+                        and response_kind != "openai-responses"
+                        and response.status_code >= 400
+                        and looks_like_tools_reasoning_conflict(response.text)
+                    ):
+                        response_kind = "openai-responses"
+                        url, headers, body = self._build_openai_responses(
+                            provider,
+                            system_prompt,
+                            messages,
+                            scene_summary,
+                            cleaned_images,
+                            cleaned_tools,
+                            tool_choice,
+                        )
+                        entry["upstream"] = {
+                            "kind": response_kind,
+                            "url": url,
+                            "requestBody": body,
+                            "retriedAsResponses": True,
+                        }
+                        response = await client.post(url, headers=headers, json=body)
+            except httpx.TimeoutException:
+                result = {"status": "error", "message": "AI 接口响应超时，请稍后重试。"}
+                return result
+            except httpx.HTTPError as error:
+                result = {"status": "error", "message": f"无法连接 AI 接口：{error}"}
+                return result
 
-        if response.status_code >= 400:
-            detail = response.text[:400]
-            return {"status": "error", "message": f"AI 接口返回 {response.status_code}：{detail}"}
+            upstream = entry.get("upstream") or {}
+            upstream["httpStatus"] = response.status_code
+            entry["upstream"] = upstream
 
-        try:
-            data = response.json()
-        except Exception:
-            return {"status": "error", "message": "AI 接口返回了无法解析的内容。"}
+            if response.status_code >= 400:
+                detail = response.text[:400]
+                upstream["errorBody"] = detail
+                result = {
+                    "status": "error",
+                    "message": f"AI 接口返回 {response.status_code}：{detail}",
+                }
+                return result
 
-        content = self._extract_content(response_kind, data)
-        tool_calls = self._extract_tool_calls(response_kind, data)
-        if not content and not tool_calls:
-            return {"status": "error", "message": "AI 接口没有返回文本或工具调用。"}
-        return {"status": "ok", "content": content or "", "toolCalls": tool_calls}
+            try:
+                data = response.json()
+            except Exception:
+                upstream["rawText"] = response.text[:2000]
+                result = {"status": "error", "message": "AI 接口返回了无法解析的内容。"}
+                return result
+
+            upstream["rawResponse"] = data
+            content = self._extract_content(response_kind, data)
+            tool_calls = self._extract_tool_calls(response_kind, data)
+            truncation = self._detect_output_truncation(response_kind, data, tool_calls)
+            if truncation:
+                upstream["truncation"] = truncation
+                result = {
+                    "status": "error",
+                    "message": truncation["message"],
+                    "content": content or "",
+                }
+                return result
+            if not content and not tool_calls:
+                result = {"status": "error", "message": "AI 接口没有返回文本或工具调用。"}
+                return result
+            # 去掉内部标记，避免前端把 _truncated 当命令字段。
+            for call in tool_calls:
+                args = call.get("arguments")
+                if isinstance(args, dict):
+                    args.pop("_truncated", None)
+            result = {"status": "ok", "content": content or "", "toolCalls": tool_calls}
+            return result
+        finally:
+            entry["result"] = result
+            entry["durationMs"] = int((time.perf_counter() - started) * 1000)
+            write_agent_call_log(self.agent_log_dir, entry)
 
     @staticmethod
     def _prepare_messages(
@@ -411,7 +554,7 @@ class AiService:
             "model": provider.resolved_model(),
             "messages": prepared,
             "temperature": provider.temperature,
-            "max_tokens": provider.maxTokens,
+            "max_tokens": provider.resolved_max_tokens(),
         }
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
@@ -502,7 +645,7 @@ class AiService:
             "instructions": instructions,
             "input": input_items,
             "temperature": provider.temperature,
-            "max_output_tokens": provider.maxTokens,
+            "max_output_tokens": provider.resolved_max_tokens(),
         }
         if tools:
             body["tools"] = [
@@ -612,7 +755,7 @@ class AiService:
             "system": system_prompt,
             "messages": anthropic_messages,
             "temperature": provider.temperature,
-            "max_tokens": provider.maxTokens,
+            "max_tokens": provider.resolved_max_tokens(),
         }
         if tools:
             body["tools"] = [
@@ -745,6 +888,84 @@ class AiService:
         return {"type": "auto"}
 
     @staticmethod
+    def _parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
+        """解析 tool arguments；非法 JSON（常见于输出截断）标 _truncated。"""
+        if isinstance(raw_args, dict):
+            return raw_args
+        if not isinstance(raw_args, str):
+            return {}
+        text = raw_args.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {"raw": raw_args, "_truncated": True}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+
+    @staticmethod
+    def _detect_output_truncation(
+        kind: str, data: dict[str, Any], tool_calls: list[dict[str, Any]]
+    ) -> dict[str, str] | None:
+        """识别 max_output_tokens / 不完整 function_call / 截断 JSON。"""
+        reasons: list[str] = []
+        if isinstance(data, dict):
+            status = str(data.get("status") or "")
+            details = data.get("incomplete_details")
+            detail_reason = ""
+            if isinstance(details, dict):
+                detail_reason = str(details.get("reason") or "")
+            if status == "incomplete" or detail_reason:
+                reasons.append(detail_reason or status or "incomplete")
+            if kind == "openai-responses" or isinstance(data.get("output"), list):
+                for item in data.get("output") or []:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "function_call"
+                        and str(item.get("status") or "") == "incomplete"
+                    ):
+                        reasons.append("incomplete_tool_call")
+                        break
+            choices = data.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                finish = str((choices[0] or {}).get("finish_reason") or "")
+                if finish in {"length", "max_tokens"}:
+                    reasons.append(finish)
+
+        truncated_args = any(
+            isinstance(call.get("arguments"), dict) and call["arguments"].get("_truncated")
+            for call in tool_calls
+        )
+        if truncated_args:
+            reasons.append("truncated_tool_arguments")
+
+        if not reasons:
+            return None
+        # 仅有普通 incomplete 但工具参数完好时，仍允许继续（少见）。
+        serious = any(
+            reason in {
+                "max_output_tokens",
+                "length",
+                "max_tokens",
+                "incomplete_tool_call",
+                "truncated_tool_arguments",
+            }
+            for reason in reasons
+        )
+        if not serious and not truncated_args:
+            return None
+        return {
+            "reason": reasons[0],
+            "message": (
+                "AI 输出被截断（maxTokens 不足），场景命令不完整，已取消执行。"
+                "请在 AI 设置中提高 maxTokens（建议 ≥ 8192），"
+                "或让模型分多轮、每次少量命令搭建。"
+            ),
+        }
+
+    @staticmethod
     def _extract_content(kind: str, data: dict[str, Any]) -> str:
         try:
             if kind == "anthropic":
@@ -811,16 +1032,7 @@ class AiService:
                 for item in data.get("output") or []:
                     if not isinstance(item, dict) or item.get("type") != "function_call":
                         continue
-                    raw_args = item.get("arguments") or "{}"
-                    if isinstance(raw_args, str):
-                        try:
-                            arguments = json.loads(raw_args)
-                        except Exception:
-                            arguments = {"raw": raw_args}
-                    elif isinstance(raw_args, dict):
-                        arguments = raw_args
-                    else:
-                        arguments = {}
+                    arguments = AiService._parse_tool_arguments(item.get("arguments") or "{}")
                     result.append(
                         {
                             "id": str(item.get("call_id") or item.get("id") or ""),
@@ -839,16 +1051,7 @@ class AiService:
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") or {}
-                raw_args = function.get("arguments") or "{}"
-                if isinstance(raw_args, str):
-                    try:
-                        arguments = json.loads(raw_args)
-                    except Exception:
-                        arguments = {"raw": raw_args}
-                elif isinstance(raw_args, dict):
-                    arguments = raw_args
-                else:
-                    arguments = {}
+                arguments = AiService._parse_tool_arguments(function.get("arguments") or "{}")
                 result.append(
                     {
                         "id": str(call.get("id") or ""),

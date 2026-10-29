@@ -34,6 +34,7 @@ export const AI_DEFAULT_SYSTEM_PROMPT = `你是“小白盒”场景搭建 Agent
 3. 改完后用截图工具自检：capture_target_camera（成片机位）、capture_overview_camera（总览）；动画中途问题用 capture_timeline_pair。
 4. 截图要省着调用：每轮尽量少拍；发现问题再用 apply_scene_commands 修正（重复人台用 remove_object）。
 5. 全部完成后调用 done，并用一两句中文说明结果；不要只闲聊。
+6. 单次 apply_scene_commands 建议不超过约 20 条；复杂场景（多塔/树林/大量散件）必须分多轮搭建，避免输出被截断。
 
 ${AI_SCENE_COMMAND_SCHEMA_HINT}`
 

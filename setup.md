@@ -1,8 +1,35 @@
-cd app
+# 初始化
 
-# 首次安装。app/.npmrc 已配置 npmmirror 二进制镜像，
-# postinstall 会自动把 Electron 运行时下载到 node_modules/electron/dist。
+后端
+
+cd web\backend  
+python  -m venv .venv  
+.venv\Scripts\Activate.ps1  
+python -m pip install -r requirements.txt
+
+前端
+
+cd ..\frontend
 npm install
 
-npm run verify
-npm run build:win
+# 启动
+
+# 后端
+
+cd web\backend
+.venv\Scripts\Activate.ps1
+python  -m uvicorn app.main:app --reload --port 8000
+
+# 前端
+
+cd web\frontend
+$env:DEV_SERVER_PORT = "3003"
+npm run dev
+
+# 后端日志
+
+# 固定目录（相对后端工作目录）：workspace/logs/
+# 按日一个文件：workspace/logs/YYYY-MM-DD.log（JSONL）
+# 含：启动/关闭、HTTP access、登录登出、AI chat 完整调用（messages/上游/响应/toolCalls）
+# 图片 base64 与 API Key 已脱敏。
+# AI 默认 maxTokens=8192；若配置仍为旧默认 2048，请求时会自动抬到 8192，避免 tool 参数截断。

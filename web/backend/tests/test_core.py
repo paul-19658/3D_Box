@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from app.db.models import User
+from app.db.session import SessionLocal, get_db, init_db, reset_engine
 from app.main import app
 from app.models.project import (
     DEFAULT_CAMERA,
@@ -27,8 +30,12 @@ from app.models.project import (
     create_project_document,
     migrate_document,
 )
+from app.services import project_repo
+from app.services import auth as auth_module
+from app.services.auth import ROLE_ADMIN
 from app.services.platform_profiles import load_rules, validate_video_profile
 from app.services.project_store import ProjectFileService
+from app.services import project_store as project_store_module
 from app.services.scene_output import (
     describe_lighting,
     light_color_text,
@@ -37,16 +44,62 @@ from app.services.scene_output import (
     resolve_shadow_caster_ids,
     summarize_scene,
 )
+import app.api.routes as routes_module
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(app)
+def isolated_env(tmp_path, monkeypatch):
+    """每个测试使用独立 workspace 与 SQLite，并重绑 AI 配置路径。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    db_url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
+    monkeypatch.setenv("WHITEBOX_WORKSPACE", str(workspace))
+    monkeypatch.setenv("WHITEBOX_DATABASE_URL", db_url)
+    monkeypatch.setenv("WHITEBOX_SECRET_KEY", "test-secret-key")
+    monkeypatch.setattr(project_store_module, "DEFAULT_WORKSPACE", workspace)
+    monkeypatch.setattr(auth_module, "DEFAULT_WORKSPACE", workspace)
+    monkeypatch.setattr(routes_module, "DEFAULT_WORKSPACE", workspace)
+    routes_module.ai_service.settings_path = workspace / "ai-environment.json"
+    reset_engine(db_url)
+    init_db()
+
+    def _override_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_db
+    yield workspace
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(isolated_env) -> TestClient:
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture
 def store(tmp_path) -> ProjectFileService:
     return ProjectFileService(workspace=tmp_path)
+
+
+def login(client: TestClient, username: str = "alice") -> dict:
+    response = client.post("/api/auth/login", json={"username": username})
+    assert response.status_code == 200, response.text
+    return response.json()["user"]
+
+
+def make_admin(username: str = "admin") -> User:
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.username_key == username.lower()))
+        assert user is not None
+        user.role = ROLE_ADMIN
+        db.commit()
+        db.refresh(user)
+        return user
 
 
 def _scene(objects=None) -> SceneState:
@@ -105,16 +158,6 @@ def test_recovery_keeps_only_latest_snapshot(store: ProjectFileService) -> None:
     snapshot = store.load_recovery()
     assert snapshot is not None
     assert snapshot["document"]["name"] == "第二版"
-
-
-def test_recent_projects_are_deduplicated_and_capped(store: ProjectFileService) -> None:
-    for index in range(25):
-        store.record_recent(f"project-{index}", f"工程 {index}")
-    store.record_recent("project-0", "工程 0")
-
-    entries = store.list_recent()
-    assert entries[0]["projectId"] == "project-0"
-    assert len(entries) == 20
 
 
 def test_export_path_traversal_is_blocked(store: ProjectFileService) -> None:
@@ -282,6 +325,7 @@ def test_health_and_meta(client: TestClient) -> None:
 
 
 def test_project_crud_over_http(client: TestClient) -> None:
+    login(client, "alice")
     document = create_project_document(
         name="HTTP 工程", scene=_scene(), app_version="0.22.0", saved_at="2026-01-01T00:00:00Z"
     ).model_dump(by_alias=True)
@@ -295,8 +339,136 @@ def test_project_crud_over_http(client: TestClient) -> None:
     listed = client.get("/api/projects").json()["projects"]
     assert any(entry["projectId"] == project_id for entry in listed)
 
+    recent = client.get("/api/recent").json()["entries"]
+    assert any(entry["projectId"] == project_id for entry in recent)
+
     client.delete(f"/api/projects/{project_id}")
     assert client.get(f"/api/projects/{project_id}").status_code == 404
+
+
+def test_projects_require_login(client: TestClient) -> None:
+    assert client.get("/api/projects").status_code == 401
+
+
+def test_username_is_case_insensitive(client: TestClient) -> None:
+    first = login(client, "Alice")
+    client.post("/api/auth/logout")
+    second = login(client, "alice")
+    assert first["id"] == second["id"]
+
+
+def test_user_cannot_access_others_project(client: TestClient) -> None:
+    login(client, "alice")
+    document = create_project_document(
+        name="Alice工程", scene=_scene(), app_version="0.22.0", saved_at="2026-01-01T00:00:00Z"
+    ).model_dump(by_alias=True)
+    project_id = client.post("/api/projects", json={"document": document}).json()["projectId"]
+    client.post("/api/auth/logout")
+
+    login(client, "bob")
+    assert client.get(f"/api/projects/{project_id}").status_code == 404
+    assert client.delete(f"/api/projects/{project_id}").status_code == 404
+
+
+def test_forget_recent_clears_last_opened(client: TestClient) -> None:
+    login(client, "alice")
+    document = create_project_document(
+        name="最近", scene=_scene(), app_version="0.22.0", saved_at="2026-01-01T00:00:00Z"
+    ).model_dump(by_alias=True)
+    project_id = client.post("/api/projects", json={"document": document}).json()["projectId"]
+    assert any(entry["projectId"] == project_id for entry in client.get("/api/recent").json()["entries"])
+    entries = client.delete(f"/api/recent/{project_id}").json()["entries"]
+    assert all(entry["projectId"] != project_id for entry in entries)
+    # 工程本身还在。
+    assert any(entry["projectId"] == project_id for entry in client.get("/api/projects").json()["projects"])
+
+
+def test_export_is_user_scoped(client: TestClient) -> None:
+    login(client, "alice")
+    saved = client.post(
+        "/api/exports/text", json={"fileName": "note.txt", "content": "alice"}
+    ).json()
+    file_name = saved["fileName"]
+    assert client.get(f"/api/exports/{file_name}").status_code == 200
+    client.post("/api/auth/logout")
+
+    login(client, "bob")
+    assert client.get(f"/api/exports/{file_name}").status_code == 404
+
+
+def test_admin_can_manage_users_and_foreign_projects(client: TestClient) -> None:
+    login(client, "admin")
+    make_admin("admin")
+    # 重新登录以刷新会话用户（角色已在库中变更，current_user 每次读库）。
+    client.post("/api/auth/logout")
+    login(client, "admin")
+
+    login(client, "alice")  # 这会把 cookie 换成 alice
+    document = create_project_document(
+        name="归属Alice", scene=_scene(), app_version="0.22.0", saved_at="2026-01-01T00:00:00Z"
+    ).model_dump(by_alias=True)
+    project_id = client.post("/api/projects", json={"document": document}).json()["projectId"]
+    client.post("/api/auth/logout")
+
+    login(client, "admin")
+    listed = client.get("/api/admin/projects").json()["projects"]
+    assert any(entry["projectId"] == project_id and entry["ownerUsername"] == "alice" for entry in listed)
+
+    opened = client.get(f"/api/admin/projects/{project_id}").json()
+    assert opened["readOnly"] is True
+    assert opened["document"]["name"] == "归属Alice"
+
+    with SessionLocal() as db:
+        row = project_repo.get_any(db, project_id)
+        assert row is not None
+        # 只读打开不应刷新 last_opened_at 给管理员侧的"最近"——这里确认 owner 的 last_opened 仍在。
+        assert row.last_opened_at is not None
+
+    assert client.delete(f"/api/admin/projects/{project_id}").status_code == 200
+    assert client.get(f"/api/admin/projects/{project_id}").status_code == 404
+
+
+def test_non_admin_cannot_change_ai_or_admin_api(client: TestClient) -> None:
+    login(client, "alice")
+    assert client.put(
+        "/api/ai/settings",
+        json={"activeProviderId": None, "providers": [], "systemPrompt": "x"},
+    ).status_code == 403
+    assert client.get("/api/admin/users").status_code == 403
+
+
+def test_disabled_user_cannot_login_or_use_cookie(client: TestClient) -> None:
+    login(client, "admin")
+    make_admin("admin")
+    client.post("/api/auth/logout")
+    login(client, "admin")
+
+    # 先让 alice 存在。
+    client.post("/api/auth/logout")
+    alice = login(client, "alice")
+    client.post("/api/auth/logout")
+    login(client, "admin")
+    patched = client.patch(
+        f"/api/admin/users/{alice['id']}", json={"isActive": False}
+    )
+    assert patched.status_code == 200
+
+    denied = client.post("/api/auth/login", json={"username": "alice"})
+    assert denied.status_code == 403
+
+
+def test_cannot_demote_last_admin_or_self(client: TestClient) -> None:
+    login(client, "admin")
+    make_admin("admin")
+    client.post("/api/auth/logout")
+    admin = login(client, "admin")
+
+    assert client.patch(
+        f"/api/admin/users/{admin['id']}", json={"role": "user"}
+    ).status_code == 409
+    assert client.patch(
+        f"/api/admin/users/{admin['id']}", json={"isActive": False}
+    ).status_code == 409
 
 
 def test_scene_descriptor_includes_lighting(client: TestClient) -> None:
@@ -591,6 +763,11 @@ def test_openai_tool_transport_and_responses_packaging() -> None:
 
 
 def test_ai_settings_never_returns_api_key(client: TestClient) -> None:
+    login(client, "admin")
+    make_admin("admin")
+    client.post("/api/auth/logout")
+    login(client, "admin")
+
     client.put(
         "/api/ai/settings",
         json={
@@ -633,3 +810,132 @@ def test_ai_settings_never_returns_api_key(client: TestClient) -> None:
     )
     payload = client.get("/api/ai/settings").json()
     assert payload["settings"]["providers"][0]["hasApiKey"] is True
+
+
+def test_resolve_max_tokens_bumps_legacy_default() -> None:
+    from app.services.ai_service import (
+        AI_DEFAULT_MAX_TOKENS,
+        AiProviderConfig,
+        resolve_max_tokens,
+    )
+
+    assert resolve_max_tokens(2048) == AI_DEFAULT_MAX_TOKENS
+    assert resolve_max_tokens(1024) == AI_DEFAULT_MAX_TOKENS
+    assert resolve_max_tokens(16384) == 16384
+    provider = AiProviderConfig(
+        id="p",
+        name="t",
+        kind="openai-compatible",
+        maxTokens=2048,
+    )
+    assert provider.resolved_max_tokens() == AI_DEFAULT_MAX_TOKENS
+
+
+def test_detect_output_truncation_for_incomplete_tool_json() -> None:
+    from app.services.ai_service import AiService
+
+    truncated = AiService._extract_tool_calls(
+        "openai-responses",
+        {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "apply_scene_commands",
+                    "status": "incomplete",
+                    "arguments": '{"commands":[{"type":"clear_scene"},{"type":"add_object","kind":"cylinder","position":{"x":',
+                }
+            ],
+        },
+    )
+    assert truncated[0]["arguments"].get("_truncated") is True
+    detected = AiService._detect_output_truncation("openai-responses", {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [{"type": "function_call", "status": "incomplete"}],
+    }, truncated)
+    assert detected is not None
+    assert "maxTokens" in detected["message"]
+
+
+def test_workspace_log_redacts_secrets_and_images(tmp_path) -> None:
+    from app.services.workspace_log import (
+        logs_dir,
+        redact_for_log,
+        summarize_images,
+        write_agent_call_log,
+        write_log_event,
+    )
+
+    redacted = redact_for_log(
+        {
+            "apiKey": "sk-secret",
+            "authorization": "Bearer tok",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看图"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + ("A" * 200),
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    assert redacted["apiKey"] == "<redacted>"
+    assert redacted["authorization"] == "<redacted>"
+    image_url = redacted["messages"][0]["content"][1]["image_url"]["url"]
+    assert "omitted" in image_url
+    assert "sk-secret" not in str(redacted)
+
+    summary = summarize_images(
+        [{"mimeType": "image/png", "base64Data": "abcd", "label": "总览"}]
+    )
+    assert summary == [{"mimeType": "image/png", "byteLength": 4, "label": "总览"}]
+
+    log_dir = logs_dir(tmp_path)
+    path = write_log_event(log_dir, kind="test.event", message="hello")
+    assert path is not None and path.name.endswith(".log")
+    assert path.parent == log_dir
+
+    agent_path = write_agent_call_log(
+        log_dir,
+        {"id": "abc", "request": {"apiKey": "sk-x"}, "result": {"status": "ok"}},
+    )
+    assert agent_path == path
+    text = path.read_text(encoding="utf-8")
+    assert '"kind": "test.event"' in text
+    assert '"kind": "ai.chat"' in text
+    assert '"apiKey": "<redacted>"' in text
+    assert "sk-x" not in text
+
+
+def test_ai_chat_writes_agent_log_on_config_error(tmp_path) -> None:
+    import asyncio
+
+    from app.services.ai_service import AiService
+
+    service = AiService(settings_path=tmp_path / "ai-environment.json")
+    result = asyncio.run(
+        service.chat(
+            [{"role": "user", "content": "你好"}],
+            log_context={"userId": "u1", "username": "alice"},
+        )
+    )
+    assert result["status"] == "error"
+
+    log_files = list((tmp_path / "logs").glob("*.log"))
+    assert len(log_files) == 1
+    entry = json.loads(log_files[0].read_text(encoding="utf-8").strip())
+    assert entry["kind"] == "ai.chat"
+    assert entry["context"]["username"] == "alice"
+    assert entry["request"]["messages"][0]["content"] == "你好"
+    assert entry["result"]["status"] == "error"
+    assert "durationMs" in entry

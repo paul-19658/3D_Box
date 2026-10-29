@@ -21,7 +21,7 @@
 
       <p v-if="error" class="error-line">{{ error }}</p>
       <p v-if="!loading && projects.length === 0" class="empty-hint">
-        还没有保存过工程。回到编辑器搭好场景后点"保存"即可出现在这里。
+        还没有保存过工程。点击下方「新建场景」开始，或回到编辑器搭好后点「保存」。
       </p>
 
       <div class="grid">
@@ -38,6 +38,12 @@
             <button type="button" class="btn btn--danger" @click="remove(project)">删除</button>
           </footer>
         </article>
+
+        <button type="button" class="card card--create" @click="newProject">
+          <span class="card__plus" aria-hidden="true">+</span>
+          <span class="card__create-title">新建场景</span>
+          <span class="card__create-hint">从空白场景开始搭建</span>
+        </button>
       </div>
     </main>
   </div>
@@ -180,6 +186,7 @@ export default {
 .card {
   display: flex;
   flex-direction: column;
+  min-height: 128px;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-m);
@@ -202,10 +209,62 @@ export default {
 .card__foot {
   display: flex;
   gap: 6px;
-  margin-top: 12px;
+  margin-top: auto;
+  padding-top: 12px;
 }
 
 .card__foot .btn {
   flex: 1;
+}
+
+.card--create {
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-style: dashed;
+  border-color: var(--line);
+  background: transparent;
+  color: var(--text-1);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.card--create:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.card--create:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.card__plus {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px dashed currentColor;
+  font-size: 22px;
+  line-height: 1;
+  font-weight: 400;
+}
+
+.card__create-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.card__create-hint {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.card--create:hover .card__create-hint {
+  color: inherit;
+  opacity: 0.85;
 }
 </style>

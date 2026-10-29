@@ -41,6 +41,9 @@
 | ASGI | Uvicorn | 0.34.0 |
 | 校验 | Pydantic | 2.10.4 |
 | HTTP 客户端 | httpx | 0.28.1 |
+| ORM | SQLAlchemy | 2.0.36 |
+| 迁移 | Alembic | 1.14.0 |
+| 密码哈希 | bcrypt | 4.2.1（登录暂不校验，脚本写库用） |
 
 **为什么用 webpack 而不是 Vite**：Vue 2.6 的模板编译必须靠 `vue-loader@15` +
 `vue-template-compiler@2.6.14`，这套组合与 webpack 5 的集成最成熟。
@@ -264,6 +267,21 @@ cd ..\backend
 py -3.10 -m pytest -q
 py -3.10 -m app.smoke http://127.0.0.1:8000   # 需要后端已启动
 ```
+
+### 数据库迁移流程
+
+- 模型定义在 `app/db/models.py`；迁移脚本在 `alembic/versions/`。
+- 应用启动时 `main.py` lifespan 会自动执行 `alembic upgrade head`，`start.cmd` 无需额外步骤。
+- 新增迁移（在 `web/backend` 下）：
+
+```powershell
+py -3.10 -m alembic revision -m "描述" --autogenerate
+# 检查生成的 versions/*.py 后：
+py -3.10 -m alembic upgrade head
+```
+
+- 连接串只用 `WHITEBOX_DATABASE_URL`（默认 SQLite）。切 Postgres 时改 URL 并安装 `psycopg`，再启动即可；类型只用可移植的 `String` / `Integer` / `Boolean` / `DateTime(timezone=True)`，并保持 Alembic `render_as_batch=True`。
+- 用户角色靠 `users.role`（`user` / `admin`）；`password_hash` 已存在但登录路径暂不校验。
 
 ---
 

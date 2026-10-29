@@ -1,11 +1,14 @@
-"""工程文件的落盘、读取、自动恢复与最近工程记录。
+"""工程文件的落盘、读取与自动恢复。
 
 对应原 Electron 版 `src/main/project-file-service.ts` 与
 `src/main/workspace-state-service.ts` 的职责。Web 版把这些能力放到后端，
 原因是：
 1. 浏览器无法自由写用户磁盘，需要服务端代劳；
 2. 工程文件可能很大（内嵌导入模型），需要原子写入避免半截文件；
-3. 最近工程与恢复快照是跨会话状态，放在服务端更稳定。
+3. 恢复快照是跨会话状态，放在服务端更稳定。
+
+最近打开列表已迁到数据库（projects.last_opened_at），本模块不再维护
+recent-projects.json。多用户时传入 workspace=users/{user_id} 即可隔离。
 """
 
 from __future__ import annotations
@@ -55,6 +58,10 @@ def _atomic_write_text(path: Path, data: str) -> None:
         raise
 
 
+def user_workspace(user_id: str) -> Path:
+    return DEFAULT_WORKSPACE / "users" / user_id
+
+
 @dataclass
 class ProjectFileService:
     """工程文件读写与工作区状态管理。"""
@@ -69,10 +76,6 @@ class ProjectFileService:
     @property
     def recovery_file(self) -> Path:
         return self.workspace / "workspace-state" / "recovery.json"
-
-    @property
-    def recent_file(self) -> Path:
-        return self.workspace / "workspace-state" / "recent-projects.json"
 
     @property
     def exports_dir(self) -> Path:
@@ -106,20 +109,23 @@ class ProjectFileService:
         return self.projects_dir / f"{project_id}.block3d"
 
     def save(self, document: dict[str, Any], project_id: Optional[str] = None) -> dict[str, Any]:
-        """保存工程，返回 {projectId, filePath, savedAt}。"""
+        """保存工程，返回 {projectId, filePath, savedAt, fileSizeBytes}。"""
         self.ensure_dirs()
         resolved_id = project_id or f"{self.safe_name(document.get('name', ''))}-{uuid.uuid4().hex[:8]}"
         document = dict(document)
         document["savedAt"] = _now()
         document.setdefault("appVersion", self.app_version)
         path = self.path_for(resolved_id)
-        _atomic_write_text(path, json.dumps(document, ensure_ascii=False, indent=2))
-        self.record_recent(resolved_id, document.get("name") or resolved_id)
+        payload = json.dumps(document, ensure_ascii=False, indent=2)
+        _atomic_write_text(path, payload)
         return {
             "projectId": resolved_id,
             "filePath": str(path),
             "displayName": path.name,
             "savedAt": document["savedAt"],
+            "fileSizeBytes": len(payload.encode("utf-8")),
+            "name": document.get("name") or resolved_id,
+            "schemaVersion": document.get("schemaVersion"),
         }
 
     def open(self, project_id: str) -> dict[str, Any]:
@@ -129,10 +135,10 @@ class ProjectFileService:
             raise FileNotFoundError(f"找不到工程：{project_id}")
         raw = json.loads(path.read_text(encoding="utf-8"))
         document = migrate_document(raw, self.app_version, raw.get("savedAt") or _now())
-        self.record_recent(project_id, document.get("name") or project_id)
         return {"projectId": project_id, "document": document}
 
     def list_projects(self) -> list[dict[str, Any]]:
+        """扫描目录列出工程（主要用于脚本 / 兼容；HTTP 列表走数据库）。"""
         self.ensure_dirs()
         entries: list[dict[str, Any]] = []
         for path in sorted(self.projects_dir.glob("*.block3d")):
@@ -157,7 +163,6 @@ class ProjectFileService:
     def delete(self, project_id: str) -> None:
         path = self.path_for(project_id)
         path.unlink(missing_ok=True)
-        self.remove_recent(project_id)
 
     # ------------------------------------------------------------------
     # 自动恢复
@@ -178,39 +183,6 @@ class ProjectFileService:
 
     def clear_recovery(self) -> None:
         self.recovery_file.unlink(missing_ok=True)
-
-    # ------------------------------------------------------------------
-    # 最近工程
-    # ------------------------------------------------------------------
-
-    def _read_recent(self) -> list[dict[str, Any]]:
-        if not self.recent_file.exists():
-            return []
-        try:
-            data = json.loads(self.recent_file.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
-
-    def record_recent(self, project_id: str, name: str) -> None:
-        entries = [entry for entry in self._read_recent() if entry.get("projectId") != project_id]
-        entries.insert(
-            0,
-            {
-                "projectId": project_id,
-                "name": name,
-                "lastOpenedAt": _now(),
-            },
-        )
-        # 最多保留 20 条，避免记录无限增长。
-        _atomic_write_text(self.recent_file, json.dumps(entries[:20], ensure_ascii=False))
-
-    def list_recent(self) -> list[dict[str, Any]]:
-        return self._read_recent()
-
-    def remove_recent(self, project_id: str) -> None:
-        entries = [entry for entry in self._read_recent() if entry.get("projectId") != project_id]
-        _atomic_write_text(self.recent_file, json.dumps(entries, ensure_ascii=False))
 
     # ------------------------------------------------------------------
     # 导出落盘

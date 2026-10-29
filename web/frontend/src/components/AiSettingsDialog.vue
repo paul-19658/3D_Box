@@ -11,6 +11,7 @@
           密钥只保存在本机后端的
           <code>workspace/ai-environment.json</code>，不会随工程文件分发，也不会回传到浏览器。
         </p>
+        <p v-if="!canEdit" class="hint hint--warn">AI 配置由管理员统一设置，当前账号仅可查看。</p>
 
         <div class="provider-tabs">
           <button
@@ -23,18 +24,18 @@
           >
             {{ provider.name || `服务 ${index + 1}` }}
           </button>
-          <button type="button" class="tab tab--add" @click="addProvider">+ 新增</button>
+          <button v-if="canEdit" type="button" class="tab tab--add" @click="addProvider">+ 新增</button>
         </div>
 
         <template v-if="current">
           <label class="field">
             <span class="field__label">名称</span>
-            <input v-model="current.name" class="input" maxlength="40" />
+            <input v-model="current.name" class="input" maxlength="40" :readonly="!canEdit" />
           </label>
 
           <label class="field">
             <span class="field__label">协议</span>
-            <select v-model="current.kind" class="select">
+            <select v-model="current.kind" class="select" :disabled="!canEdit">
               <option value="openai">OpenAI 官方</option>
               <option value="openai-compatible">OpenAI 兼容接口</option>
               <option value="anthropic">Anthropic Messages</option>
@@ -44,12 +45,22 @@
 
           <label class="field">
             <span class="field__label">接口地址</span>
-            <input v-model="current.baseUrl" class="input" placeholder="留空使用官方默认地址" />
+            <input
+              v-model="current.baseUrl"
+              class="input"
+              placeholder="留空使用官方默认地址"
+              :readonly="!canEdit"
+            />
           </label>
 
           <label class="field">
             <span class="field__label">模型</span>
-            <input v-model="current.model" class="input" placeholder="例如 deepseek-chat / gpt-4o-mini" />
+            <input
+              v-model="current.model"
+              class="input"
+              placeholder="例如 deepseek-chat / gpt-4o-mini"
+              :readonly="!canEdit"
+            />
           </label>
 
           <label class="field">
@@ -58,6 +69,7 @@
               v-model="current.apiKey"
               class="input"
               type="password"
+              :readonly="!canEdit"
               :placeholder="current.hasApiKey ? '已保存，留空表示沿用' : '请输入 API Key'"
             />
           </label>
@@ -71,6 +83,7 @@
               step="0.1"
               min="0"
               max="2"
+              :readonly="!canEdit"
             />
             <span class="field__label field__label--tight">最大长度</span>
             <input
@@ -80,15 +93,21 @@
               step="128"
               min="256"
               max="32768"
+              :readonly="!canEdit"
             />
           </div>
 
           <label class="field field--stack">
             <span class="field__label">系统提示词</span>
-            <textarea v-model="form.systemPrompt" class="textarea" rows="8"></textarea>
+            <textarea
+              v-model="form.systemPrompt"
+              class="textarea"
+              rows="8"
+              :readonly="!canEdit"
+            ></textarea>
           </label>
 
-          <div class="actions">
+          <div v-if="canEdit" class="actions">
             <button type="button" class="btn" @click="setActive">设为当前使用</button>
             <button
               v-if="form.providers.length > 1"
@@ -103,8 +122,14 @@
       </div>
 
       <footer class="dialog__foot">
-        <button type="button" class="btn" @click="$emit('close')">取消</button>
-        <button type="button" class="btn btn--primary" :disabled="saving" @click="save">
+        <button type="button" class="btn" @click="$emit('close')">{{ canEdit ? '取消' : '关闭' }}</button>
+        <button
+          v-if="canEdit"
+          type="button"
+          class="btn btn--primary"
+          :disabled="saving"
+          @click="save"
+        >
           {{ saving ? '保存中…' : '保存设置' }}
         </button>
       </footer>
@@ -129,7 +154,7 @@ const createProvider = () => ({
   apiKey: '',
   model: '',
   temperature: 0.4,
-  maxTokens: 2048,
+  maxTokens: 8192,
   hasApiKey: false
 })
 
@@ -151,6 +176,9 @@ export default {
   computed: {
     current() {
       return this.form.providers[this.activeIndex] || null
+    },
+    canEdit() {
+      return this.$store.getters.isAdmin
     }
   },
 
@@ -222,6 +250,11 @@ export default {
 
 .hint code {
   color: var(--accent-strong);
+}
+
+.hint--warn {
+  border-color: var(--warn);
+  color: var(--warn);
 }
 
 .provider-tabs {

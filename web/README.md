@@ -114,19 +114,25 @@ web/
 ├─ verify.ps1                 一键全量验证（lint + 单测 + 构建 + 冒烟）
 ├─ backend/
 │  ├─ app/
-│  │  ├─ main.py                  FastAPI 入口：CORS、路由挂载、SPA 回落
+│  │  ├─ main.py                  FastAPI 入口：CORS、鉴权路由、SPA 回落、自动迁移
 │  │  ├─ smoke.py                 端到端冒烟脚本（打真实 HTTP）
-│  │  ├─ api/routes.py            所有 REST 路由
+│  │  ├─ api/routes.py            用户侧 REST 路由
+│  │  ├─ api/admin_routes.py      管理员：用户 / 跨用户工程
+│  │  ├─ db/                      SQLAlchemy 模型与会话
 │  │  ├─ models/project.py        工程文档的 Pydantic 模型与迁移
+│  │  ├─ scripts/                 set_role / set_password / import_legacy
 │  │  ├─ data/platform-profiles.json  平台预设（帧率 / 码率 / 时长 / 画幅）
 │  │  └─ services/
-│  │     ├─ project_store.py      工程 / 恢复快照 / 最近工程 / 导出落盘
+│  │     ├─ auth.py               Cookie 会话、登录、管理员依赖
+│  │     ├─ project_repo.py       工程元数据与最近打开
+│  │     ├─ project_store.py      按用户目录的工程 / 恢复 / 导出落盘
 │  │     ├─ ai_service.py         AI 服务商配置与对话（密钥不出服务端）
 │  │     ├─ platform_profiles.py  平台规则校验
 │  │     └─ scene_output.py       场景说明 + 建议提示词
-│  ├─ tests/test_core.py          21 个单元 / 接口测试
+│  ├─ alembic/                    数据库迁移
+│  ├─ tests/test_core.py          单元 / 接口测试（含鉴权与隔离）
 │  ├─ requirements.txt
-│  └─ workspace/                  运行时数据（工程、导出、AI 配置）
+│  └─ workspace/                  运行时数据（app.db、用户目录、AI 配置）
 │
 └─ frontend/
    ├─ public/
@@ -138,11 +144,11 @@ web/
    │  ├─ main.js                  挂载 Vue、同步 router 到 store
    │  ├─ App.vue                  外壳：主题、通知、忙碌遮罩、全局快捷键
    │  ├─ api/client.js            唯一网络出口，组件不直接 fetch
-   │  ├─ router/index.js          /editor 与 /projects
+   │  ├─ router/index.js          /login /editor /projects /admin
    │  ├─ store/index.js           Vuex：唯一状态源 + editScene 唯一写入口
    │  ├─ core/                    纯逻辑层（无 DOM、无 Vue 依赖，可单测）
    │  ├─ components/              面板与对话框（只发事件，不改状态）
-   │  ├─ views/                   Editor / Projects
+   │  ├─ views/                   Login / Editor / Projects / Admin
    │  └─ styles/index.css         设计令牌与原子类
    ├─ webpack.config.js
    ├─ vitest.config.js
@@ -336,7 +342,7 @@ npm run test           # Vitest（71 个用例）
 ### 后端
 
 ```powershell
-py -3.10 -m pytest -q                          # 21 个用例
+py -3.10 -m pytest -q                          # 后端单元 / 接口测试
 py -3.10 -m app.smoke http://127.0.0.1:8000    # 端到端冒烟，21 项检查
 py -3.10 -m uvicorn app.main:app --port 8000
 ```
@@ -357,16 +363,49 @@ npm rebuild <package-name>
 
 ## 四、运行时数据（`backend/workspace/`）
 
+Web 版已引入**用户账号**与 **SQLite 数据库**（可切换 Postgres）。工程正文仍是文件；
+归属、最近打开、角色在数据库里。
+
 | 路径 | 内容 | 是否可删 |
 | --- | --- | --- |
-| `projects/*.block3d` | 用户保存的工程 | 删了工程就没了 |
-| `recovery.json` | 最近一份自动恢复快照（只留一份） | 可删 |
-| `recent.json` | 最近打开记录（最多 20 条） | 可删 |
-| `exports/` | 导出的图片 / MP4 视频 / 序列帧 / 模型 / 文本 | 可删 |
-| `ai-environment.json` | AI 服务商配置（**含 API Key 明文**） | 可删，删后需重配 |
+| `app.db` | SQLite 库（用户 / 工程元数据） | 删了账号与工程索引就没了 |
+| `secret.key` | Cookie 签名密钥（无 `WHITEBOX_SECRET_KEY` 时自动生成） | 可删，删后所有会话失效 |
+| `users/{userId}/projects/*.block3d` | 该用户保存的工程 | 删了工程就没了 |
+| `users/{userId}/workspace-state/recovery.json` | 该用户最近一份自动恢复快照 | 可删 |
+| `users/{userId}/exports/` | 该用户导出的图片 / 视频 / 模型 / 文本 | 可删 |
+| `ai-environment.json` | 全局 AI 服务商配置（**含 API Key 明文**，仅管理员可改） | 可删，删后需重配 |
+| `projects/*.block3d`（旧布局） | 升级前的全局工程；可用导入脚本迁到某用户下 | 导入后可空 |
 
 > `ai-environment.json` 含密钥，**不要提交到版本库，也不要随工程文件分发**。
 > 接口层只回传 `hasApiKey` 布尔值，密钥永远不出服务端。
+
+### 账号与角色
+
+- 登录页只输入**账号名**即可进入；账号不存在时自动创建为普通用户。
+- `users.password_hash` 字段已预留，可用脚本写入；**当前登录不校验密码**（内网可信环境）。
+- 角色：`user`（普通）/ `admin`（管理员）。管理员可：改全局 AI 配置、管理用户、只读查看 / 删除任意工程。
+- 指定第一个管理员（在 `web/backend` 下）：
+
+```powershell
+py -3.10 -m app.scripts.set_role --username 张三 --role admin
+py -3.10 -m app.scripts.set_password --username 张三 --password '可选预埋'
+py -3.10 -m app.scripts.import_legacy --username 张三   # 导入旧 workspace/projects
+```
+
+### 环境变量
+
+| 变量 | 含义 | 默认 |
+| --- | --- | --- |
+| `WHITEBOX_WORKSPACE` | 工作区根目录 | `workspace` |
+| `WHITEBOX_DATABASE_URL` | SQLAlchemy 连接串 | `sqlite:///workspace/app.db` |
+| `WHITEBOX_SECRET_KEY` | Cookie HMAC 密钥 | 自动写到 `workspace/secret.key` |
+
+切换到 Postgres：安装驱动后改 URL，再启动服务（启动时会自动 `alembic upgrade head`）：
+
+```powershell
+# 例：postgresql+psycopg://user:pass@localhost/xiaobaihe
+$env:WHITEBOX_DATABASE_URL = "postgresql+psycopg://..."
+```
 
 ---
 
