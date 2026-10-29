@@ -50,8 +50,9 @@ AI_SCENE_COMMAND_SCHEMA_HINT = """apply_scene_commands 的 commands 数组约定
 1. 用户说“生成/搭建/布置…场景”时，第一条命令必须是 {"type":"clear_scene"}。
 2. 坐标单位是米，旋转单位是度。人台围坐用 presetId:"sit"。树/柱用 kind:"cylinder"，不要 invent tree/person 等 kind。
 3. 避免穿模；跑步/走路必须用 animate_move 产生位移；跟拍用 cameraFollow；360° 环绕用 cameraFollow:{"mode":"orbit","orbitDegrees":360,"radius":8}。
-4. 发现重复角色/多余物体（如「跳舞女孩」与「跳舞女孩_补齐」）时用 remove_object，不要再 add「补齐」分身。
-5. JSON 必须严格合法：数字写 50（不要写成字符串）；双引号；无尾随逗号。
+4. 镜头推近/拉远/平移用 animate_camera（相机路径关键帧）；禁止 animate_move 的 name/id 写成 camera，禁止造隐形控制点带动镜头。cameraFollow 只用于跟拍真实物体。
+5. 发现重复角色/多余物体（如「跳舞女孩」与「跳舞女孩_补齐」）时用 remove_object，不要再 add「补齐」分身。
+6. JSON 必须严格合法：数字写 50（不要写成字符串）；双引号；无尾随逗号。
 
 命令类型：
 - {"type":"clear_scene"}
@@ -62,6 +63,7 @@ AI_SCENE_COMMAND_SCHEMA_HINT = """apply_scene_commands 的 commands 数组约定
 - {"type":"set_mannequin_pose","id?","name?","presetId":"stand|sit|raise-hand|walk|run"}
 - {"type":"set_camera","position?","target?","fovDegrees?"}
 - {"type":"animate_move","name?","id?","path":[{"x":0,"z":0},{"x":8,"z":0}],"durationSeconds":4,"faceAlongPath":true,"cameraFollow":{"mode":"orbit","orbitDegrees":360,"radius":8}}
+- {"type":"animate_camera","path":[{"position":{"x":2,"y":1.9,"z":23},"target":{"x":1,"y":4,"z":0},"fovDegrees":48},{"position":{"x":1.9,"y":2.2,"z":18},"target":{"x":1,"y":4,"z":0}}],"durationSeconds":5}
 """
 
 AI_DEFAULT_SYSTEM_PROMPT = f"""你是“小白盒”场景搭建 Agent。小白盒用基础体（方块、圆柱、球体、墙体、地面）、人台和摄影机快速表达空间。
@@ -82,6 +84,7 @@ AI_AGENT_CAPABILITY_HINT = """【能力提醒】
 - 改场景只能通过 apply_scene_commands；命令必须合法 JSON 字段。
 - 单次 commands 宜短：复杂场景拆成多轮 apply，避免一次输出过长被截断。
 - 跑步/走路禁止只用 run/walk 姿势原地摆拍，必须 animate_move；跟拍用 cameraFollow；环绕用 mode:"orbit"。
+- 镜头推近/拉远/平移用 animate_camera（path 至少两点含 position；target/fov 可选）；禁止 name:"camera" 的 animate_move，禁止隐形控制点跟拍伪装运镜。
 - 树林用多个 cylinder + floor 表达，人物用 add_mannequin（presetId 可用 raise-hand 表示伸展姿态）。
 - 目标机拍空或被墙挡住时，结合 overview / timeline_pair 再修正。
 - 重复分身（名称含补齐/副本）必须 remove_object，禁止再 add 一个补齐人台。
@@ -94,7 +97,8 @@ def compose_system_prompt(settings_prompt: str) -> str:
     if "必须输出可被软件自动执行的 JSON 命令" in prompt and "list_assets" not in prompt:
         prompt = AI_DEFAULT_SYSTEM_PROMPT
     parts = [prompt, AI_AGENT_CAPABILITY_HINT]
-    if "remove_object" not in prompt:
+    # 旧自定义提示缺新命令时补全 schema（含 remove_object / animate_camera）。
+    if "remove_object" not in prompt or "animate_camera" not in prompt:
         parts.append(AI_SCENE_COMMAND_SCHEMA_HINT)
     return "\n\n".join(parts)
 

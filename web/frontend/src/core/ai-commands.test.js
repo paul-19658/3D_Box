@@ -68,6 +68,38 @@ describe('AI 回复解析', () => {
     expect(extractCommandsFromReply(reply)).toEqual([])
   })
 
+  it('解析 animate_camera 路径与别名 dolly', () => {
+    const reply = JSON.stringify([
+      {
+        type: 'dolly',
+        path: [
+          { position: { x: 2, y: 1.9, z: 23 }, target: { x: 1, y: 4, z: 0 }, fovDegrees: 48 },
+          { position: { x: 1.9, y: 2.2, z: 18 }, target: { x: 1, y: 4, z: 0 } }
+        ],
+        durationSeconds: 5
+      }
+    ])
+    const commands = extractCommandsFromReply(reply)
+    expect(commands).toHaveLength(1)
+    expect(commands[0].type).toBe('animate_camera')
+    expect(commands[0].durationSeconds).toBe(5)
+    expect(commands[0].path).toHaveLength(2)
+    expect(commands[0].path[0].position).toEqual({ x: 2, y: 1.9, z: 23 })
+    expect(commands[0].path[0].fovDegrees).toBe(48)
+    expect(commands[0].path[1].fovDegrees).toBeUndefined()
+  })
+
+  it('animate_camera 少于两个有效路径点时被丢弃', () => {
+    const reply = JSON.stringify([
+      {
+        type: 'animate_camera',
+        path: [{ position: { x: 0, y: 1, z: 10 } }],
+        durationSeconds: 3
+      }
+    ])
+    expect(extractCommandsFromReply(reply)).toEqual([])
+  })
+
   it('解析 faceAlongPath 与 cameraFollow 布尔/对象形态', () => {
     const reply = JSON.stringify([
       {
@@ -126,10 +158,17 @@ describe('AI 回复解析', () => {
     expect(AI_DEFAULT_SYSTEM_PROMPT).toContain('list_assets')
     expect(AI_DEFAULT_SYSTEM_PROMPT).toContain('apply_scene_commands')
     expect(AI_DEFAULT_SYSTEM_PROMPT).toContain('animate_move')
+    expect(AI_DEFAULT_SYSTEM_PROMPT).toContain('animate_camera')
     expect(AI_DEFAULT_SYSTEM_PROMPT).toContain(AI_SCENE_COMMAND_SCHEMA_HINT.slice(0, 40))
     expect(AI_SCENE_COMMAND_SCHEMA_HINT).toContain('clear_scene')
     expect(AI_SCENE_COMMAND_SCHEMA_HINT).toContain('cameraFollow')
     expect(AI_SCENE_COMMAND_SCHEMA_HINT).toContain('remove_object')
+    expect(AI_SCENE_COMMAND_SCHEMA_HINT).toContain('animate_camera')
+  })
+
+  it('animate_camera 命令摘要可读', () => {
+    expect(describeCommand({ type: 'animate_camera', durationSeconds: 5 })).toContain('镜头路径动画')
+    expect(describeCommand({ type: 'animate_camera', durationSeconds: 5 })).toContain('5')
   })
 })
 
@@ -306,6 +345,28 @@ describe('命令应用', () => {
       }
     ])
     expect(result.scene.timeline.cameraShots.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('animate_camera 生成镜头关键帧并把当前相机设为起点', () => {
+    const scene = emptyScene()
+    const result = applyAiSceneCommands(scene, [
+      {
+        type: 'animate_camera',
+        path: [
+          { position: { x: 2, y: 1.9, z: 23 }, target: { x: 1.1, y: 4.45, z: 0 }, fovDegrees: 48 },
+          { position: { x: 1.9, y: 2.2, z: 18 }, target: { x: 1.1, y: 4.45, z: 0 } }
+        ],
+        durationSeconds: 5
+      }
+    ])
+    expect(result.applied).toBe(1)
+    expect(result.hasTimelineAnimation).toBe(true)
+    expect(result.scene.timeline.durationSeconds).toBeGreaterThanOrEqual(5)
+    expect(result.scene.timeline.cameraShots.length).toBeGreaterThanOrEqual(2)
+    expect(result.scene.camera.position.z).toBeCloseTo(23, 5)
+    expect(result.scene.camera.fovDegrees).toBeCloseTo(48, 5)
+    const lastShot = result.scene.timeline.cameraShots[result.scene.timeline.cameraShots.length - 1]
+    expect(lastShot.camera.position.z).toBeCloseTo(18, 5)
   })
 
   it('多条带跟拍的 animate_move：后者覆盖相机镜头', () => {

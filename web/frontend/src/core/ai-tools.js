@@ -80,7 +80,7 @@ export const AI_TOOL_DEFINITIONS = [
   {
     name: 'apply_scene_commands',
     description:
-      '批量执行场景命令（clear_scene / add_* / update_object / remove_object / set_camera / animate_move 等）。搭建类请求第一条通常是 clear_scene。',
+      '批量执行场景命令（clear_scene / add_* / update_object / remove_object / set_camera / animate_move / animate_camera 等）。搭建类请求第一条通常是 clear_scene。镜头推近/拉远用 animate_camera。',
     parameters: {
       type: 'object',
       properties: {
@@ -340,7 +340,7 @@ function executeApplyCommands(ctx, input) {
   if (commands.length === 0) {
     const hint =
       rejected.length > 0
-        ? `没有通过校验的合法命令（拒绝 ${rejected.slice(0, 8).join(', ')}）。请只用 clear_scene/add_object(box|cylinder|sphere|wall|floor)/add_mannequin/update_object/remove_object/set_camera/animate_move；树用 cylinder，人物用 add_mannequin，360 环绕用 animate_move + cameraFollow:{mode:"orbit",orbitDegrees:360}。`
+        ? `没有通过校验的合法命令（拒绝 ${rejected.slice(0, 8).join(', ')}）。请只用 clear_scene/add_object(box|cylinder|sphere|wall|floor)/add_mannequin/update_object/remove_object/set_camera/animate_move/animate_camera；树用 cylinder，人物用 add_mannequin，360 环绕用 animate_move + cameraFollow:{mode:"orbit",orbitDegrees:360}，镜头推近用 animate_camera。`
         : 'commands 不能为空'
     return {
       ok: false,

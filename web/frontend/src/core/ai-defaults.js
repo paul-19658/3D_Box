@@ -11,8 +11,9 @@ export const AI_SCENE_COMMAND_SCHEMA_HINT = `apply_scene_commands 的 commands �
 1. 用户说“生成/搭建/布置…场景”时，第一条命令必须是 {"type":"clear_scene"}。
 2. 坐标单位是米，旋转单位是度。人台围坐用 presetId:"sit"。树/柱用 kind:"cylinder"，不要 invent tree/person 等 kind。
 3. 避免穿模；跑步/走路必须用 animate_move 产生位移；跟拍用 cameraFollow；360° 环绕用 cameraFollow:{"mode":"orbit","orbitDegrees":360,"radius":8}。
-4. 发现重复角色/多余物体（如「跳舞女孩」与「跳舞女孩_补齐」）时用 remove_object，不要再 add「补齐」分身。
-5. JSON 必须严格合法：数字写 50（不要写成字符串）；双引号；无尾随逗号。
+4. 镜头推近/拉远/平移用 animate_camera（相机路径关键帧）；禁止 animate_move 的 name/id 写成 camera，禁止造隐形控制点带动镜头。cameraFollow 只用于跟拍真实物体。
+5. 发现重复角色/多余物体（如「跳舞女孩」与「跳舞女孩_补齐」）时用 remove_object，不要再 add「补齐」分身。
+6. JSON 必须严格合法：数字写 50（不要写成字符串）；双引号；无尾随逗号。
 
 命令类型：
 - {"type":"clear_scene"}
@@ -23,6 +24,7 @@ export const AI_SCENE_COMMAND_SCHEMA_HINT = `apply_scene_commands 的 commands �
 - {"type":"set_mannequin_pose","id?","name?","presetId":"stand|sit|raise-hand|walk|run"}
 - {"type":"set_camera","position?","target?","fovDegrees?"}
 - {"type":"animate_move","name?","id?","path":[{"x":0,"z":0},{"x":8,"z":0}],"durationSeconds":4,"faceAlongPath":true,"cameraFollow":{"mode":"orbit","orbitDegrees":360,"radius":8}}
+- {"type":"animate_camera","path":[{"position":{"x":2,"y":1.9,"z":23},"target":{"x":1,"y":4,"z":0},"fovDegrees":48},{"position":{"x":1.9,"y":2.2,"z":18},"target":{"x":1,"y":4,"z":0}}],"durationSeconds":5}
 `
 
 export const AI_DEFAULT_SYSTEM_PROMPT = `你是“小白盒”场景搭建 Agent。小白盒用基础体（方块、圆柱、球体、墙体、地面）、人台和摄影机快速表达空间。

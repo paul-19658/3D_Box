@@ -15,7 +15,8 @@ export const AI_SCENE_COMMAND_TYPES = [
   'remove_object',
   'set_mannequin_pose',
   'set_camera',
-  'animate_move'
+  'animate_move',
+  'animate_camera'
 ]
 
 const BASIC_KINDS = ['box', 'cylinder', 'sphere', 'wall', 'floor']
@@ -83,7 +84,11 @@ const TYPE_ALIASES = {
   camera: 'set_camera',
   animate: 'animate_move',
   move: 'animate_move',
-  orbit_camera: 'animate_move'
+  orbit_camera: 'animate_move',
+  dolly: 'animate_camera',
+  push_in: 'animate_camera',
+  camera_move: 'animate_camera',
+  move_camera_path: 'animate_camera'
 }
 
 const PERSON_KINDS = new Set(['person', 'human', 'character', 'dancer', 'mannequin', 'actor', 'girl', 'boy'])
@@ -243,7 +248,37 @@ function parseCommand(rawInput) {
     }
   }
 
+  if (raw.type === 'animate_camera') {
+    const path = Array.isArray(raw.path)
+      ? raw.path
+          .slice(0, MAX_PATH_POINTS)
+          .map((point) => parseCameraPathPoint(point))
+          .filter(Boolean)
+      : []
+    if (path.length < 2) return null
+    const duration = coerceNumber(raw.durationSeconds)
+    return {
+      type: 'animate_camera',
+      path,
+      durationSeconds:
+        duration !== undefined ? Math.min(Math.max(duration, 1), 30) : 4
+    }
+  }
+
   return null
+}
+
+/** 镜头路径点：必须有 position；target / fovDegrees 可选。 */
+function parseCameraPathPoint(value) {
+  if (!isRecord(value)) return null
+  const position = optionalVector(value.position)
+  if (!position) return null
+  const point = { position }
+  const target = optionalVector(value.target)
+  if (target) point.target = target
+  const fov = coerceNumber(value.fovDegrees)
+  if (fov !== undefined) point.fovDegrees = Math.min(Math.max(fov, 10), 120)
+  return point
 }
 
 /** 直接校验命令数组（给 tool 参数用，不必再 JSON.stringify 绕一圈）。 */
@@ -365,6 +400,9 @@ export function describeCommand(command) {
   if (command.type === 'set_camera') return '调整摄影机'
   if (command.type === 'animate_move') {
     return `让${command.name || '物体'}沿路径移动 ${command.durationSeconds} 秒`
+  }
+  if (command.type === 'animate_camera') {
+    return `镜头路径动画 ${command.durationSeconds} 秒`
   }
   return command.type
 }

@@ -494,6 +494,8 @@ def test_compose_system_prompt_embeds_schema_for_legacy_prompt() -> None:
     assert "list_assets" in AI_DEFAULT_SYSTEM_PROMPT
     assert "apply_scene_commands" in AI_DEFAULT_SYSTEM_PROMPT
     assert "animate_move" in AI_DEFAULT_SYSTEM_PROMPT
+    assert "animate_camera" in AI_DEFAULT_SYSTEM_PROMPT
+    assert "animate_camera" in AI_SCENE_COMMAND_SCHEMA_HINT
     assert AI_SCENE_COMMAND_SCHEMA_HINT[:20] in AI_DEFAULT_SYSTEM_PROMPT
 
     # 旧版「一次吐 JSON」提示 → 回落默认 agent 提示。

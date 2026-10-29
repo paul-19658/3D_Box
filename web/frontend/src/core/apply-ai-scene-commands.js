@@ -188,6 +188,70 @@ function cameraFollowShots(follow, path, durationSeconds, baseCamera) {
   })
 }
 
+function lerpNumber(from, to, progress) {
+  return from + (to - from) * progress
+}
+
+function lerpVector(from, to, progress) {
+  return {
+    x: lerpNumber(from.x, to.x, progress),
+    y: lerpNumber(from.y, to.y, progress),
+    z: lerpNumber(from.z, to.z, progress)
+  }
+}
+
+/**
+ * 镜头路径关键帧：在 path 点之间按进度插值 position / target / fov。
+ * 缺省字段沿用 baseCamera 或前一点已解析值。
+ */
+function cameraPathShots(path, durationSeconds, baseCamera) {
+  if (!Array.isArray(path) || path.length < 2) return []
+
+  let lastTarget = { ...baseCamera.target }
+  let lastFov = baseCamera.fovDegrees
+  const resolved = path.map((point) => {
+    const position = {
+      x: point.position.x ?? baseCamera.position.x,
+      y: point.position.y ?? baseCamera.position.y,
+      z: point.position.z ?? baseCamera.position.z
+    }
+    const target = point.target
+      ? {
+          x: point.target.x ?? lastTarget.x,
+          y: point.target.y ?? lastTarget.y,
+          z: point.target.z ?? lastTarget.z
+        }
+      : { ...lastTarget }
+    const fovDegrees = point.fovDegrees ?? lastFov
+    lastTarget = target
+    lastFov = fovDegrees
+    return { position, target, fovDegrees }
+  })
+
+  const sampleCount = Math.max(resolved.length, Math.ceil(durationSeconds * 2) + 1, 3)
+  return Array.from({ length: sampleCount }, (_, index) => {
+    const progress = sampleCount === 1 ? 0 : index / (sampleCount - 1)
+    const scaled = progress * (resolved.length - 1)
+    const fromIndex = Math.min(Math.floor(scaled), resolved.length - 2)
+    const local = scaled - fromIndex
+    const from = resolved[fromIndex]
+    const to = resolved[fromIndex + 1]
+    return {
+      id: createId(),
+      name: `运镜 ${String(index + 1).padStart(2, '0')}`,
+      timeSeconds: durationSeconds * progress,
+      transition: index === 0 ? 'cut' : 'smooth',
+      camera: {
+        position: lerpVector(from.position, to.position, local),
+        target: lerpVector(from.target, to.target, local),
+        fovDegrees: lerpNumber(from.fovDegrees, to.fovDegrees, local),
+        aspectWidth: baseCamera.aspectWidth,
+        aspectHeight: baseCamera.aspectHeight
+      }
+    }
+  })
+}
+
 function resolvePathPoints(object, path) {
   return path.map((point) => ({
     x: point.x ?? object.position.x,
@@ -430,6 +494,29 @@ export function applyAiSceneCommands(scene, commands) {
       if (follow && followShots[0]) {
         camera = cloneObject(followShots[0].camera)
       }
+      hasTimelineAnimation = true
+      applied += 1
+      continue
+    }
+
+    if (command.type === 'animate_camera') {
+      const duration = command.durationSeconds ?? 4
+      const path = Array.isArray(command.path) ? command.path : []
+      if (path.length < 2) {
+        skipped.push('animate_camera 至少需要 2 个路径点')
+        continue
+      }
+      const shots = cameraPathShots(path, duration, camera)
+      if (shots.length < 2) {
+        skipped.push('animate_camera 无法生成镜头关键帧')
+        continue
+      }
+      timeline = {
+        durationSeconds: Math.max(timeline.durationSeconds, duration),
+        cameraShots: sortedByTime(shots),
+        objectKeyframes: timeline.objectKeyframes
+      }
+      camera = cloneObject(shots[0].camera)
       hasTimelineAnimation = true
       applied += 1
     }
