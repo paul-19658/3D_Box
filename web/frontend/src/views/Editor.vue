@@ -1092,15 +1092,18 @@ export default {
       const height = Math.min(Math.max(heightMeters, 1.2), 2.2)
       this.edit((scene) => ({
         ...scene,
-        objects: scene.objects.map((object) =>
-          object.id === id
-            ? {
-                ...object,
-                size: { ...object.size, y: height },
-                mannequin: object.mannequin ? { ...object.mannequin, heightMeters: height } : null
-              }
-            : object
-        )
+        objects: scene.objects.map((object) => {
+          if (object.id !== id) return object
+          const oldHeight = object.mannequin?.heightMeters ?? object.size.y ?? 1.75
+          // 改身高时保持脚底高度不变，避免人台突然陷进地面或悬空。
+          const feetY = object.position.y - oldHeight / 2
+          return {
+            ...object,
+            position: { ...object.position, y: feetY + height / 2 },
+            size: { ...object.size, y: height },
+            mannequin: object.mannequin ? { ...object.mannequin, heightMeters: height } : null
+          }
+        })
       }))
     },
 

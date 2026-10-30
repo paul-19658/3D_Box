@@ -67,6 +67,29 @@ export function placeOnGround(objects, selectedIds) {
   })
 }
 
+/**
+ * 人台根节点在髋部附近：本地脚底约在 y=-0.5，世界脚底 = position.y - height/2。
+ * AI 常把 y=0 当成"站在地面"，导致下半身穿模；这里保证脚底不低于 0。
+ * 已抬高（平台上）的人物不会被压下来。
+ */
+export function liftMannequinFeetAboveGround(position, heightMeters = 1.75) {
+  const height = Number.isFinite(heightMeters) && heightMeters > 0 ? heightMeters : 1.75
+  const feetY = position.y - height / 2
+  if (feetY >= 0) return { ...position }
+  return { ...position, y: position.y - feetY }
+}
+
+/**
+ * 用户 floor 板若上表面贴近或低于参考面 y=0，会与系统无限地面 / 网格共面闪烁。
+ * 把上表面至少抬到略高于网格（0.002），保留水平位置不变。
+ */
+export function liftFloorTopAboveGround(position, size, minTop = 0.02) {
+  const half = Math.max(Number(size?.y) || 0.12, 0.01) / 2
+  const top = position.y + half
+  if (top >= minTop) return { ...position }
+  return { ...position, y: position.y + (minTop - top) }
+}
+
 function overlapsInPlan(candidate, existing, clearance = 0) {
   const bounds = objectWorldBounds(candidate)
   return existing.some((object) => {

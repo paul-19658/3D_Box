@@ -245,6 +245,27 @@ describe('命令应用', () => {
     expect(result.scene.objects[0].mannequin.presetId).toBe('sit')
   })
 
+  it('add_mannequin 的 y=0 会抬到身高一半，避免穿模', () => {
+    const result = applyAiSceneCommands(emptyScene(), [
+      { type: 'add_mannequin', name: '战士', position: { x: -5, y: 0, z: -3 }, heightMeters: 1.75 }
+    ])
+    expect(result.scene.objects[0].position.y).toBeCloseTo(0.875, 6)
+  })
+
+  it('add_object floor 中心为负时抬高上表面，减轻与参考面闪烁', () => {
+    const result = applyAiSceneCommands(emptyScene(), [
+      {
+        type: 'add_object',
+        kind: 'floor',
+        name: '战场地面',
+        position: { x: 0, y: -0.1, z: 0 },
+        size: { x: 40, y: 0.12, z: 40 }
+      }
+    ])
+    const floor = result.scene.objects[0]
+    expect(floor.position.y + floor.size.y / 2).toBeGreaterThanOrEqual(0.02)
+  })
+
   it('set_mannequin_pose 只作用于人台；唯一人台时 id 写错也可兜底', () => {
     const scene = {
       ...emptyScene(),

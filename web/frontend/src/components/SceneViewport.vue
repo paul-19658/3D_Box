@@ -752,6 +752,8 @@ export default {
       })
       this.ground = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), groundMaterial)
       this.ground.rotation.x = -Math.PI / 2
+      // 略低于参考网格与用户 floor 底板，避免与共面的地板发生 Z-fighting 闪烁。
+      this.ground.position.y = -0.08
       this.ground.receiveShadow = true
       this.ground.renderOrder = -2
       scene.add(this.ground)
@@ -1198,18 +1200,22 @@ export default {
         const cached = this.importedModels?.get(object.id)
         if (cached) this.setImportedMesh(object.id, cached)
       } else {
-        const mesh = new THREE.Mesh(
-          createGeometry(object),
-          new THREE.MeshStandardMaterial({
-            color: object.colorOverride || object.color,
-            roughness: 0.82,
-            metalness: 0,
-            side: THREE.DoubleSide,
-            transparent: (object.displayMode ?? 'solid') !== 'solid',
-            opacity:
-              object.displayMode === 'transparent' ? 0.34 : object.displayMode === 'wireframe' ? 0.62 : 1
-          })
-        )
+        const material = new THREE.MeshStandardMaterial({
+          color: object.colorOverride || object.color,
+          roughness: 0.82,
+          metalness: 0,
+          side: THREE.DoubleSide,
+          transparent: (object.displayMode ?? 'solid') !== 'solid',
+          opacity:
+            object.displayMode === 'transparent' ? 0.34 : object.displayMode === 'wireframe' ? 0.62 : 1
+        })
+        // floor 与系统地面接近时，用 polygonOffset 再压一层深度冲突。
+        if (object.kind === 'floor') {
+          material.polygonOffset = true
+          material.polygonOffsetFactor = 1
+          material.polygonOffsetUnits = 1
+        }
+        const mesh = new THREE.Mesh(createGeometry(object), material)
         mesh.castShadow = true
         mesh.receiveShadow = true
         mesh.userData.objectId = object.id
