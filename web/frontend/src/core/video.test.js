@@ -159,27 +159,42 @@ describe('文件名', () => {
 })
 
 describe('能力文案', () => {
-  it('可用时给出 codec 名', () => {
+  it('可用时给出 codec 名与 local 模式', () => {
     const text = describeMp4Support({ ok: true, codec: 'avc1.640028', label: 'H.264 High' })
     expect(text.ok).toBe(true)
+    expect(text.mode).toBe('local')
     expect(text.message).toContain('H.264 High')
   })
 
-  it('没有 WebCodecs 时指引用户换浏览器或改用序列帧', () => {
+  it('没有 WebCodecs 但服务器可编码时走 server 兜底', () => {
+    const text = describeMp4Support(
+      { ok: false, reason: 'no-webcodecs' },
+      { serverAvailable: true }
+    )
+    expect(text.ok).toBe(true)
+    expect(text.mode).toBe('server')
+    expect(text.message).toContain('服务器')
+    expect(text.message).toContain('ffmpeg')
+  })
+
+  it('没有 WebCodecs 且服务器也不可用时指引序列帧', () => {
     const text = describeMp4Support({ ok: false, reason: 'no-webcodecs' })
     expect(text.ok).toBe(false)
+    expect(text.mode).toBe('none')
     expect(text.message).toContain('WebCodecs')
     expect(text.message).toContain('序列帧')
   })
 
-  it('没有可用编码器时同样给替代路径', () => {
+  it('没有可用编码器且无服务器时同样给替代路径', () => {
     const text = describeMp4Support({ ok: false, reason: 'no-codec' })
     expect(text.ok).toBe(false)
+    expect(text.mode).toBe('none')
     expect(text.message).toContain('H.264')
     expect(text.message).toContain('序列帧')
   })
 
   it('未检测时不是 ok', () => {
     expect(describeMp4Support(null).ok).toBe(false)
+    expect(describeMp4Support(null).mode).toBe('none')
   })
 })

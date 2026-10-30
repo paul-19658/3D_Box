@@ -100,28 +100,52 @@ export function mp4FileName(projectName, suffix = '') {
 /**
  * 把"编码能力探测结果"翻译成给用户看的一句话。
  *
- * 探测失败时不能只说"不支持"，否则用户不知道能做什么。
- * 这里明确给出替代路径（PNG 序列帧），并说明原因。
+ * `options.serverAvailable`：后端是否装了 ffmpeg。本机 WebCodecs 失败时
+ * 优先提示走服务器兜底；两边都没有才退到 PNG 序列帧。
+ *
+ * 返回的 `mode`：
+ * - `local`：浏览器内 WebCodecs
+ * - `server`：上传帧 → 后端 ffmpeg
+ * - `none`：只能出图 / 序列帧
  */
-export function describeMp4Support(result) {
-  if (!result) return { ok: false, message: '还未检测编码能力。' }
+export function describeMp4Support(result, options = {}) {
+  const serverAvailable = Boolean(options.serverAvailable)
+  if (!result) return { ok: false, mode: 'none', message: '还未检测编码能力。' }
   if (result.ok) {
     return {
       ok: true,
-      message: `可直接导出 MP4（${result.label || result.codec}）。`
+      mode: 'local',
+      message: `可直接在本机导出 MP4（${result.label || result.codec}）。`
+    }
+  }
+  if (serverAvailable) {
+    const reason =
+      result.reason === 'no-webcodecs'
+        ? '当前浏览器没有 WebCodecs'
+        : result.reason === 'no-codec'
+          ? '本机 H.264 编码器不可用'
+          : '本机无法编码'
+    return {
+      ok: true,
+      mode: 'server',
+      message: `${reason}，将自动把画面帧上传到服务器，用 ffmpeg 合成 MP4。`
     }
   }
   if (result.reason === 'no-webcodecs') {
     return {
       ok: false,
-      message: '当前浏览器没有 WebCodecs（VideoEncoder），无法在本地编码 MP4。请改用 Chrome / Edge 111+，或勾选 PNG 序列帧。'
+      mode: 'none',
+      message:
+        '当前浏览器没有 WebCodecs（VideoEncoder），且服务器也无法编码 MP4。请改用 Chrome / Edge 111+，或勾选 PNG 序列帧。'
     }
   }
   if (result.reason === 'no-codec') {
     return {
       ok: false,
-      message: '当前浏览器的 H.264 编码器不可用（常见于无硬件加速的环境）。可以勾选 PNG 序列帧，或换一台机器重试。'
+      mode: 'none',
+      message:
+        '本机 H.264 编码器不可用，且服务器也无法编码 MP4（常见于无硬件加速的环境）。可以勾选 PNG 序列帧，或换一台机器重试。'
     }
   }
-  return { ok: false, message: result.message || 'MP4 编码不可用。' }
+  return { ok: false, mode: 'none', message: result.message || 'MP4 编码不可用。' }
 }

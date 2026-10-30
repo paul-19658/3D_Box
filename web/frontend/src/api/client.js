@@ -49,6 +49,30 @@ async function request(path, options = {}) {
   return contentType.includes('application/json') ? response.json() : response.text()
 }
 
+/** multipart 上传（不要手动设 Content-Type，浏览器会带 boundary）。 */
+async function postMultipart(path, form, failureLabel) {
+  const response = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    body: form,
+    credentials: 'same-origin'
+  })
+  if (response.status === 401) {
+    if (onUnauthorized) onUnauthorized()
+    throw new ApiError('未登录。', 401)
+  }
+  if (!response.ok) {
+    let detail = response.status === 403 ? '无权限。' : `${failureLabel}（${response.status}）`
+    try {
+      const payload = await response.json()
+      if (payload && payload.detail) detail = String(payload.detail)
+    } catch {
+      // ignore
+    }
+    throw new ApiError(detail, response.status)
+  }
+  return response.json()
+}
+
 export const api = {
   meta: () => request('/meta'),
   health: () => request('/health'),
@@ -103,26 +127,22 @@ export const api = {
     upload: async (fileName, blob) => {
       const form = new FormData()
       form.append('file', blob, fileName)
-      const response = await fetch(`${BASE}/exports/upload`, {
-        method: 'POST',
-        body: form,
-        credentials: 'same-origin'
-      })
-      if (response.status === 401) {
-        if (onUnauthorized) onUnauthorized()
-        throw new ApiError('未登录。', 401)
+      return postMultipart('/exports/upload', form, '上传失败')
+    },
+    /**
+     * 本机 WebCodecs 不可用时：上传 JPEG/PNG 帧序列，由后端 ffmpeg 合成 MP4。
+     * `frameBlobs` 必须按时间顺序。
+     */
+    encodeMp4: async (fileName, frameRate, frameBlobs) => {
+      const form = new FormData()
+      form.append('fileName', fileName)
+      form.append('frameRate', String(frameRate))
+      for (let index = 0; index < frameBlobs.length; index += 1) {
+        const blob = frameBlobs[index]
+        const ext = blob.type === 'image/png' ? 'png' : 'jpg'
+        form.append('frames', blob, `frame_${String(index).padStart(4, '0')}.${ext}`)
       }
-      if (!response.ok) {
-        let detail = response.status === 403 ? '无权限。' : `上传失败（${response.status}）`
-        try {
-          const payload = await response.json()
-          if (payload && payload.detail) detail = String(payload.detail)
-        } catch {
-          // ignore
-        }
-        throw new ApiError(detail, response.status)
-      }
-      return response.json()
+      return postMultipart('/exports/encode-mp4', form, '服务器编码失败')
     },
     downloadUrl: (fileName) => `${BASE}/exports/${encodeURIComponent(fileName)}`
   },

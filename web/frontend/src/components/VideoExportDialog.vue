@@ -62,14 +62,17 @@
           不能只在按钮上禁用：用户需要知道"为什么不行"和"那我该怎么办"。
         -->
         <div class="validation" :class="`validation--${supportTone}`">
-          <p class="validation__title">MP4 编码：{{ support.ok ? '可用' : '不可用' }}</p>
+          <p class="validation__title">MP4 编码：{{ supportTitle }}</p>
           <p class="meta-line">{{ support.message }}</p>
-          <p v-if="support.ok && support.codec" class="meta-line">编码器：{{ support.codec }}</p>
+          <p v-if="support.mode === 'local' && support.codec" class="meta-line">
+            编码器：{{ support.codec }}
+          </p>
         </div>
 
         <p class="section-title section-gap">导出内容</p>
         <label class="checkbox"
-          ><input v-model="withVideo" type="checkbox" :disabled="!support.ok" /> MP4 视频（H.264，浏览器内编码）</label
+          ><input v-model="withVideo" type="checkbox" :disabled="!support.ok" />
+          MP4 视频（H.264{{ support.mode === 'server' ? '，服务器编码' : support.mode === 'local' ? '，本机编码' : '' }}）</label
         >
         <label class="checkbox"><input v-model="withEndpoints" type="checkbox" /> 首帧 / 尾帧单图（PNG）</label>
         <label class="checkbox"
@@ -116,22 +119,18 @@
 /**
  * 动画导出。
  *
- * 主产物是 **MP4**（浏览器内用 WebCodecs 编码 H.264 + mp4-muxer 封装），
+ * 主产物是 **MP4**：
+ * 1. 本机 WebCodecs 可用 → 浏览器内编 H.264（快、不占服务器）；
+ * 2. 本机不可用但后端有 ffmpeg → 逐帧 JPEG 上传，服务器合成；
+ * 3. 两边都没有 → 只能出首尾帧 / PNG 序列。
+ *
  * 首帧 / 尾帧单图保留为附加产物——很多 AI 平台需要首尾帧成对上传。
- *
- * 为什么不再默认导出序列帧：
- * 5 秒 24fps 就是 120 张 PNG，每张几百 KB，落盘、下载、再交给剪辑软件
- * 转码，链路又长又占空间。而 WebCodecs 在 Chrome/Edge 111+ 上是原生能力，
- * 直接在浏览器里编成 MP4 只需一次上传。
- *
- * 但仍然**保留**序列帧选项：H.264 的可用性依赖硬件与系统，
- * 有些环境（无硬件加速的虚拟机、某些 Linux 发行版）确实没有可用的编码器。
- * 那种情况下序列帧是唯一可行的退路，所以不能删掉。
+ * 序列帧选项仍保留，仅调试用。
  *
  * 逐帧流程：
  * 1. `evaluateTimelineAtTime` 求出该帧的相机与物体变换；
  * 2. 把相机推到该帧位姿，渲染到一块可复用的 2D 画布（`captureFrameToCanvas`）；
- * 3. 交给编码器入队，或直接落盘成 PNG。
+ * 3. 交给本地编码器，或收集成 JPEG 上传服务器。
  *
  * 导出结束会恢复相机，并解除"导出模式"，避免"导完视频画面被改掉"。
  */
@@ -162,8 +161,9 @@ export default {
       withSequence: false,
       busy: false,
       /** 编码能力探测结果：null 表示还没测完。 */
-      support: { ok: false, message: '正在检测编码能力…' },
+      support: { ok: false, mode: 'none', message: '正在检测编码能力…' },
       supportChecked: false,
+      serverMp4Encode: false,
       progress: { done: 0, total: 0, label: '' },
       exported: []
     }
@@ -198,9 +198,17 @@ export default {
       if (this.validation.warnings.length > 0) return 'warning'
       return 'ok'
     },
+    supportTitle() {
+      if (!this.supportChecked) return '检测中'
+      if (this.support.mode === 'local') return '本机可用'
+      if (this.support.mode === 'server') return '服务器兜底'
+      return '不可用'
+    },
     supportTone() {
       if (!this.supportChecked) return 'unknown'
-      return this.support.ok ? 'ok' : 'warning'
+      if (this.support.mode === 'local') return 'ok'
+      if (this.support.mode === 'server') return 'warning'
+      return 'warning'
     },
     progressPercent() {
       if (this.progress.total === 0) return 0
@@ -243,21 +251,29 @@ export default {
      *
      * 尺寸变了要重测：H.264 的 level 与分辨率绑定，
      * 1080p 能用的 profile 在 4K 下可能就超 level 了。
+     * 同时问后端是否有 ffmpeg，决定能不能走服务器兜底。
      */
     async refreshSupport() {
       const { width, height } = this.size
       this.supportChecked = false
-      this.support = { ok: false, message: '正在检测编码能力…' }
+      this.support = { ok: false, mode: 'none', message: '正在检测编码能力…' }
       let result
+      let serverOk = false
       try {
-        result = await probeMp4Support(width, height)
+        const [local, meta] = await Promise.all([
+          probeMp4Support(width, height),
+          api.meta().catch(() => ({ serverMp4Encode: false }))
+        ])
+        result = local
+        serverOk = Boolean(meta?.serverMp4Encode)
       } catch (error) {
         result = { ok: false, reason: 'no-codec', message: String(error?.message || error) }
       }
-      this.support = { ...result, ...describeMp4Support(result) }
+      this.serverMp4Encode = serverOk
+      this.support = { ...result, ...describeMp4Support(result, { serverAvailable: serverOk }) }
       this.supportChecked = true
-      // 探测出不可用时自动勾上首尾帧，否则用户点"开始导出"会无事发生。
-      if (!result.ok && !this.withEndpoints && !this.withSequence) this.withEndpoints = true
+      // 本机与服务器都编不出 MP4 时，自动勾上首尾帧，避免点导出无事发生。
+      if (!this.support.ok && !this.withEndpoints && !this.withSequence) this.withEndpoints = true
     },
 
     onFrameRateChange() {
@@ -276,6 +292,69 @@ export default {
       const bytes = new Uint8Array(binary.length)
       for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
       return new Blob([bytes], { type: mime })
+    },
+
+    canvasToJpegBlob(canvas, quality = 0.92) {
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) reject(new Error('无法导出帧图像。'))
+            else resolve(blob)
+          },
+          'image/jpeg',
+          quality
+        )
+      })
+    },
+
+    /**
+     * 本机 WebCodecs 编码；失败时若服务器可用则改走上传帧。
+     */
+    async exportMp4Local(plan, width, height, prefix, renderFrameAt) {
+      this.progress = { done: 0, total: plan.totalFrames, label: '本机编码' }
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const session = await createMp4Session({
+        width,
+        height,
+        frameRate: this.frameRate,
+        bitrate: 8_000_000
+      })
+      try {
+        for (let index = 0; index < plan.totalFrames; index += 1) {
+          await renderFrameAt(plan.sourceTimeSeconds(index))
+          this.viewport.captureFrameToCanvas(canvas, width, height)
+          await session.addFrame(canvas, index)
+          this.progress.done = index + 1
+          if (index % 4 === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+        }
+        const blob = await session.finish()
+        return api.exports.upload(mp4FileName(prefix), blob)
+      } catch (error) {
+        session.abort()
+        throw error
+      }
+    },
+
+    /** 逐帧抓 JPEG → 一次性上传 → 后端 ffmpeg。 */
+    async exportMp4Server(plan, width, height, prefix, renderFrameAt) {
+      this.progress = { done: 0, total: plan.totalFrames, label: '渲染帧' }
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const frameBlobs = []
+      for (let index = 0; index < plan.totalFrames; index += 1) {
+        await renderFrameAt(plan.sourceTimeSeconds(index))
+        this.viewport.captureFrameToCanvas(canvas, width, height)
+        frameBlobs.push(await this.canvasToJpegBlob(canvas))
+        this.progress.done = index + 1
+        if (index % 4 === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      this.progress = { done: 0, total: 1, label: '服务器编码' }
+      const result = await api.exports.encodeMp4(mp4FileName(prefix), this.frameRate, frameBlobs)
+      this.progress.done = 1
+      return result
     },
 
     async run() {
@@ -307,32 +386,21 @@ export default {
 
       try {
         if (this.withVideo && this.support.ok) {
-          this.progress = { done: 0, total: plan.totalFrames, label: '编码' }
-          // 复用同一块 2D 画布：每帧新建会带来明显的 GC 压力。
-          const canvas = document.createElement('canvas')
-          canvas.width = width
-          canvas.height = height
-          const session = await createMp4Session({
-            width,
-            height,
-            frameRate: this.frameRate,
-            bitrate: 8_000_000
-          })
-          try {
-            for (let index = 0; index < plan.totalFrames; index += 1) {
-              await renderFrameAt(plan.sourceTimeSeconds(index))
-              this.viewport.captureFrameToCanvas(canvas, width, height)
-              await session.addFrame(canvas, index)
-              this.progress.done = index + 1
-              // 让出主线程：编码是异步的，但循环本身是同步的，
-              // 不让出的话进度条根本不会重绘，界面看起来像卡死。
-              if (index % 4 === 0) await new Promise((resolve) => setTimeout(resolve, 0))
+          const preferLocal = this.support.mode === 'local'
+          if (preferLocal) {
+            try {
+              files.push(await this.exportMp4Local(plan, width, height, prefix, renderFrameAt))
+            } catch (error) {
+              // 编码中途失败时，若服务器有 ffmpeg，自动改走兜底，避免用户白渲一遍再手动重试。
+              if (!this.serverMp4Encode) throw error
+              await this.$store.dispatch('notify', {
+                kind: 'warning',
+                message: `本机编码失败，改走服务器：${error.message}`
+              })
+              files.push(await this.exportMp4Server(plan, width, height, prefix, renderFrameAt))
             }
-            const blob = await session.finish()
-            files.push(await api.exports.upload(mp4FileName(prefix), blob))
-          } catch (error) {
-            session.abort()
-            throw error
+          } else {
+            files.push(await this.exportMp4Server(plan, width, height, prefix, renderFrameAt))
           }
         }
 

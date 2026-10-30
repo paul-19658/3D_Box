@@ -50,8 +50,13 @@ def main() -> int:
     check("health 可用", health.get("status") == "ok", str(health))
 
     meta = call("/api/meta")
-    check("appName 中文未损坏", meta.get("appName") == "小白盒", repr(meta.get("appName")))
+    check("appName 中文未损坏", meta.get("appName") == "3D导演台 测试版", repr(meta.get("appName")))
     check("schema 版本为 13", meta.get("projectSchemaVersion") == 13)
+    check(
+        "serverMp4Encode 为布尔",
+        isinstance(meta.get("serverMp4Encode"), bool),
+        repr(meta.get("serverMp4Encode")),
+    )
 
     login = call("/api/auth/login", "POST", {"username": "smoke-user"})
     check("登录成功", bool(login.get("user", {}).get("id")), str(login))

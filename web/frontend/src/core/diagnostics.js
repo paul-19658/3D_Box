@@ -224,7 +224,7 @@ export function buildReport() {
   const dom = collectDomSnapshot()
   const lines = []
 
-  lines.push('=== 小白盒 Web 诊断报告 ===')
+  lines.push('=== 3D导演台 测试版 诊断报告 ===')
   lines.push(`生成时间：${new Date().toISOString()}`)
   lines.push('')
   lines.push('--- 环境 ---')

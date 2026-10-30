@@ -316,6 +316,7 @@ py -3.10 -m alembic upgrade head
 | 第二块 WebGL 画布读像素全黑 | 截图/断言拿到黑图 | `new WebGLRenderer({ canvas, preserveDrawingBuffer: true })` |
 | 相机位姿每帧变化时全量重建 helper | 播放掉到个位数帧率 | 按"造型签名"判断，只有位姿变就走快速路径 |
 | **H.264 codec 字符串写死** | 换台机器就报"没有可用的编码器" | 按 `MP4_CODEC_CANDIDATES` 运行时逐个 `isConfigSupported` 探测（实测有的机器只有 High profile 可用） |
+| **本机 WebCodecs 不可用就只能出 PNG** | 局域网 IP / 无硬件加速环境导不出 MP4 | 探测失败时走 `POST /api/exports/encode-mp4`（上传 JPEG 帧 → 后端 ffmpeg）；`/api/meta.serverMp4Encode` 告知前端能否兜底 |
 | **`VideoEncoder` 的 timestamp 用毫秒** | 5 秒视频变成 5 毫秒 | 单位是**微秒**，用 `mp4TimestampUs()` 统一换算 |
 | **`VideoFrame` 忘记 `close()`** | 编几十帧后浏览器 OOM 崩掉 | 句柄必须释放，放在 `encode()` 之后的 `finally` 里 |
 | **不等编码队列** | 内存飙升、进度条不重绘 | 每帧检查 `encodeQueueSize` 并 `setTimeout(0)` 让出主线程 |

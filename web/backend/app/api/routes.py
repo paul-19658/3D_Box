@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
+import shutil
+import tempfile
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -38,6 +42,13 @@ from app.services.auth import (
 from app.services.platform_profiles import load_rules, validate_video_profile
 from app.services.project_store import DEFAULT_WORKSPACE, ProjectFileService, user_workspace
 from app.services.scene_output import build_scene_descriptor, build_suggested_prompt
+from app.services.video_encode import (
+    MAX_FRAME_BYTES,
+    MAX_FRAMES,
+    encode_image_sequence_to_mp4,
+    ffmpeg_available,
+    frame_extension_for_upload,
+)
 from app.services.workspace_log import logs_dir, write_log_event
 
 router = APIRouter(prefix="/api")
@@ -62,10 +73,12 @@ def health() -> dict[str, str]:
 @router.get("/meta")
 def meta() -> dict[str, Any]:
     return {
-        "appName": "小白盒",
+        "appName": "3D导演台 测试版",
         "appVersion": "0.22.0",
         "projectExtension": "block3d",
         "projectSchemaVersion": 13,
+        # 前端据此决定：本机 WebCodecs 不可用时能否走服务器 ffmpeg 兜底。
+        "serverMp4Encode": ffmpeg_available(),
     }
 
 
@@ -278,6 +291,71 @@ async def upload_export(
     """二进制直传（序列帧 / MP4 这类大文件走这里，避免 base64 膨胀 33%）。"""
     data = await file.read()
     return _store_for(user).write_export(file.filename or "export.bin", data)
+
+
+@router.post("/exports/encode-mp4")
+async def encode_mp4_export(
+    frameRate: int = Form(...),
+    fileName: str = Form("export.mp4"),
+    frames: list[UploadFile] = File(...),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """前端上传逐帧画面，服务端用 ffmpeg 合成 H.264 MP4。
+
+    仅在浏览器 WebCodecs / 本机 H.264 不可用时作为兜底；本机能编码时
+    仍应走前端 WebCodecs，避免占用服务器带宽与 CPU。
+    """
+    if not ffmpeg_available():
+        raise HTTPException(
+            status_code=503,
+            detail="服务器未安装 ffmpeg，无法编码 MP4。请安装 ffmpeg 并确保在 PATH 中，或设置 FFMPEG_PATH。",
+        )
+    if not isinstance(frameRate, int) or frameRate < 1 or frameRate > 120:
+        raise HTTPException(status_code=400, detail="视频帧率无效。")
+    if not frames:
+        raise HTTPException(status_code=400, detail="没有可编码的帧。")
+    if len(frames) > MAX_FRAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"帧数过多（{len(frames)}），最多 {MAX_FRAMES} 帧。",
+        )
+
+    store = _store_for(user)
+    store.ensure_dirs()
+    staging = Path(tempfile.mkdtemp(prefix="encode-upload-", dir=str(store.exports_dir)))
+    frame_paths: list[Path] = []
+    try:
+        first_ext: str | None = None
+        for index, upload in enumerate(frames):
+            data = await upload.read()
+            if not data:
+                raise HTTPException(status_code=400, detail=f"第 {index} 帧为空。")
+            if len(data) > MAX_FRAME_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"第 {index} 帧过大（>{MAX_FRAME_BYTES // (1024 * 1024)} MB）。",
+                )
+            ext = frame_extension_for_upload(upload.filename, upload.content_type)
+            if first_ext is None:
+                first_ext = ext
+            elif ext != first_ext:
+                raise HTTPException(status_code=400, detail="全部帧必须是同一种图片格式。")
+            path = staging / f"upload_{index:04d}{ext}"
+            path.write_bytes(data)
+            frame_paths.append(path)
+
+        output_tmp = staging / "output.mp4"
+        try:
+            encode_image_sequence_to_mp4(frame_paths, frameRate, output_tmp)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+
+        safe_name = fileName if str(fileName).lower().endswith(".mp4") else f"{fileName}.mp4"
+        return store.write_export(safe_name, output_tmp.read_bytes())
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # 下载时显式声明 MIME。

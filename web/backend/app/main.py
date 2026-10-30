@@ -45,9 +45,9 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="小白盒 Web API",
+    title="3D导演台 测试版 API",
     version="0.22.0",
-    description="面向零基础创作者的白膜场景、镜头与动画草稿工具（Web 版后端）",
+    description="3D导演台 测试版：白膜场景、镜头与动画草稿工具（Web 版后端）",
     lifespan=lifespan,
 )
 

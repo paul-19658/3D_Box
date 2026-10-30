@@ -3,7 +3,7 @@
     <header class="projects__bar">
       <div class="projects__brand">
         <span class="brand-mark">◇</span>
-        <span>小白盒 · 工程管理</span>
+        <span>3D导演台 测试版 · 工程管理</span>
       </div>
       <div class="projects__actions">
         <button type="button" class="btn" @click="$router.push('/editor')">返回编辑器</button>

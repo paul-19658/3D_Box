@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime, timezone
 
 import pytest
@@ -394,6 +395,66 @@ def test_export_is_user_scoped(client: TestClient) -> None:
 
     login(client, "bob")
     assert client.get(f"/api/exports/{file_name}").status_code == 404
+
+
+def test_meta_reports_server_mp4_encode_flag(client: TestClient) -> None:
+    meta = client.get("/api/meta").json()
+    assert isinstance(meta.get("serverMp4Encode"), bool)
+
+
+def test_encode_mp4_requires_ffmpeg(client: TestClient, monkeypatch) -> None:
+    login(client, "alice")
+    monkeypatch.setattr("app.api.routes.ffmpeg_available", lambda: False)
+    response = client.post(
+        "/api/exports/encode-mp4",
+        data={"frameRate": "24", "fileName": "clip.mp4"},
+        files=[("frames", ("frame_0000.png", b"not-a-real-png", "image/png"))],
+    )
+    assert response.status_code == 503
+    assert "ffmpeg" in response.json()["detail"].lower()
+
+
+def test_encode_mp4_from_uploaded_frames(client: TestClient, tmp_path) -> None:
+    from app.services.video_encode import FFMPEG_BIN, ffmpeg_available
+
+    if not ffmpeg_available():
+        import pytest
+
+        pytest.skip("本机未安装 ffmpeg")
+
+    login(client, "alice")
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    # 生成 3 帧偶数尺寸纯色图，模拟前端上传的序列。
+    generated = subprocess.run(
+        [
+            FFMPEG_BIN,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=64x48:d=1",
+            "-frames:v",
+            "3",
+            str(frames_dir / "frame_%04d.png"),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert generated.returncode == 0, generated.stderr.decode("utf-8", errors="replace")
+    files = sorted(frames_dir.glob("frame_*.png"))
+    assert len(files) == 3
+
+    response = client.post(
+        "/api/exports/encode-mp4",
+        data={"frameRate": "24", "fileName": "clip.mp4"},
+        files=[("frames", (path.name, path.read_bytes(), "image/png")) for path in files],
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["fileName"].endswith(".mp4")
+    assert body["byteLength"] > 0
+    assert client.get(f"/api/exports/{body['fileName']}").status_code == 200
 
 
 def test_admin_can_manage_users_and_foreign_projects(client: TestClient) -> None:

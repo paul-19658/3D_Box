@@ -3,7 +3,7 @@
     <header class="admin__bar">
       <div class="admin__brand">
         <span class="brand-mark">◇</span>
-        <span>小白盒 · 管理</span>
+        <span>3D导演台 测试版 · 管理</span>
       </div>
       <div class="admin__actions">
         <button type="button" class="btn" @click="$router.push('/editor')">返回编辑器</button>

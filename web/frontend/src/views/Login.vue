@@ -1,7 +1,7 @@
 <template>
   <div class="login">
     <form class="login__card" @submit.prevent="submit">
-      <h1 class="login__title">小白盒</h1>
+      <h1 class="login__title">3D导演台 测试版</h1>
       <p class="login__hint">输入账号名即可进入。账号不存在时会自动创建。</p>
       <label class="field">
         <span class="field__label">账号</span>

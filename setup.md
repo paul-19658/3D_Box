@@ -2,6 +2,9 @@
 
 后端
 
+# 可选但推荐：安装 ffmpeg，并确保在 PATH 中（或设置 FFMPEG_PATH）。
+# 浏览器 WebCodecs 不可用时，导出 MP4 会走「上传帧 → 后端 ffmpeg」兜底。
+
 cd web\backend  
 python  -m venv .venv  
 .venv\Scripts\Activate.ps1  
