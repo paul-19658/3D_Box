@@ -46,8 +46,28 @@
       </div>
 
       <div class="timeline__center">
+        <button
+          type="button"
+          class="auto-key"
+          :class="{ 'is-on': autoKeyEnabled }"
+          :disabled="readOnly"
+          :title="
+            readOnly
+              ? '只读工程无法记录关键帧'
+              : autoKeyEnabled
+                ? '自动关键帧已开启：变换会自动记录到当前播放头'
+                : '开启后，物体/相机/人台的变换会自动记录为关键帧'
+          "
+          @click="$emit('toggle-auto-key')"
+        >
+          <span class="auto-key__dot" aria-hidden="true"></span>
+          自动关键帧
+        </button>
         <button type="button" class="btn btn--ghost" @click="$emit('record-camera')">记录镜头</button>
         <button type="button" class="btn btn--ghost" @click="$emit('record-object')">记录关键帧</button>
+        <span v-if="autoKeyEnabled && playing" class="auto-key__paused" role="status">
+          播放中暂停记录
+        </span>
       </div>
 
       <div class="timeline__right">
@@ -213,7 +233,10 @@ export default {
     selectedPathNodeKey: { type: String, default: null },
     /** 由父组件算好的导航线轨道（含节点时刻），见 core/nav-path.js。 */
     pathTracks: { type: Array, default: () => [] },
-    objects: { type: Array, default: () => [] }
+    objects: { type: Array, default: () => [] },
+    /** 自动关键帧总开关（对标 Maya 的 Auto Key）。 */
+    autoKeyEnabled: { type: Boolean, default: false },
+    readOnly: { type: Boolean, default: false }
   },
 
   data() {
@@ -419,7 +442,77 @@ export default {
   flex: 1;
   display: flex;
   justify-content: center;
+  align-items: center;
   gap: 8px;
+}
+
+/*
+ * 自动关键帧开关：对标 Maya 的 Auto Key 红色录制键。
+ *
+ * 关闭时是普通描边按钮；开启后整块变红并显示实心红点，
+ * 形成"正在录制"的强视觉信号——这个开关会替用户写数据，
+ * 必须让人一眼看出它是不是开着。
+ */
+.auto-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-s);
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.auto-key:hover:not(:disabled) {
+  border-color: var(--text-2);
+  color: var(--text-0);
+}
+
+.auto-key:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.auto-key.is-on {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
+}
+
+.auto-key__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  background: transparent;
+}
+
+.auto-key.is-on .auto-key__dot {
+  background: var(--danger);
+  border-color: var(--danger);
+  animation: auto-key-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes auto-key-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* 播放中暂停记录：必须写出来，否则用户以为开着开关却没生效是 bug。 */
+.auto-key__paused {
+  color: var(--warn);
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .play-btn {

@@ -26,12 +26,40 @@ from app.services.workspace_log import configure_workspace_logging, logs_dir, wr
 
 # 前端构建产物目录。开发阶段前端由 webpack-dev-server 提供，
 # 生产阶段由 FastAPI 直接托管，避免再部署一个静态服务器。
-FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+#
+# 这里就取真实路径（resolve）：下面的归属校验拿它当基准，
+# 基准本身若是软链接或含 `..`，校验结论就不可信。
+FRONTEND_DIST = (Path(__file__).resolve().parent.parent.parent / "frontend" / "dist").resolve()
 
 logger = logging.getLogger("xiaobaihe")
 
 # 这些路径访问很频繁，不写 access 日志，避免淹没真正有用的记录。
 _QUIET_PATHS = frozenset({"/api/health", "/favicon.ico"})
+
+
+def resolve_dist_file(dist_root: Path, full_path: str) -> Path | None:
+    """把请求路径解析成 dist 内的真实文件；越界或不存在时返回 None。
+
+    这是 `serve_spa` 的安全核心，单独抽出来是为了能被单元测试直接覆盖
+    （测试环境通常没有 `dist/`，走 HTTP 端到端反而测不到）。
+
+    `full_path` 完全由请求方控制，且 Starlette 会先把 `%2e%2e%2f` 这类
+    百分号编码解码成 `../` 再传进来，所以**绝不能**直接把
+    `dist_root / full_path` 丢给 `is_file()`：那等于开放任意文件读取。
+    实测该写法可以读到 `workspace/ai-environment.json` 里的明文 API Key，
+    以及 `/../../../../Windows/win.ini` 这样的系统文件。
+
+    归属判定用 `is_relative_to` 而非字符串 `startswith`：后者会把
+    `dist-backup/` 这类同前缀的兄弟目录误判成"在 dist 内"。
+    """
+    if not full_path:
+        return None
+    candidate = (dist_root / full_path).resolve()
+    if not candidate.is_relative_to(dist_root.resolve()):
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
 
 
 @asynccontextmanager
@@ -121,7 +149,12 @@ if FRONTEND_DIST.exists():
 
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str) -> FileResponse:
-        candidate = FRONTEND_DIST / full_path
-        if full_path and candidate.is_file():
+        """把 dist 里的真实文件直接返回，其余路径交给 vue-router。
+
+        路径归属校验见 `resolve_dist_file`：它保证只有 dist 内的真实文件
+        才会被返回，越界一律回落到 index.html。
+        """
+        candidate = resolve_dist_file(FRONTEND_DIST, full_path)
+        if candidate is not None:
             return FileResponse(candidate)
         return FileResponse(FRONTEND_DIST / "index.html")

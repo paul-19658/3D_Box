@@ -27,8 +27,7 @@ KIND_LABELS = {
 LIGHT_KIND_LABELS = {
     "point": "点光源",
     "spot": "聚光灯",
-    "area": "面光",
-    "sun": "日光",
+    "area": "面光",    "sun": "日光",
 }
 
 MAX_SHADOW_CASTING_LIGHTS = 2
@@ -49,6 +48,78 @@ def _round(value: float, digits: int = 2) -> float:
 
 def _round_vector(value: dict[str, float]) -> dict[str, float]:
     return {axis: _round(value.get(axis, 0)) for axis in ("x", "y", "z")}
+
+
+# ---------------------------------------------------------------------------
+# 焦距换算
+#
+# 与前端 `web/frontend/src/core/focal-length.js` **必须逐字等价**：
+# 说明文件里的"50mm 镜头"要和渲染出的视野对应，否则用户按焦距构图、
+# 导出的提示词却描述了另一个镜头。
+#
+# 口径沿用 three.js `PerspectiveCamera`：画幅长边占满 filmGauge（默认 35mm），
+# `camera.fov` 是垂直视场角。
+# ---------------------------------------------------------------------------
+
+FILM_GAUGE_MM = 35
+_FULL_FRAME_DIAGONAL_MM = math.hypot(36, 24)
+
+
+def focal_length_mm(camera: dict[str, Any]) -> Optional[float]:
+    """由垂直视场角与画幅比反算焦距（mm）；无法计算时返回 None。"""
+    try:
+        fov = float(camera.get("fovDegrees"))
+        width = float(camera.get("aspectWidth") or 16)
+        height = float(camera.get("aspectHeight") or 9)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fov) or fov <= 0 or fov >= 180:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    aspect = width / height
+    film_height = FILM_GAUGE_MM / max(aspect, 1.0)
+    slope = math.tan(math.radians(fov / 2))
+    if slope <= 0:
+        return None
+    return 0.5 * film_height / slope
+
+
+def equivalent_full_frame_focal_length_mm(camera: dict[str, Any]) -> Optional[float]:
+    """等效全画幅焦距（相机厂商标称口径，43.27mm 对角线）。"""
+    focal = focal_length_mm(camera)
+    if focal is None:
+        return None
+    try:
+        width = float(camera.get("aspectWidth") or 16)
+        height = float(camera.get("aspectHeight") or 9)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    aspect = width / height
+    film_height = FILM_GAUGE_MM / max(aspect, 1.0)
+    film_width = FILM_GAUGE_MM * min(aspect, 1.0)
+    diagonal = math.hypot(film_width, film_height)
+    if diagonal <= 0:
+        return None
+    return focal * _FULL_FRAME_DIAGONAL_MM / diagonal
+
+
+def describe_camera_lens(camera: dict[str, Any]) -> str:
+    """镜头描述，如 "50mm（等效全画幅 54mm）"；无法计算时返回空串。
+
+    AI 图像/视频平台对"50mm 镜头""长焦压缩感"这类摄影术语反应很直接，
+    比"视场角 39 度"有效得多——这正是本项目输出的核心价值。
+    """
+    focal = focal_length_mm(camera)
+    if focal is None:
+        return ""
+    text = f"{_round(focal, 1)}mm"
+    equivalent = equivalent_full_frame_focal_length_mm(camera)
+    if equivalent is not None:
+        text += f"（等效全画幅 {round(equivalent)}mm）"
+    return text
 
 
 def resolve_shadow_caster_ids(lights: list[dict[str, Any]]) -> set[str]:
@@ -400,7 +471,8 @@ def build_suggested_prompt(project_name: str, scene: dict[str, Any]) -> str:
     lines.append("")
     lines.append(
         f"摄影机位置（{_round(position.get('x', 0))}, {_round(position.get('y', 0))}, "
-        f"{_round(position.get('z', 0))}），视场角 {_round(camera.get('fovDegrees', 0))} 度，"
+        f"{_round(position.get('z', 0))}），镜头 {describe_camera_lens(camera)}，"
+        f"视场角 {_round(camera.get('fovDegrees', 0))} 度，"
         f"画幅 {camera['aspectRatio']}。"
     )
     lines.append(_camera_direction_text(camera))
@@ -428,7 +500,8 @@ def summarize_scene(scene: dict[str, Any]) -> str:
 
     lines = [
         f"物体共 {len(objects)} 个（可见 {visible_count} 个），"
-        f"相机视场角 {_round(camera.get('fovDegrees', 0))} 度，"
+        f"相机镜头 {describe_camera_lens(camera)}，"
+        f"视场角 {_round(camera.get('fovDegrees', 0))} 度，"
         f"画幅 {camera.get('aspectWidth')}:{camera.get('aspectHeight')}。"
     ]
     position = camera.get("position", {})

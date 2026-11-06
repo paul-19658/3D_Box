@@ -57,10 +57,45 @@ describe('时间轴求值', () => {
     expect(evaluateCameraShots(shots, 1, camera(0)).position.x).toBeCloseTo(5, 6)
   })
 
-  it('smooth 使用 smoothstep，不是线性', () => {
+  /*
+   * 行为变更说明（schema 无关，纯插值算法升级）：
+   *
+   * 旧实现用 smoothstep 缓动，两个关键帧之间是"慢-快-慢"，所以
+   * t=0.5 时位置是 1.5625；代价是**每个中间关键帧速度归零**，
+   * 多镜头推移会一顿一顿。
+   *
+   * 新实现用时间参数化的向心 Catmull-Rom（见 core/camera-path.js）：
+   * 只有两个关键帧时，两端切线都等于该割线，三次 Hermite 精确退化为
+   * **匀速直线运动**，所以 t=0.5 时位置是 2.5（线性）。
+   * 这是刻意的取舍——"不停顿"比"每段缓入缓出"更接近真实运镜。
+   */
+  it('两个关键帧之间是匀速直线运动（不再是 smoothstep 缓动）', () => {
     const shots = [shot('a', 0, 0), shot('b', 2, 10)]
-    // t=0.25 时线性应为 2.5；smoothstep 为 0.15625。
-    expect(evaluateCameraShots(shots, 0.5, camera(0)).position.x).toBeCloseTo(1.5625, 4)
+    expect(evaluateCameraShots(shots, 0.5, camera(0)).position.x).toBeCloseTo(2.5, 6)
+    expect(evaluateCameraShots(shots, 1.5, camera(0)).position.x).toBeCloseTo(7.5, 6)
+  })
+
+  it('多个关键帧时速度连续：中间镜头处不归零', () => {
+    const shots = [shot('a', 0, 0), shot('b', 2, 10), shot('c', 4, 20)]
+    const atKey = evaluateCameraShots(shots, 2, camera(0)).position.x
+    const before = evaluateCameraShots(shots, 2 - 1 / 24, camera(0)).position.x
+    const after = evaluateCameraShots(shots, 2 + 1 / 24, camera(0)).position.x
+    expect(atKey).toBeCloseTo(10, 6)
+    // 关键帧前后各一帧的位移应当接近（旧算法在这里会骤降）
+    expect(Math.abs(after - atKey)).toBeCloseTo(Math.abs(atKey - before), 2)
+    expect(Math.abs(after - atKey)).toBeGreaterThan(0.1)
+  })
+
+  it('三个关键帧不再共线时，轨迹会离开两端的连直线（有弧线）', () => {
+    const arc = (x, z) => ({ ...camera(x), target: { x: 0, y: 1, z: 0 }, position: { x, y: 2, z } })
+    const shots = [
+      { id: 'a', name: 'a', timeSeconds: 0, transition: 'smooth', camera: arc(0, 0) },
+      { id: 'b', name: 'b', timeSeconds: 2, transition: 'smooth', camera: arc(5, 3) },
+      { id: 'c', name: 'c', timeSeconds: 4, transition: 'smooth', camera: arc(10, 0) }
+    ]
+    const atMid = evaluateCameraShots(shots, 2, camera(0)).position
+    // 首尾连线中点是 (5,2,0)，实际经过 (5,2,3)
+    expect(atMid.z).toBeCloseTo(3, 6)
   })
 
   it('cut 镜头在到达前保持上一个镜头', () => {
@@ -161,5 +196,88 @@ describe('evaluateTimelineAtTime', () => {
     const timeline = { durationSeconds: 4, cameraShots: [], objectKeyframes: [] }
     expect(evaluateTimelineAtTime(timeline, camera(0), -5).timeSeconds).toBe(0)
     expect(evaluateTimelineAtTime(timeline, camera(0), 50).timeSeconds).toBe(4)
+  })
+})
+
+/**
+ * 相机 target 绑定物体时的求值。
+ *
+ * 这是"相机跟随物体"的核心：绑定必须按**该时刻**物体的位置解算，
+ * 否则物体一动镜头就跟丢了；而且打了镜头轨之后绑定不能失效
+ * （镜头是从 shot 数据重建的，不会自带 targetObjectId）。
+ */
+describe('evaluateTimelineAtTime：相机绑定物体', () => {
+  const boundCamera = (overrides = {}) => ({ ...camera(0), targetObjectId: 'obj-1', ...overrides })
+
+  const boxObject = (x, y = 1.1) => ({
+    id: 'obj-1',
+    kind: 'box',
+    position: { x, y, z: 0 },
+    rotation: { x: 0, y: 0, z: 0 },
+    size: { x: 1, y: 1, z: 1 }
+  })
+
+  it('看向点等于被绑定物体在该时刻的位置', () => {
+    const timeline = { durationSeconds: 4, cameraShots: [], objectKeyframes: [] }
+    const frame = evaluateTimelineAtTime(timeline, boundCamera(), 0, [boxObject(7, 1.1)])
+    expect(frame.camera.target).toEqual({ x: 7, y: 1.1, z: 0 })
+  })
+
+  it('物体有关键帧动画时，不同时刻的看向点跟着变', () => {
+    const timeline = {
+      durationSeconds: 4,
+      cameraShots: [],
+      objectKeyframes: [keyframe('k1', 0, 0), keyframe('k2', 4, 8)]
+    }
+    const objects = [boxObject(0)]
+    const at0 = evaluateTimelineAtTime(timeline, boundCamera(), 0, objects)
+    const at4 = evaluateTimelineAtTime(timeline, boundCamera(), 4, objects)
+    expect(at0.camera.target.x).toBe(0)
+    expect(at4.camera.target.x).toBe(8)
+  })
+
+  it('打了镜头轨后绑定依然生效（target 以基准相机为准）', () => {
+    const timeline = {
+      durationSeconds: 4,
+      // 镜头记录了机位，但它不含 targetObjectId——绑定必须从基准相机带过来
+      cameraShots: [shot('a', 0, 1)],
+      objectKeyframes: []
+    }
+    const frame = evaluateTimelineAtTime(timeline, boundCamera(), 1, [boxObject(5, 2)])
+    expect(frame.camera.position.x).toBe(1)
+    expect(frame.camera.target).toEqual({ x: 5, y: 2, z: 0 })
+  })
+
+  it('未绑定时行为不变（target 用相机自己的）', () => {
+    const timeline = { durationSeconds: 4, cameraShots: [], objectKeyframes: [] }
+    const frame = evaluateTimelineAtTime(timeline, camera(0), 0, [boxObject(7)])
+    expect(frame.camera.target).toEqual({ x: 0, y: 1, z: 0 })
+  })
+
+  it('绑定的物体不存在时退回静态 target，不跳到原点', () => {
+    const timeline = { durationSeconds: 4, cameraShots: [], objectKeyframes: [] }
+    const frame = evaluateTimelineAtTime(timeline, boundCamera(), 0, [boxObject(7)])
+    // 换成一个 id 对不上的物体列表
+    const other = evaluateTimelineAtTime(timeline, boundCamera(), 0, [{ ...boxObject(7), id: '别的物体' }])
+    expect(frame.camera.target).toEqual({ x: 7, y: 1.1, z: 0 })
+    expect(other.camera.target).toEqual({ x: 0, y: 1, z: 0 })
+  })
+
+  it('人台绑定时对准竖直中心，而不是脚底', () => {
+    const timeline = { durationSeconds: 4, cameraShots: [], objectKeyframes: [] }
+    const mannequin = {
+      id: 'obj-1',
+      kind: 'mannequin',
+      position: { x: 0, y: 0, z: 0 },
+      size: { x: 1, y: 1.8, z: 1 }
+    }
+    const frame = evaluateTimelineAtTime(timeline, boundCamera(), 0, [mannequin])
+    expect(frame.camera.target.y).toBeCloseTo(0.9, 6)
+  })
+
+  it('不传物体列表时安全退回（老调用点不会崩）', () => {
+    const timeline = { durationSeconds: 4, cameraShots: [], objectKeyframes: [] }
+    const frame = evaluateTimelineAtTime(timeline, boundCamera(), 0)
+    expect(frame.camera.target).toEqual({ x: 0, y: 1, z: 0 })
   })
 })

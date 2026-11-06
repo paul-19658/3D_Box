@@ -3,6 +3,15 @@
     <canvas ref="canvas" class="viewport-canvas"></canvas>
     <div class="viewport-hud">
       <button
+        v-if="cameraViewActive"
+        type="button"
+        class="hud-pill hud-pill--camera-view"
+        title="退出相机视角 (Esc)"
+        @click="$emit('camera-view-change', 'exit')"
+      >
+        相机视角 · 退出 (Esc)
+      </button>
+      <button
         v-if="cameraViewMode !== 'none'"
         type="button"
         class="hud-pill"
@@ -89,6 +98,46 @@ import { resolveShadowCasterIds } from '@/core/lighting-description'
 import { objectIdColor } from '@/core/object-id-color'
 import { outputSize } from '@/core/video'
 import { registerSceneProbe } from '@/core/diagnostics'
+import {
+  WASD_DEFAULTS,
+  applyLookDelta,
+  cameraTargetFromOrientation,
+  clampDelta,
+  computeFlyOffset,
+  isEditableTarget,
+  movementIntentFromKeys,
+  navSchemeHandler,
+  orientationFromCameraTarget,
+  shouldRunOrbitControls
+} from '@/core/camera-nav'
+import { objectFocusPoint } from '@/core/camera-target'
+
+/**
+ * `TransformControls.setMode()` 接受的三个值。
+ *
+ * `transformMode` 还允许 `'select'`——那是"纯选择、不显示操纵器"
+ * （对标 Maya 的 Q），必须在这里挡掉，不能透传给 TransformControls。
+ */
+const TRANSFORM_MODES = ['translate', 'rotate', 'scale']
+
+/**
+ * gizmo 拖拽的减速系数（1 = 鼠标移动多少物体就移动多少）。
+ *
+ * 实测当前手感是精确 1:1——60px 鼠标位移对应 0.6142 世界单位，
+ * 与几何期望 `2·tan(fov/2)·距离 / 画布高度` 完全一致（1.00×），
+ * 也就是说并不存在放大 bug，纯粹是"太快、不好精确定位"的手感问题。
+ *
+ * 取 0.5：同样的鼠标位移只走一半距离，定位精度翻倍。
+ * 想更慢 / 更快改这一个常量即可（必须落在 (0, 1] 内）。
+ *
+ * 实现代价很小，但语义上有两点要注意：
+ * 1. 只对**场景物体**减速，摄影机模型仍 1:1——它的位姿直接变成机位，
+ *    减速会让取景变得迟钝，那不是用户想要的"更精细"。
+ * 2. 每帧都从**按下时的快照**重新换算，而不是在上一帧结果上累乘。
+ *    TransformControls 本身是按"指针相对按下点的位移"算绝对值的，
+ *    所以从快照换算既不会漂移，也不会因为帧率不同而产生不同结果。
+ */
+const TRANSFORM_DRAG_SENSITIVITY = 0.5
 
 let rectAreaLightReady = false
 
@@ -143,6 +192,14 @@ export default {
     paintScope: { type: String, default: 'object' },
     theme: { type: String, default: 'dark' },
     cameraViewMode: { type: String, default: 'none' },
+    /**
+     * 相机视角导航：视口锁定为场景摄影机的眼睛，导航手势写回相机属性。
+     *
+     * 与 `cameraViewMode` 的区别见 store 里的注释：那个只读取景，这个会改相机。
+     */
+    cameraViewActive: { type: Boolean, default: false },
+    /** 导航方案标识（`wasd` / `orbit`），实现见 core/camera-nav.js。 */
+    cameraNavScheme: { type: String, default: 'wasd' },
     /** 场景摄影机是否被选中——决定高亮与是否挂载控制柄。 */
     cameraSelected: { type: Boolean, default: false },
     /** 是否显示"摄影机监视器"小窗。 */
@@ -174,6 +231,8 @@ export default {
       ready: false,
       canvasWidth: 0,
       canvasHeight: 0,
+      /** 容器尺寸监听器（见 mounted 里的说明）。 */
+      resizeObserver: null,
       // 监视器窗体的位置与尺寸。位置是相对视口左上角的像素值。
       monitorRect: { x: 0, y: 0, w: 268, h: 151 },
       monitorReady: false,
@@ -214,6 +273,34 @@ export default {
     // 相机位姿、视场角、画幅任一变化都要重画摄影机模型与视锥。
     cameraState: { handler: 'rebuildCameraHelper', deep: true },
     cameraSelected: ['rebuildCameraHelper', 'attachTransformControls'],
+    /*
+     * 导航方案变化时重建导航状态。
+     *
+     * 必须由组件自己响应 prop 变化，而不是让父组件在 commit 之后同步调用：
+     * Vue 的 props 是异步更新的，父组件紧接着调用时这里读到的 `cameraNavScheme`
+     * 还是旧值，`beginCameraView()` 就会按旧方案设置 `controls.enabled`。
+     * 从 wasd 切到 orbit 时 OrbitControls 被误设成禁用 → 环绕完全失效，
+     * 只剩中键转向，表现就是"只能转动镜头本身的旋转属性"。
+     */
+    cameraNavScheme() {
+      if (this.cameraViewActive) this.resetCameraNavState()
+    },
+    /*
+     * 进出相机视角：重画相机模型（进入时要隐藏它，退出时恢复），
+     * 并把 gizmo 摘掉——相机视角里不该有可拖动的控制柄，
+     * 否则中键拖拽会被 TransformControls 抢先。
+     */
+    cameraViewActive() {
+      this.rebuildCameraHelper()
+      /*
+       * 两种情况都调 `attachTransformControls()`：它内部会跳过
+       * "场景相机自身"的控制柄，但**物体与灯光的控制柄照常挂载**——
+       * 取景时用户仍然需要直接摆物体（这是"事件优先级"需求的前提）。
+       * 之前这里写的是 `transformControls?.detach()`，会让物体 gizmo
+       * 在进入相机视角的瞬间消失，且不会自动恢复。
+       */
+      this.attachTransformControls()
+    },
     // 监视器开合时画布才刚出现在 DOM 里，必须等下一帧再初始化渲染器。
     monitorOpen(value) {
       if (value) this.$nextTick(() => this.initMonitor())
@@ -228,6 +315,14 @@ export default {
      * 退出时再由 attachTransformControls 按当前选中恢复。
      */
     previewActive(active) {
+      /*
+       * 进出预演会隐藏/显示工具栏与侧边栏 → 视口尺寸变化。
+       *
+       * ResizeObserver 一般能兜住，但它在"下一帧之前"才回调；而预演的第一帧
+       * 可能在这之前就画了。那次画出来的尺寸还是旧的，canvas 被 CSS 拉伸
+       * （实测 1.2862×，即"画面扁扁的"）。所以这里显式补一次。
+       */
+      this.$nextTick(() => this.handleResize())
       if (active) {
         // 预演期间禁止一切编辑手势：拾取会选中物体、拖拽会改数据。
         this.controls.enabled = false
@@ -254,11 +349,31 @@ export default {
   mounted() {
     this.init()
     window.addEventListener('resize', this.handleResize)
+    /*
+     * 只监听 window.resize 是不够的：**布局变了但窗口没变**同样会改变
+     * 视口尺寸。典型场景就是进入成片预演——工具栏和侧边栏被 v-if 隐藏，
+     * 视口从 1244 变宽到 1600，但没触发 window.resize。
+     *
+     * 而 canvas 的 CSS 是 `width/height: 100%`（见 styles/index.css），
+     * 绘制缓冲却由 `renderer.setSize(w, h, false)` 决定（第三参数 false =
+     * **不改样式**）。于是缓冲停留在 1244×750、CSS 盒子变成 1600×750，
+     * 浏览器把画面横向拉伸 —— 实测 1.2862×，用户看到的就是"画面扁扁的"。
+     *
+     * 用 ResizeObserver 盯住容器本身，任何布局变化都能补上。
+     */
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => this.handleResize())
+      this.resizeObserver.observe(this.$el)
+    }
     this.handleResize()
   },
 
   beforeDestroy() {
     window.removeEventListener('resize', this.handleResize)
+    if (this.resizeObserver) {
+      this.resizeObserver.disconnect()
+      this.resizeObserver = null
+    }
     this.disposeAll()
   },
 
@@ -333,12 +448,29 @@ export default {
       this.transformControls = new TransformControls(camera, canvas)
       this.transformControls.size = 0.85
       this.transformControls.addEventListener('dragging-changed', (event) => {
-        controls.enabled = !event.value
+        /*
+         * 拖 gizmo 时锁住 OrbitControls，避免同一次拖拽既摆物体又转镜头。
+         *
+         * 松手后的解锁**不能**简单写 `controls.enabled = true`：
+         * `wasd` 相机视角下相机归导航独占，OrbitControls 必须保持关闭，
+         * 否则拖完物体导航就被悄悄交还给 OrbitControls，
+         * 表现为"拖过一次物体后 WASD 不灵了 / 视角开始自己转"。
+         */
+        controls.enabled = event.value
+          ? false
+          : shouldRunOrbitControls(this.cameraViewActive, this.cameraNavScheme)
         // 记录拖拽状态：重建摄影机模型时据此跳过销毁，
         // 否则拖到一半控制柄会突然脱手。
         this.transformDragging = event.value
+        // 按下时快照原始变换，供 `dampTransformDuringDrag()` 做减速换算。
+        this.dragStartTransform = event.value ? this.snapshotTransform() : null
         // 松手时才提交一次，这样"拖动一次 = 一次撤销"。
         if (!event.value) this.emitTransform(true)
+      })
+      // 拖拽过程中只发预览，不写历史。
+      this.transformControls.addEventListener('objectChange', () => {
+        this.dampTransformDuringDrag()
+        this.emitTransform(false)
       })
       // 拖拽过程中只发预览，不写历史。
       this.transformControls.addEventListener('objectChange', () => this.emitTransform(false))
@@ -1498,6 +1630,20 @@ export default {
     rebuildCameraHelper() {
       if (!this.ready) return
 
+      /*
+       * 相机视角下隐藏相机自身模型。
+       *
+       * 相机视角把编辑相机搬到场景相机的眼睛位置，此时相机模型正好
+       * 罩在观察者身上——机壳和视锥会糊住整个画面，近裁剪面还会把它
+       * 切成几片乱飘的多边形。Maya 的 look through camera 同样会隐藏
+       * 该相机自身，这是通行做法。
+       */
+      if (this.cameraViewActive) {
+        if (this.cameraHelper) this.cameraHelper.visible = false
+        return
+      }
+      if (this.cameraHelper) this.cameraHelper.visible = true
+
       // 正在拖拽摄影机时不重建：拖拽会把新位置写回 store，
       // store 变化又会触发本函数，如果这里把对象换掉，
       // TransformControls 会立刻失去挂载目标，拖拽中途断掉。
@@ -1648,6 +1794,19 @@ export default {
      */
     pickSceneCamera() {
       if (!this.cameraHelper || !this.raycaster) return null
+
+      /*
+       * 相机视角下**绝不**拾取场景摄影机自身。
+       *
+       * 必须在这里拦，而不是靠"把相机模型 visible 设成 false"：
+       * three.js 的 Raycaster 并不检查 `visible`（只查 layers），
+       * 隐藏的机身照样会被射线打中。而相机视角下编辑相机就在相机原点，
+       * 机身、镜头、视锥全罩在观察者身上，于是随便点一下都会命中它：
+       *   camera-select → cameraSelected=true → attachTransformControls()
+       *   把控制柄挂到相机模型上、顺手关掉 OrbitControls。
+       * 结果就是"环绕方案下只能转动镜头本身的旋转属性"。
+       */
+      if (this.cameraViewActive) return null
 
       // 第一级：机身、镜头这些实体。它们就是用户看到并想去点的部分。
       const solids = []
@@ -1839,9 +1998,30 @@ export default {
         return
       }
 
+      /*
+       * 相机视角下**照样挂物体/灯光的控制柄**，只不挂"场景相机自身"的。
+       *
+       * 上一版在这里整体 return，导致取景时完全没法摆物体；但当时那样做是有
+       * 原因的：相机视角把编辑相机搬到场景相机的眼睛位置，机身正好罩在观察者
+       * 身上，一旦把控制柄挂到相机模型上，拖动就变成"转相机自身"并顶掉导航。
+       * 所以正确的收窄方式是：**跳过 cameraSelected 分支**，其余照旧。
+       */
+      const allowCameraHelperGizmo = !this.cameraViewActive
+
+      /*
+       * `transformMode === 'select'` 表示"纯选择、不显示操纵器"（对标 Maya 的 Q）。
+       * `TransformControls.setMode()` 只接受 translate/rotate/scale，
+       * 传其它值会报警并把控制柄留在原地，所以这里必须先摘掉。
+       */
+      if (!TRANSFORM_MODES.includes(this.transformMode)) {
+        controls.detach()
+        this.updateSelectionHelper()
+        return
+      }
+
       // 选中摄影机时把控制柄挂到摄影机模型上。
       // 平移改机位；旋转改朝向（把旋转量折算成新的 target），两者都写回场景相机。
-      if (this.cameraSelected) {
+      if (this.cameraSelected && allowCameraHelperGizmo) {
         if (this.cameraHelper) {
           controls.setMode(this.transformMode)
           controls.attach(this.cameraHelper)
@@ -1912,6 +2092,87 @@ export default {
       this.selectionBox = new THREE.Box3Helper(box, 0xffb020)
       this.selectionBox.renderOrder = 830
       this.scene.add(this.selectionBox)
+    },
+
+    /**
+     * 给本次 gizmo 拖拽要影响的节点做一份原始变换快照。
+     *
+     * 只快照**场景物体**（`rootMap` 里的根节点）以及多选用的 `pivot`；
+     * 摄影机模型不快照 → 不参与减速，保持 1:1 取景手感。
+     */
+    snapshotTransform() {
+      const target = this.transformControls?.object
+      if (!target) return null
+      // 摄影机模型 / 灯光不在减速范围内（见 TRANSFORM_DRAG_SENSITIVITY 注释）。
+      if (target === this.cameraHelper) return null
+      if (this.selectedLightId) return null
+
+      const isMultiPivot = Boolean(target.userData?.multiSelect)
+      if (!isMultiPivot && !target.userData?.objectId) return null
+
+      if (isMultiPivot) {
+        /*
+         * 多选：控制柄挂在 `pivot` 上，真正的位移由父组件按增量分发。
+         * 这里只需要把 pivot 的起始位置记下来，减速在 pivot 上做即可。
+         */
+        return {
+          multi: true,
+          target,
+          position: target.position.clone()
+        }
+      }
+
+      return {
+        multi: false,
+        target,
+        position: target.position.clone(),
+        quaternion: target.quaternion.clone(),
+        scale: target.scale.clone()
+      }
+    },
+
+    /**
+     * 把 TransformControls 算出的「原始」变换按减速系数折回一部分。
+     *
+     * 关键是**每次都从按下时的快照换算**，而不是在上一帧结果上累乘：
+     * TransformControls 是按"指针相对按下点的位移"算绝对值的，
+     * 从快照换算既不会漂移，也不受帧率影响。
+     */
+    dampTransformDuringDrag() {
+      const start = this.dragStartTransform
+      if (!start || !this.transformDragging) return
+      const target = this.transformControls?.object
+      if (!target || target !== start.target) return
+      const k = TRANSFORM_DRAG_SENSITIVITY
+
+      // 位移：线性插值回起点方向。
+      target.position.set(
+        start.position.x + (target.position.x - start.position.x) * k,
+        start.position.y + (target.position.y - start.position.y) * k,
+        start.position.z + (target.position.z - start.position.z) * k
+      )
+
+      if (start.multi) return
+
+      /*
+       * 旋转：沿最短弧把"起始朝向 → 原始朝向"的转角按比例缩小。
+       * 用 slerp 而不是对欧拉角做插值——欧拉角插值会在某些姿态下走偏，
+       * 甚至出现万向锁跳变。
+       *
+       * 必须先把原始朝向**拷贝出来**再 `copy(start)`：
+       * `slerp()` 是原地修改，若直接 `copy(start).slerp(target, k)`，
+       * 此时 target 已被覆盖成 start，等于"和自己插值"，
+       * 结果是永远转不动（实测转角恒为 0°）。
+       */
+      const rawQuaternion = target.quaternion.clone()
+      target.quaternion.copy(start.quaternion).slerp(rawQuaternion, k)
+
+      // 缩放：按比例折回（缩放是乘性的，用线性插值就够了，且不会越界）。
+      target.scale.set(
+        start.scale.x + (target.scale.x - start.scale.x) * k,
+        start.scale.y + (target.scale.y - start.scale.y) * k,
+        start.scale.z + (target.scale.z - start.scale.z) * k
+      )
     },
 
     /**
@@ -2090,13 +2351,58 @@ export default {
        * 用户退出预演时发现选中的东西变了，却找不到是什么时候点的。
        */
       if (this.previewActive) return
+
+      /*
+       * ============ 指针事件优先级（从上到下，先命中先处理）============
+       *
+       * 1. 预演：不接受任何编辑手势（上面已返回）。
+       * 2. **控制柄（gizmo）**：优先级最高。用户明确把指针放在某根轴上了，
+       *    意图就是"拖这个物体/灯光"，不该被任何导航手势抢走。
+       * 3. 相机视角的中键 / 左键：转视角或点选。
+       * 4. 右键：交给 OrbitControls 平移。
+       * 5. 常规拾取与造物手势。
+       *
+       * 第 2 条**必须排在相机视角分支之前**：否则相机视角下拖 gizmo 会被
+       * 当成"转视角"，表现就是"取景时摆不动物体"。
+       */
+      if (this.isPointerOnGizmo()) return
+
+      /*
+       * 相机视角下的中键拖拽 = 转向。
+       *
+       * 必须排在 OrbitControls 之前处理：OrbitControls 的中键是 DOLLY，
+       * 不拦的话同一次拖拽既转向又推拉，画面会又转又缩。
+       * 中键还要 preventDefault，否则浏览器会进入"自动滚动"模式。
+       */
+      if (this.cameraViewActive && event.button === 1) {
+        event.preventDefault()
+        this.beginNavLook(event)
+        return
+      }
+
+      /*
+       * 相机视角下的左键：**拖拽=转视角，点按=选中物体**。
+       *
+       * 按下时先不做判定，只记起点：
+       * - 指针移动超过阈值 → 当成拖拽，走和镜头转向同一条路径；
+       * - 松手时几乎没动 → 当成点按，在 `handlePointerUp` 里做拾取。
+       *
+       * 不能在按下时直接拾取：那样每次想转视角都会顺手改掉选中项
+       * （用户看到的是"一转镜头选中的东西就变了"）。
+       * 也不能在移动后就放弃选中：用户就是想"点一下选中"，
+       * 而手抖 1~2px 是常态，所以阈值用项目里既有的 4px。
+       */
+      if (this.cameraViewActive && event.button === 0) {
+        this.pointerDownAt = { x: event.clientX, y: event.clientY }
+        this.navPressPending = true
+        this.updatePointer(event)
+        return
+      }
+
       if (event.button === 2) {
         // 右键交给 OrbitControls 做平移，不参与拾取。
         return
       }
-
-      // 落在控制柄上：整段交互交给 TransformControls，不做任何拾取。
-      if (this.isPointerOnGizmo()) return
 
       this.pointerDownAt = { x: event.clientX, y: event.clientY }
       this.updatePointer(event)
@@ -2153,6 +2459,17 @@ export default {
       // 另外这里不能加 `if (!this.cameraSelected)` 的前置条件——
       // 那样在摄影机已选中时再点它，逻辑会继续往下走到 pickObject，
       // 落空后发出 selection-clear，刚选中的摄影机立刻被取消选中。
+      this.selectAtPointer(event)
+    },
+
+    /**
+     * 按指针位置做一次拾取与选中。
+     *
+     * 从 `handlePointerDown` 里抽出来，是因为相机视角下左键要区分
+     * "点按=选中"与"按住=拖拽转视角"：选中必须发生在**松手**且没有拖动时，
+     * 所以同一段逻辑要在 `handlePointerUp` 里也能调用。
+     */
+    selectAtPointer(event) {
       const cameraPoint = this.pickSceneCamera()
       const hit = this.pickObject()
       const cameraDistance = cameraPoint ? cameraPoint.distanceTo(this.raycaster.ray.origin) : Infinity
@@ -2364,6 +2681,28 @@ export default {
     },
 
     handlePointerMove(event) {
+      /*
+       * 相机视角左键：超过阈值才认定为"拖拽转视角"。
+       *
+       * 一旦越过阈值就转入正常的 look 拖拽流程，并清掉"待选中"标记——
+       * 否则松手时会顺手把拖拽起点处的物体选中，用户会觉得"转个视角怎么选中变了"。
+       */
+      if (this.navPressPending && !this.navState?.dragging) {
+        const distance = this.pointerDownAt
+          ? Math.hypot(event.clientX - this.pointerDownAt.x, event.clientY - this.pointerDownAt.y)
+          : Infinity
+        if (distance > 4) {
+          this.navPressPending = false
+          this.beginNavLook(event)
+        }
+      }
+
+      // 相机视角转向优先：中键/左键拖拽期间不做任何拾取或造物手势。
+      if (this.navState?.dragging) {
+        this.updateNavLook(event)
+        return
+      }
+
       if (this.pathNodeDrag) {
         this.updatePointer(event)
         this.updatePathNodeDrag()
@@ -2394,6 +2733,25 @@ export default {
     },
 
     handlePointerUp(event) {
+      /*
+       * 相机视角左键松手：拖过就是转视角的收尾，没拖过就是"点按选中"。
+       *
+       * 顺序很重要：先处理拖拽收尾（提交一次撤销），再处理点按拾取。
+       */
+      if (this.navPressPending) {
+        this.navPressPending = false
+        this.pointerDownAt = null
+        this.updatePointer(event)
+        this.selectAtPointer(event)
+        return
+      }
+
+      // 中键 / 左键转向结束：提交一次，保证"拖一次 = 撤销一次"。
+      if (this.navState?.dragging) {
+        this.endNavLook(event)
+        return
+      }
+
       const wasClick = this.isClickGesture(event)
       this.pointerDownAt = null
 
@@ -2452,6 +2810,11 @@ export default {
       const width = container.clientWidth
       const height = container.clientHeight
       if (width === 0 || height === 0) return
+      /*
+       * 尺寸没变就直接返回：ResizeObserver 会在很多与本视口无关的重排里被触发，
+       * 每次重建投影矩阵是白费功夫。
+       */
+      if (width === this.canvasWidth && height === this.canvasHeight) return
       this.canvasWidth = width
       this.canvasHeight = height
       this.camera.aspect = width / height
@@ -2470,7 +2833,26 @@ export default {
        * 成片出现无法解释的抖动。
        */
       if (this.exporting) return
-      this.controls.update()
+      // 相机视角飞行：必须在 controls.update() 之前推进，
+      // 否则本帧的位移要等下一帧才反映到画面上（手感发黏）。
+      this.stepCameraView()
+      /*
+       * OrbitControls 在 `wasd` 相机视角下必须停跑。
+       *
+       * 它的 update() 会 `camera.lookAt(target)` 并按 `position - target`
+       * 反推球坐标再写回位置，于是：朝向被强制指回旧 target（中键转向
+       * 看不到效果），相机飞近注视点时球坐标退化、被钉死在 target 上
+       * （表现为"往前飞一段后突然不动"）。这两条都实测复现过。
+       */
+      if (shouldRunOrbitControls(this.cameraViewActive, this.cameraNavScheme)) {
+        /*
+         * 环绕方案下每帧同步轴心：绑定了物体时轴心就是物体位置，
+         * 物体一动（导航线 / 关键帧动画）相机就跟着走，这就是"锁定并跟随"。
+         * 必须在 controls.update() 之前写，否则本帧要等下一帧才生效。
+         */
+        if (this.cameraViewActive) this.applyOrbitPivot(false)
+        this.controls.update()
+      }
       // 地面与网格跟随相机中心，形成"无限地面"效果。
       const gridX = Math.round(this.controls.target.x / 20) * 20
       const gridZ = Math.round(this.controls.target.z / 20) * 20
@@ -2782,6 +3164,530 @@ export default {
       this.controls.update()
     },
 
+    // ------------------------------------------------------------------
+    // 相机视角导航
+    // ------------------------------------------------------------------
+
+    /**
+     * 拖拽期间"看向目标"的**实时**位置。
+     *
+     * 为什么需要它：拖 gizmo 时 `handleObjectTransform(commit:false)` 只改
+     * 视口里的 three.js 根节点、**不写 store**（否则每帧写历史会灌满撤销栈）。
+     * 于是 `cameraState`（父组件解算好的相机）里的看向点仍是拖拽开始前的旧值，
+     * 轴心/瞄准都跟着不动——用户看到的是"拖的时候镜头不动，一松手镜头瞬移过去"。
+     *
+     * 这里直接从正在被拖的节点读实时位置来解算，就能做到每帧平滑跟随。
+     * 只在"被拖的正是绑定物体"时生效；其余时刻返回 null，由调用方回退到
+     * 父组件解算好的值（那条路径是导出/预览共用的，必须保持一致）。
+     */
+    liveBoundTarget() {
+      const state = this.cameraState
+      if (!state?.targetObjectId) return null
+      if (state.lookAtEnabled === false) return null
+      // 只在拖拽期间需要实时值；松手后 store 已经更新，走常规路径即可。
+      if (!this.transformDragging) return null
+      const dragged = this.transformControls?.object
+      if (!dragged || dragged.userData?.objectId !== state.targetObjectId) return null
+      const data = this.objects?.find((object) => object.id === state.targetObjectId)
+      if (!data) return null
+      /*
+       * 只替换位置，其余字段（kind / size）沿用 store 数据——它们在一次
+       * 位置拖拽里不会变，但 `objectFocusPoint` 需要它们来算竖直偏移
+       * （人台、导入模型的 position 在底部，必须抬升半个高度）。
+       */
+      return objectFocusPoint({
+        ...data,
+        position: { x: dragged.position.x, y: dragged.position.y, z: dragged.position.z }
+      })
+    },
+
+    /**
+     * `orbit` 方案（Maya 环绕）的环绕轴心。
+     *
+     * 两条规则：
+     * 1. **未绑定物体时轴心是世界原点 (0,0,0)** —— 这是 Maya tumble pivot 的
+     *    默认值。不用"相机当前看向点"做轴心，是因为那个点会随着上一次运镜
+     *    漂到任意位置，用户根本无法预期自己会绕着哪儿转。
+     * 2. **绑定了物体时轴心是该物体的位置** —— 这样物体一动（走导航线、
+     *    播关键帧），轴心跟着走，相机就实现了"锁定并跟随"。
+     *
+     * 注意 `cameraState` 是父组件已经解算过绑定的相机，所以这里直接读它的
+     * `target` 就是物体的位置；未绑定时它等于静态 target，因此要用
+     * `targetObjectId` 区分这两种情况。
+     */
+    orbitPivotPoint() {
+      // 拖拽绑定物体期间用实时位置，否则镜头要等松手才跟过去。
+      const live = this.liveBoundTarget()
+      if (live) return live
+      const state = this.cameraState
+      if (!state) return { x: 0, y: 0, z: 0 }
+      /*
+       * 只有**绑定生效**时才用物体位置做轴心。
+       * 关掉"看向物体"开关后绑定关系仍在，但相机应当回到世界原点环绕——
+       * 否则会出现"开关关了、轴心还在跟物体跑"的不一致。
+       */
+      if (state.targetObjectId && state.lookAtEnabled !== false) return state.target
+      return { x: 0, y: 0, z: 0 }
+    },
+
+    /**
+     * 把环绕轴心写进 OrbitControls。
+     *
+     * **相机不跟随物体平移，只是持续"看向"轴心。**
+     * 物体移动时只更新 `controls.target`：`OrbitControls.update()` 会按
+     * `position - target` 反推球坐标再写回位置，位置因此**保持不变**，
+     * 而它每帧末尾的 `lookAt(target)` 让视线跟到新目标上。
+     * 代价是环绕半径会随物体距离变化——这是"只看不跟"的固有语义。
+     *
+     * 注意：曾经这里还有一套"机位与轴心一起平移"的刚性跟随（可选开关）。
+     * 它已被移除——用户要的是"镜头单纯的看向 target"。
+     * 如果以后要重新加回平移跟随，务必记住：**必须机位与轴心一起平移**，
+     * 只改 target 反而会被 `update()` 把相机按在原地。
+     *
+     * `snap=true`（进入环绕 / 切换方案的那一刻）额外把视线立刻对准轴心：
+     * 不做的话画面还停在旧朝向，要拖一下才"跳"过去。
+     */
+    applyOrbitPivot(snap) {
+      if (!this.controls || !this.camera) return
+      const pivot = this.orbitPivotPoint()
+
+      /*
+       * 轴心与机位距离过近时**不动轴心**。
+       *
+       * 物体走到相机跟前时 `|position - target| → 0`，`lookAt` 的方向退化、
+       * 球坐标半径趋零，相机可能被钉死或抖动。此时保持上一帧的轴心更稳，
+       * 物体擦身而过后自然恢复。
+       */
+      const radius = Math.hypot(
+        this.camera.position.x - pivot.x,
+        this.camera.position.y - pivot.y,
+        this.camera.position.z - pivot.z
+      )
+      if (radius < 0.05) return
+
+      this.controls.target.set(pivot.x, pivot.y, pivot.z)
+
+      if (!snap) return
+      this.camera.lookAt(pivot.x, pivot.y, pivot.z)
+      // navState 也要同步：切回 wasd 时朝向必须连续，否则会突然转一下。
+      if (this.navState) {
+        const orientation = orientationFromCameraTarget({
+          position: {
+            x: this.camera.position.x,
+            y: this.camera.position.y,
+            z: this.camera.position.z
+          },
+          target: pivot
+        })
+        this.navState.yaw = orientation.yaw
+        this.navState.pitch = orientation.pitch
+        this.navState.distance = Math.max(orientation.distance, 1)
+      }
+    },
+
+    /**
+     * 进入相机视角：初始化导航内部状态。
+     *
+     * 为什么要单独记 yaw/pitch/distance 而不是每帧从 `controls` 反推：
+     * 飞行时相机位置由我们自己推进（不经过 OrbitControls），
+     * 而 OrbitControls 的 target 会被它自己的阻尼逻辑改写。
+     * 自持一份朝向状态，才能保证"往前飞"始终朝着当前视线方向。
+     */
+    beginCameraView() {
+      if (!this.camera) return
+      const orientation = orientationFromCameraTarget(this.cameraState)
+      this.navState = {
+        yaw: orientation.yaw,
+        pitch: orientation.pitch,
+        distance: Math.max(orientation.distance, 1),
+        dragging: false,
+        lastX: 0,
+        lastY: 0,
+        pointerId: null
+      }
+      this.navKeys = { forward: false, backward: false, left: false, right: false, up: false, down: false, boost: false }
+      this.navLastTime = null
+      /*
+       * `wasd` 方案必须让 OrbitControls 彻底让位（见 core/camera-nav.js 里
+       * `ownsCamera` 的说明）：它的 update() 会每帧 lookAt(target) 并
+       * 按 position-target 反推球坐标写回位置，导致朝向被覆盖、
+       * 相机飞近注视点时还会塌陷卡死。
+       * `orbit` 方案反过来——就是让 OrbitControls 驱动，因此保持启用。
+       */
+      const handler = navSchemeHandler(this.cameraNavScheme)
+      if (this.controls) this.controls.enabled = !handler.ownsCamera
+      if (!handler.ownsCamera) this.attachOrbitWriteBack()
+      else this.detachOrbitWriteBack()
+      /*
+       * 环绕方案：轴心默认世界原点，并把视线立刻对准它；
+       * 飞行方案：朝向由 navState 决定。
+       * 两条路径互斥，走错就会"画面朝向和导航状态不一致"。
+       */
+      if (handler.ownsCamera) this.applyNavOrientation()
+      else this.applyOrbitPivot(true)
+      window.addEventListener('keydown', this.handleNavKeyDown)
+      window.addEventListener('keyup', this.handleNavKeyUp)
+      window.addEventListener('blur', this.handleNavBlur)
+    },
+
+    /** 退出相机视角：停掉接管，把编辑视角交还 OrbitControls。 */
+    endCameraView() {
+      this.navState = null
+      this.navKeys = null
+      this.navLastTime = null
+      this.navPressPending = false
+      this.detachOrbitWriteBack()
+      window.removeEventListener('keydown', this.handleNavKeyDown)
+      window.removeEventListener('keyup', this.handleNavKeyUp)
+      window.removeEventListener('blur', this.handleNavBlur)
+      if (this.controls) this.controls.enabled = true
+    },
+
+    /**
+     * 把导航朝向写进相机与 OrbitControls 的注视点。
+     *
+     * 三件事必须同时做，少一件就会出问题：
+     * 1. `camera.lookAt` —— 画面方向真的转过去（只改 store 的话用户看不到变化）；
+     * 2. 同步 `controls.target` —— 否则退出相机视角时 OrbitControls
+     *    会从旧 target 重新推导，视角突然跳一下；
+     * 3. 保持注视距离 —— 不能让 target 塌到机位上，否则球坐标退化。
+     */
+    applyNavOrientation() {
+      if (!this.camera || !this.navState) return
+      /*
+       * 相机绑定了物体时，朝向由**物体位置**决定，而不是 navState 的 yaw/pitch。
+       *
+       * 这是"飞行模式下只重新对准"的落点：WASD 仍可自由移动机位，
+       * 但镜头始终盯着被绑定物体（相当于一条 aim 约束）。此时中键/左键
+       * 转向不会改变朝向——转不开是预期行为，不是 bug。
+       *
+       * 拖拽期间用实时位置（`liveBoundTarget`），这样拖动绑定物体时
+       * 镜头每帧都跟着重新瞄准，而不是松手才跳过去。
+       */
+      const live = this.liveBoundTarget()
+      const bound =
+        live ??
+        (this.cameraState?.targetObjectId && this.cameraState.lookAtEnabled !== false
+          ? this.cameraState.target
+          : null)
+      const resolved = bound
+        ? { target: bound }
+        : cameraTargetFromOrientation({
+            position: {
+              x: this.camera.position.x,
+              y: this.camera.position.y,
+              z: this.camera.position.z
+            },
+            yaw: this.navState.yaw,
+            pitch: this.navState.pitch,
+            distance: this.navState.distance
+          })
+      this.camera.lookAt(resolved.target.x, resolved.target.y, resolved.target.z)
+      if (this.controls) {
+        this.controls.target.set(resolved.target.x, resolved.target.y, resolved.target.z)
+      }
+      /*
+       * 绑定状态下把 navState 反算回真实朝向，保证解除绑定的那一刻
+       * 画面不会突然跳到"上一次转向留下的旧 yaw/pitch"。
+       */
+      if (bound) {
+        const orientation = orientationFromCameraTarget({
+          position: {
+            x: this.camera.position.x,
+            y: this.camera.position.y,
+            z: this.camera.position.z
+          },
+          target: bound
+        })
+        this.navState.yaw = orientation.yaw
+        this.navState.pitch = orientation.pitch
+        this.navState.distance = Math.max(orientation.distance, 1)
+      }
+    },
+
+    /**
+     * `orbit` 方案：OrbitControls 转完相机后，把结果写回场景相机。
+     *
+     * 与 `wasd` 的关键区别：这里的朝向不是由 `navState.yaw/pitch` 决定的，
+     * 而是由 OrbitControls 自己算出来的。因此：
+     * - 写回的 `target` 必须取 `controls.target`（真正的环绕轴心），
+     *   不能再用 `navState` 里的 yaw/pitch 反算——那是**过期**的方向，
+     *   会得到一个和画面完全无关的注视点；
+     * - 写完再把 `navState` 从真实位姿反算回来，保证切回 `wasd` 时
+     *   朝向是连续的，不会突然跳一下。
+     *
+     * 用节流提交：OrbitControls 拖拽过程中会连续触发 change，
+     * 每次都提交会灌满撤销栈；攒到停手 260ms 再提交一次。
+     */
+    publishOrbitCamera(commit) {
+      if (!this.camera || !this.controls) return
+      const position = {
+        x: this.camera.position.x,
+        y: this.camera.position.y,
+        z: this.camera.position.z
+      }
+      const target = {
+        x: this.controls.target.x,
+        y: this.controls.target.y,
+        z: this.controls.target.z
+      }
+      if (this.navState) {
+        const orientation = orientationFromCameraTarget({ position, target })
+        this.navState.yaw = orientation.yaw
+        this.navState.pitch = orientation.pitch
+        this.navState.distance = Math.max(orientation.distance, 1)
+      }
+      this.$emit('camera-transform', { position, target, commit })
+    },
+
+    attachOrbitWriteBack() {
+      if (!this.controls || this.orbitWriteBack) return
+      /*
+       * 拖拽过程中：只更新视口显示，不写历史。
+       * 每帧都提交会把撤销栈灌满，用户按一次 Ctrl+Z 只退回一帧。
+       */
+      this.orbitWriteBack = () => {
+        if (!this.cameraViewActive) return
+        this.publishOrbitCamera(false)
+      }
+      /*
+       * 松手（`end`）立刻提交一次。
+       *
+       * 这里**不能**只靠节流计时器：环绕默认开着阻尼，松手后相机会继续
+       * 缓动一小段，`change` 会持续触发、不断重置计时器，提交迟迟不发生
+       * （表现为"环绕了但场景相机没动"）。`end` 是 OrbitControls 给出的
+       * 明确"操作结束"信号，用它落库最可靠。
+       */
+      this.orbitCommit = () => {
+        if (!this.cameraViewActive) return
+        if (this.navCommitTimer) {
+          window.clearTimeout(this.navCommitTimer)
+          this.navCommitTimer = null
+        }
+        this.publishOrbitCamera(true)
+      }
+      this.controls.addEventListener('change', this.orbitWriteBack)
+      this.controls.addEventListener('end', this.orbitCommit)
+    },
+
+    detachOrbitWriteBack() {
+      if (!this.controls) return
+      if (this.orbitWriteBack) {
+        this.controls.removeEventListener('change', this.orbitWriteBack)
+        this.orbitWriteBack = null
+      }
+      if (this.orbitCommit) {
+        this.controls.removeEventListener('end', this.orbitCommit)
+        this.orbitCommit = null
+      }
+    },
+
+    /** 切换导航方案时重置内部状态，避免残留上一次的朝向与按键。 */
+    resetCameraNavState() {
+      if (!this.cameraViewActive) return
+      this.endCameraView()
+      this.beginCameraView()
+    },
+
+    /**
+     * WASD 按键按下。
+     *
+     * 必须先排除"正在输入"的元素：编辑器里有工程名输入框和大量
+     * 数值输入框，用户在框里打 wasd 会被当成相机移动。
+     */
+    handleNavKeyDown(event) {
+      if (isEditableTarget(event.target)) return
+      if (!this.navKeys) return
+      const key = event.key.toLowerCase()
+      // 方案决定是否消费键盘：`orbit` 方案下 WASD 完全不参与。
+      if (!navSchemeHandler(this.cameraNavScheme).consumesKeyboard) return
+      const mapping = {
+        w: 'forward',
+        arrowup: 'forward',
+        s: 'backward',
+        arrowdown: 'backward',
+        a: 'left',
+        arrowleft: 'left',
+        d: 'right',
+        arrowright: 'right',
+        q: 'down',
+        e: 'up'
+      }
+      const field = mapping[key]
+      if (field) {
+        this.navKeys[field] = true
+        // 阻止方向键滚动页面；WASD 不 preventDefault，避免干扰浏览器快捷键。
+        if (key.startsWith('arrow')) event.preventDefault()
+        return
+      }
+      if (key === 'shift') this.navKeys.boost = true
+    },
+
+    handleNavKeyUp(event) {
+      if (!this.navKeys) return
+      const key = event.key.toLowerCase()
+      const mapping = {
+        w: 'forward',
+        arrowup: 'forward',
+        s: 'backward',
+        arrowdown: 'backward',
+        a: 'left',
+        arrowleft: 'left',
+        d: 'right',
+        arrowright: 'right',
+        q: 'down',
+        e: 'up'
+      }
+      const field = mapping[key]
+      if (field) this.navKeys[field] = false
+      if (key === 'shift') this.navKeys.boost = false
+    },
+
+    /**
+     * 失焦时清空按键。
+     *
+     * 用户在按住 W 时切走窗口，keyup 收不到，回来后相机会一直往前飞。
+     */
+    handleNavBlur() {
+      if (!this.navKeys) return
+      for (const field of Object.keys(this.navKeys)) this.navKeys[field] = false
+    },
+
+    /** 中键按下：开始拖拽转向。 */
+    beginNavLook(event) {
+      if (!this.navState) return
+      if (!navSchemeHandler(this.cameraNavScheme).consumesPointerLook) return
+      this.navState.dragging = true
+      this.navState.pointerId = event.pointerId
+      this.navState.lastX = event.clientX
+      this.navState.lastY = event.clientY
+      this.$refs.canvas?.setPointerCapture?.(event.pointerId)
+    },
+
+    /** 中键拖拽中：更新朝向，并把新位姿发给父组件（不写历史）。 */
+    updateNavLook(event) {
+      if (!this.navState?.dragging || event.pointerId !== this.navState.pointerId) return
+      const deltaX = event.clientX - this.navState.lastX
+      const deltaY = event.clientY - this.navState.lastY
+      this.navState.lastX = event.clientX
+      this.navState.lastY = event.clientY
+      const next = applyLookDelta({
+        yaw: this.navState.yaw,
+        pitch: this.navState.pitch,
+        deltaX,
+        deltaY
+      })
+      this.navState.yaw = next.yaw
+      this.navState.pitch = next.pitch
+      // 必须立刻把朝向应用到相机：只 emit 的话父组件只挪了相机模型，
+      // 用户拖中键时画面根本不会转（store 变了但看不到）。
+      this.applyNavOrientation()
+      this.publishNavCamera(false)
+    },
+
+    /** 中键松开：提交一次，保证"拖一次 = 撤销一次"。 */
+    endNavLook(event) {
+      if (!this.navState?.dragging) return
+      if (event && event.pointerId !== this.navState.pointerId) return
+      this.navState.dragging = false
+      this.navState.pointerId = null
+      this.publishNavCamera(true)
+    },
+
+    /**
+     * 把当前导航状态推给父组件。
+     *
+     * `commit=false` 时父组件只更新视口显示，不写 store——
+     * 否则每帧写一次历史，用户按一次 Ctrl+Z 只能退一帧。
+     */
+    publishNavCamera(commit) {
+      if (!this.camera) return
+      const position = {
+        x: this.camera.position.x,
+        y: this.camera.position.y,
+        z: this.camera.position.z
+      }
+      const resolved = cameraTargetFromOrientation({
+        position,
+        yaw: this.navState?.yaw ?? 0,
+        pitch: this.navState?.pitch ?? 0,
+        distance: this.navState?.distance ?? 1
+      })
+      this.$emit('camera-transform', { position: resolved.position, target: resolved.target, commit })
+    },
+
+    /**
+     * 每帧推进飞行移动。
+     *
+     * 位移按**秒**计算（见 core/camera-nav.js），因此不同帧率下
+     * 同样的按键时长位移一致；帧间隔还做了上限保护，
+     * 避免切走标签页再回来时相机瞬移。
+     */
+    stepCameraView() {
+      if (!this.cameraViewActive || !this.navState || !this.navKeys || !this.camera) return
+      const now = performance.now()
+      const deltaSeconds = this.navLastTime === null ? 0 : clampDelta((now - this.navLastTime) / 1000)
+      this.navLastTime = now
+
+      if (!navSchemeHandler(this.cameraNavScheme).consumesKeyboard) return
+
+      const intent = movementIntentFromKeys(this.navKeys)
+      const moving = intent.x !== 0 || intent.y !== 0 || intent.z !== 0
+
+      if (moving) {
+        const quaternion = [
+          this.camera.quaternion.x,
+          this.camera.quaternion.y,
+          this.camera.quaternion.z,
+          this.camera.quaternion.w
+        ]
+        const offset = computeFlyOffset({
+          deltaSeconds,
+          intent,
+          boost: this.navKeys.boost,
+          quaternion,
+          speed: WASD_DEFAULTS
+        })
+        this.camera.position.set(
+          this.camera.position.x + offset.x,
+          this.camera.position.y + offset.y,
+          this.camera.position.z + offset.z
+        )
+      }
+
+      /*
+       * 朝向**每帧都同步**，而不是只在移动时同步。
+       *
+       * 因为相机可能绑定了物体：用户按住 gizmo 拖动该物体时并没有按 WASD，
+       * 但镜头必须跟着物体实时重新瞄准。若把这一步放在 `moving` 分支里，
+       * 就会出现"拖物体时镜头不动、松手才瞬移"——正是要修的症状。
+       */
+      this.applyNavOrientation()
+
+      if (!moving) return
+      // 飞行中每帧只更新视口显示，松手/停手时不提交——
+      // 键盘移动没有"松手"这一刻，因此改用节流提交（见 publishNavCameraThrottled）。
+      this.publishNavCamera(false)
+      this.publishNavCameraThrottled()
+    },
+
+    /**
+     * 键盘飞行与环绕都没有明确的"操作结束"信号，因此用静默计时提交：
+     * 停止操作 260ms 后提交一次，把这段连续操作合并成一次撤销。
+     *
+     * 提交时必须按当前方案分派：`wasd` 用 navState 的 yaw/pitch 反算 target，
+     * `orbit` 必须用 `controls.target`。用错的话 store 里的相机朝向会和画面不一致。
+     */
+    publishNavCameraThrottled() {
+      if (this.navCommitTimer) window.clearTimeout(this.navCommitTimer)
+      this.navCommitTimer = window.setTimeout(() => {
+        this.navCommitTimer = null
+        if (!this.cameraViewActive) return
+        if (navSchemeHandler(this.cameraNavScheme).ownsCamera) this.publishNavCamera(true)
+        else this.publishOrbitCamera(true)
+      }, 260)
+    },
+
     /** 导出当前编辑视角画面为 base64 PNG。 */
     captureImageBase64(maxDimension = 1920) {
       return this.renderToSize(maxDimension, (canvas) => canvas.toDataURL('image/png').split(',')[1])
@@ -2863,7 +3769,7 @@ export default {
             this.applyTimelineFrame(timeline, timeSeconds)
           }
           const frameCamera = timeline
-            ? evaluateTimelineAtTime(timeline, baseCamera, timeSeconds).camera
+            ? evaluateTimelineAtTime(timeline, baseCamera, timeSeconds, this.objects).camera
             : baseCamera
           const timeLabel = `${timeSeconds.toFixed(1)}s`
 
@@ -3281,6 +4187,13 @@ export default {
       // 注销探针：组件销毁后不能再让外部读到半拆解的 three.js 对象。
       registerSceneProbe(null, {})
       this.disposeMonitor()
+      // 相机视角的键盘监听与提交计时器必须清掉：
+      // 组件销毁后键盘监听还在，会对着已拆解的相机继续算位移。
+      this.endCameraView()
+      if (this.navCommitTimer) {
+        window.clearTimeout(this.navCommitTimer)
+        this.navCommitTimer = null
+      }
       cancelAnimationFrame(this.animationFrame)
       const canvas = this.$refs.canvas
       if (canvas) {

@@ -6,6 +6,7 @@
  */
 
 import { BASIC_KIND_NAMES, MANNEQUIN_PRESET_IDS } from './project-document'
+import { clampFovDegrees } from './focal-length'
 
 export const AI_SCENE_COMMAND_TYPES = [
   'clear_scene',
@@ -220,7 +221,7 @@ function parseCommand(rawInput) {
       type: 'set_camera',
       position: optionalVector(raw.position),
       target: optionalVector(raw.target),
-      fovDegrees: fov !== undefined ? Math.min(Math.max(fov, 10), 120) : undefined
+      fovDegrees: fov !== undefined ? clampFovDegrees(fov) : undefined
     }
   }
 
@@ -277,7 +278,7 @@ function parseCameraPathPoint(value) {
   const target = optionalVector(value.target)
   if (target) point.target = target
   const fov = coerceNumber(value.fovDegrees)
-  if (fov !== undefined) point.fovDegrees = Math.min(Math.max(fov, 10), 120)
+  if (fov !== undefined) point.fovDegrees = clampFovDegrees(fov)
   return point
 }
 

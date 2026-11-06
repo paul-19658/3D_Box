@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import User
 from app.db.session import get_db
+from app.models.project import PROJECT_SCHEMA_VERSION
 from app.services import project_repo
 from app.services.ai_service import (
     AI_DEFAULT_MAX_TOKENS,
@@ -76,7 +77,9 @@ def meta() -> dict[str, Any]:
         "appName": "3D导演台 测试版",
         "appVersion": "0.22.0",
         "projectExtension": "block3d",
-        "projectSchemaVersion": 13,
+        # 必须引用常量而不是写死数字：这里之前硬编码 13，升 schema 时漏改，
+        # 结果是 /api/meta 与模型层版本号不一致，只有测试才会发现。
+        "projectSchemaVersion": PROJECT_SCHEMA_VERSION,
         # 前端据此决定：本机 WebCodecs 不可用时能否走服务器 ffmpeg 兜底。
         "serverMp4Encode": ffmpeg_available(),
     }
@@ -172,7 +175,7 @@ def save_project(
         project_id=result["projectId"],
         owner_id=user.id,
         name=str(result.get("name") or result["projectId"]),
-        schema_version=int(result.get("schemaVersion") or 13),
+        schema_version=int(result.get("schemaVersion") or 15),
         file_size_bytes=int(result.get("fileSizeBytes") or 0),
     )
     return result

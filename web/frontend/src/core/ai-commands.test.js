@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { applyAiSceneCommands } from '@/core/apply-ai-scene-commands'
 import { describeCommand, extractCommandsFromReply, isVerificationPass } from '@/core/ai-commands'
 import { AI_DEFAULT_SYSTEM_PROMPT, AI_SCENE_COMMAND_SCHEMA_HINT } from '@/core/ai-defaults'
+import { MAX_FOV_DEGREES, MIN_FOV_DEGREES } from '@/core/focal-length'
 
 const emptyScene = () => ({
   objects: [],
@@ -59,8 +60,12 @@ describe('AI 回复解析', () => {
   })
 
   it('把越界数值夹紧到允许范围', () => {
+    // 上限来自共享常量：加焦距功能时发现旧的两处硬编码 10/120
+    // 把镜头卡在约 5.7~112mm，135mm 长焦设不出来，已统一放宽到 5~140°。
     const reply = '[{"type":"set_camera","fovDegrees":9999}]'
-    expect(extractCommandsFromReply(reply)[0].fovDegrees).toBe(120)
+    expect(extractCommandsFromReply(reply)[0].fovDegrees).toBe(MAX_FOV_DEGREES)
+    const tooWide = '[{"type":"set_camera","fovDegrees":0.01}]'
+    expect(extractCommandsFromReply(tooWide)[0].fovDegrees).toBe(MIN_FOV_DEGREES)
   })
 
   it('animate_move 少于两个路径点时被丢弃', () => {

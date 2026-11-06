@@ -51,7 +51,7 @@ def main() -> int:
 
     meta = call("/api/meta")
     check("appName 中文未损坏", meta.get("appName") == "3D导演台 测试版", repr(meta.get("appName")))
-    check("schema 版本为 13", meta.get("projectSchemaVersion") == 13)
+    check("schema 版本为 15", meta.get("projectSchemaVersion") == 15)
     check(
         "serverMp4Encode 为布尔",
         isinstance(meta.get("serverMp4Encode"), bool),
@@ -65,7 +65,7 @@ def main() -> int:
     check("平台预设 5 条", len(profiles.get("profiles", [])) == 5)
 
     document = {
-        "schemaVersion": 13,
+        "schemaVersion": 15,
         "appVersion": "0.22.0",
         "savedAt": "2026-10-19T00:00:00Z",
         "name": "冒烟场景",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +22,7 @@ from sqlalchemy import select
 
 from app.db.models import User
 from app.db.session import SessionLocal, get_db, init_db, reset_engine
-from app.main import app
+from app.main import app, resolve_dist_file
 from app.models.project import (
     DEFAULT_CAMERA,
     DEFAULT_LIGHTING,
@@ -38,7 +39,10 @@ from app.services.platform_profiles import load_rules, validate_video_profile
 from app.services.project_store import ProjectFileService
 from app.services import project_store as project_store_module
 from app.services.scene_output import (
+    describe_camera_lens,
     describe_lighting,
+    equivalent_full_frame_focal_length_mm,
+    focal_length_mm,
     light_color_text,
     light_height_text,
     light_side_text,
@@ -179,6 +183,198 @@ def test_legacy_document_falls_back_to_defaults() -> None:
     assert migrated["scene"]["camera"]["fovDegrees"] == DEFAULT_CAMERA.fovDegrees
     assert migrated["scene"]["lighting"]["lights"][0]["name"] == "柔和主光"
     assert migrated["scene"]["objects"] == []
+
+
+def test_v13_camera_migrates_to_null_target_binding() -> None:
+    """v13 工程没有 targetObjectId，迁移后必须是 None 而不是缺字段。
+
+    缺字段会让"是否绑定"在两端出现"字段不存在 / 为 null"两种判断分支，
+    很容易在一端漏掉，表现为"同一份工程在网页版绑定生效、在别处失效"。
+    """
+    raw = {
+        "name": "v13 工程",
+        "schemaVersion": 13,
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+            }
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["scene"]["camera"]["targetObjectId"] is None
+
+
+def test_camera_target_binding_round_trips() -> None:
+    """绑定物体 id 必须能存能读。"""
+    raw = {
+        "name": "绑定工程",
+        "scene": {
+            "objects": [
+                {
+                    "id": "box-1",
+                    "kind": "box",
+                    "name": "方块",
+                    "position": {"x": 0, "y": 0.5, "z": 0},
+                    "rotation": {"x": 0, "y": 0, "z": 0},
+                    "size": {"x": 1, "y": 1, "z": 1},
+                }
+            ],
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+                "targetObjectId": "box-1",
+                "lookAtEnabled": True,
+            },
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["scene"]["camera"]["targetObjectId"] == "box-1"
+    assert migrated["scene"]["camera"]["lookAtEnabled"] is True
+
+
+def test_v14_camera_defaults_look_at_enabled_to_true() -> None:
+    """v14 工程没有 lookAtEnabled，迁移后必须是 True（一绑就生效的老行为）。"""
+    raw = {
+        "name": "v14 工程",
+        "schemaVersion": 14,
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+                "targetObjectId": "box-1",
+            }
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["scene"]["camera"]["lookAtEnabled"] is True
+
+
+def test_look_at_can_be_disabled_while_binding_is_kept() -> None:
+    """关掉开关只是"暂时不用"，绑定关系必须保留。
+
+    这是与"解除绑定"的关键区别：解除会把 targetObjectId 清空，
+    关开关则保留 id，随时可以勾回来而无需重新拖拽。
+    """
+    raw = {
+        "name": "关闭看向",
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+                "targetObjectId": "box-1",
+                "lookAtEnabled": False,
+            }
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    camera = migrated["scene"]["camera"]
+    assert camera["targetObjectId"] == "box-1"
+    assert camera["lookAtEnabled"] is False
+
+
+def test_empty_target_binding_is_normalized_to_none() -> None:
+    """空字符串不是"未绑定"也不是合法 id，必须归一成 None。
+
+    与前端 `normalizeCamera()` 用同一条规则，否则两端对同一份工程的
+    "是否绑定"判断会分叉。
+    """
+    raw = {
+        "name": "空绑定",
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+                "targetObjectId": "",
+            }
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["scene"]["camera"]["targetObjectId"] is None
+
+
+# ----------------------------------------------------------------------
+# 焦距换算（必须与前端 core/focal-length.js 逐字等价）
+# ----------------------------------------------------------------------
+
+
+def _camera(fov: float, aspect_width: float = 16, aspect_height: float = 9) -> dict:
+    return {"fovDegrees": fov, "aspectWidth": aspect_width, "aspectHeight": aspect_height}
+
+
+def test_focal_length_matches_three_js_film_gauge_model() -> None:
+    """16:9 下 42° 垂直视场角对应约 25.6mm（长边 35mm 口径）。"""
+    focal = focal_length_mm(_camera(42))
+    assert focal is not None
+    assert abs(focal - 25.6) < 0.2
+
+
+def test_focal_length_decreases_as_fov_widens() -> None:
+    narrow = focal_length_mm(_camera(20))
+    wide = focal_length_mm(_camera(90))
+    assert narrow is not None and wide is not None
+    assert narrow > wide
+
+
+def test_focal_length_differs_between_landscape_and_portrait() -> None:
+    """长边定视野：同一视场角在横竖屏下对应不同焦距。"""
+    landscape = focal_length_mm(_camera(42, 16, 9))
+    portrait = focal_length_mm(_camera(42, 9, 16))
+    assert landscape is not None and portrait is not None
+    assert landscape != portrait
+
+
+def test_equivalent_full_frame_focal_length_is_larger_on_16_9() -> None:
+    """16:9 的感光面比全画幅小，所以等效焦距比实际焦距长。"""
+    actual = focal_length_mm(_camera(42))
+    equivalent = equivalent_full_frame_focal_length_mm(_camera(42))
+    assert actual is not None and equivalent is not None
+    assert equivalent > actual
+
+
+def test_invalid_fov_returns_none_instead_of_nan() -> None:
+    assert focal_length_mm(_camera(0)) is None
+    assert focal_length_mm(_camera(180)) is None
+    assert focal_length_mm({"fovDegrees": None}) is None
+    assert focal_length_mm({}) is None
+
+
+def test_describe_camera_lens_is_human_readable() -> None:
+    text = describe_camera_lens(_camera(42))
+    assert "mm" in text
+    assert "等效全画幅" in text
+
+
+def test_scene_description_mentions_lens() -> None:
+    """说明文件里必须出现镜头描述——AI 平台对"50mm 镜头"比对角度敏感。"""
+    scene = {
+        "objects": [],
+        "camera": {
+            **_camera(42),
+            "position": {"x": 0, "y": 2, "z": 8},
+            "target": {"x": 0, "y": 1, "z": 0},
+        },
+        "lighting": {"lights": []},
+        "timeline": {"durationSeconds": 0},
+    }
+    text = summarize_scene(scene)
+    assert "镜头" in text
+    assert "mm" in text
 
 
 def test_corrupted_object_is_skipped_not_fatal() -> None:
@@ -349,6 +545,74 @@ def test_project_crud_over_http(client: TestClient) -> None:
 
 def test_projects_require_login(client: TestClient) -> None:
     assert client.get("/api/projects").status_code == 401
+
+
+# ----------------------------------------------------------------------
+# SPA 静态回落：路径穿越防护
+# ----------------------------------------------------------------------
+
+
+def _make_dist(tmp_path: Path) -> Path:
+    """造一个最小的 dist 目录：一个 index.html 加一个静态资源。"""
+    dist = tmp_path / "dist"
+    (dist / "mannequin").mkdir(parents=True)
+    (dist / "index.html").write_text("<html>index</html>", encoding="utf-8")
+    (dist / "mannequin" / "LICENSE.txt").write_text("CC0", encoding="utf-8")
+    return dist
+
+
+def test_spa_serves_real_file_inside_dist(tmp_path) -> None:
+    """dist 内的真实文件必须能取到，否则前端静态资源全挂。"""
+    dist = _make_dist(tmp_path)
+    served = resolve_dist_file(dist, "mannequin/LICENSE.txt")
+    assert served is not None
+    assert served.name == "LICENSE.txt"
+
+
+def test_spa_missing_path_falls_back_to_index(tmp_path) -> None:
+    """不存在的路径交给 vue-router，返回 None 由调用方回落到 index.html。"""
+    dist = _make_dist(tmp_path)
+    assert resolve_dist_file(dist, "editor") is None
+    assert resolve_dist_file(dist, "") is None
+
+
+def test_spa_path_traversal_is_blocked(tmp_path) -> None:
+    """穿越到 dist 之外一律拒绝。
+
+    这是真实存在过的漏洞：原先直接用 `dist / full_path` 做 is_file()，
+    实测可读到 workspace/ai-environment.json 的明文 API Key 与系统 win.ini。
+    """
+    dist = _make_dist(tmp_path)
+    secret = tmp_path / "ai-environment.json"
+    secret.write_text('{"apiKey":"super-secret"}', encoding="utf-8")
+
+    for attack in (
+        "../ai-environment.json",
+        "../../ai-environment.json",
+        "mannequin/../../ai-environment.json",
+        "../" * 8 + "ai-environment.json",
+    ):
+        assert resolve_dist_file(dist, attack) is None, attack
+
+
+def test_spa_sibling_prefix_directory_is_blocked(tmp_path) -> None:
+    """同前缀的兄弟目录不能被当成 dist 内部。
+
+    用字符串 startswith 判归属时，`dist-backup/` 会被误判为在 `dist` 内；
+    必须用 Path.is_relative_to 按路径段比较。
+    """
+    dist = _make_dist(tmp_path)
+    sibling = tmp_path / "dist-backup"
+    sibling.mkdir()
+    (sibling / "leak.txt").write_text("leaked", encoding="utf-8")
+
+    assert resolve_dist_file(dist, "../dist-backup/leak.txt") is None
+
+
+def test_spa_directory_is_not_served_as_file(tmp_path) -> None:
+    """目录不是文件，必须回落 index，而不是把目录当文件返回。"""
+    dist = _make_dist(tmp_path)
+    assert resolve_dist_file(dist, "mannequin") is None
 
 
 def test_username_is_case_insensitive(client: TestClient) -> None:

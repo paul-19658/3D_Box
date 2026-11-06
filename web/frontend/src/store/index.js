@@ -15,8 +15,15 @@ import Vuex from 'vuex'
 import { api } from '@/api/client'
 import { createHistory, commitHistory, undoHistory, redoHistory } from '@/core/history'
 import { createInitialScene } from '@/core/scene'
-import { migrateProjectDocument, sceneFingerprint, createProjectDocument } from '@/core/project-document'
+import {
+  migrateProjectDocument,
+  sceneFingerprint,
+  createProjectDocument,
+  createId
+} from '@/core/project-document'
 import { applyAiSceneCommands } from '@/core/apply-ai-scene-commands'
+import { CAMERA_NAV_SCHEMES, DEFAULT_CAMERA_NAV_SCHEME } from '@/core/camera-nav'
+import { applyAutoKey, collectAutoKeyTargets } from '@/core/auto-key'
 import { AI_MAX_HISTORY_MESSAGES } from '@/core/ai-defaults'
 import {
   AI_AGENT_MAX_STEPS,
@@ -134,6 +141,40 @@ export default new Vuex.Store({
     monitorOpen: false,
 
     cameraViewMode: 'none',
+    /**
+     * 相机视角导航：视口锁定为场景摄影机的眼睛，导航手势实时写回相机属性。
+     *
+     * 与 `cameraViewMode` 分开的原因：后者是"临时切到某台摄影机看一眼"
+     * （只读取景，不改相机）；本项是"接管相机"，操作会真的改机位与朝向。
+     * 两者语义相反，混在一个状态里必然出现"以为在看，结果改了相机"。
+     */
+    cameraViewActive: false,
+    /**
+     * 相机导航方案标识（`wasd` / `orbit`）。
+     *
+     * 放 store 而不是组件 data，是为了以后能持久化到用户偏好、
+     * 也能被菜单栏与视口同时读到。方案实现见 `core/camera-nav.js`。
+     */
+    cameraNavScheme: DEFAULT_CAMERA_NAV_SCHEME,
+    /**
+     * 自动关键帧总开关（对标 Maya 的 Auto Key）。
+     *
+     * 默认关闭：这是会"替用户写数据"的功能，必须由用户显式打开。
+     * 悄悄默认开启会让第一次拖动就产生一堆关键帧，用户会以为工程坏了。
+     */
+    autoKeyEnabled: false,
+    /**
+     * 当前播放头下被手动改过、需要压过时间轴求值的物体 id。
+     *
+     * 放在 store 而不是组件里，是因为"哪些物体被改了"只有唯一写入口
+     * `editScene` 能可靠知道。放组件里就得让每个调用点自觉上报，
+     * 一旦有人绕过（AI 命令、脚本、以后新增的入口）就会漏，
+     * 表现为"某些入口改完物体还是被关键帧拽回去"。
+     *
+     * 播放头一变就清空（见 `setTimelineTime`）：这是 Maya / Blender 的约定，
+     * 拖过的属性只在当前帧保持用户给的值，一改时间就重新由动画曲线说话。
+     */
+    timelineEditOverrides: [],
     /**
      * 成片预演：视口不再显示编辑视角，而是以成片画幅渲染场景摄影机。
      *
@@ -275,6 +316,49 @@ export default new Vuex.Store({
       state.cameraViewMode = mode
     },
     /**
+     * 进出相机视角导航。
+     *
+     * 退出时顺手关掉监视器：监视器显示的就是"场景相机所见"，
+     * 而相机视角下视口本身已经是相机所见，两个画面完全重复，
+     * 留着只会让人以为"怎么有两个一样的窗口"。
+     */
+    setCameraViewActive(state, active) {
+      state.cameraViewActive = Boolean(active)
+      if (!state.cameraViewActive) return
+      state.monitorOpen = false
+    },
+    setCameraNavScheme(state, scheme) {
+      state.cameraNavScheme = scheme
+      // 记住用户选的导航方案：这是操作习惯，不该每次重开都重置。
+      // 隐私模式下 localStorage 可能不可用，失败就退回默认值。
+      try {
+        window.localStorage.setItem('xiaobaihe-camera-nav', scheme)
+      } catch {
+        /* 忽略：取不到存储不影响功能 */
+      }
+    },
+    setAutoKeyEnabled(state, enabled) {
+      state.autoKeyEnabled = Boolean(enabled)
+    },
+    /**
+     * 记录"当前播放头下被用户手动改过的物体"，用于压过时间轴求值。
+     *
+     * 存在的唯一目的：物体一旦有关键帧，求值就会在每个时刻覆盖它的变换。
+     * 用户在 t=2 把物体从 A 拖到 B，松手后显示立刻被拉回 A，
+     * 看起来就像"位置被锁住、拖不动"。这里记下改过的 id，
+     * `displayedObjects` 对这些物体改用场景里的真实值。
+     *
+     * 只影响显示，不写进场景数据。
+     */
+    setTimelineEditOverrides(state, ids) {
+      if (!Array.isArray(ids) || ids.length === 0) return
+      state.timelineEditOverrides = [...new Set([...state.timelineEditOverrides, ...ids])]
+    },
+    clearTimelineEditOverrides(state) {
+      if (state.timelineEditOverrides.length === 0) return
+      state.timelineEditOverrides = []
+    },
+    /**
      * 进出"成片预演"。
      *
      * 进入预演会顺手清掉编辑态的临时视图：切割平面、导航线草稿、
@@ -318,9 +402,19 @@ export default new Vuex.Store({
 
     setTimelineTime(state, time) {
       state.timelineTime = time
+      /*
+       * 播放头一变，手动编辑覆盖立刻失效，重新由关键帧求值说话。
+       *
+       * 放在 mutation 里而不是组件的 watch 里：这样所有调用点
+       * （拖标尺、输入时刻、播放、退出预演归零）都自动覆盖到，
+       * 不会因为某个入口忘了清而残留一个"上一帧的临时姿态"。
+       */
+      state.timelineEditOverrides = []
     },
     setTimelinePlaying(state, playing) {
       state.timelinePlaying = playing
+      // 一开始播放就必须严格按关键帧走，不能带着上一次拖拽的临时姿态。
+      if (playing) state.timelineEditOverrides = []
     },
     setSelectedShotId(state, id) {
       state.selectedShotId = id
@@ -456,6 +550,10 @@ export default new Vuex.Store({
       const theme = window.localStorage.getItem('xiaobaihe-theme')
       if (theme === 'light' || theme === 'dark') commit('setTheme', theme)
 
+      // 恢复上次选择的相机导航方案；非法值一律忽略，回退到默认方案。
+      const navScheme = window.localStorage.getItem('xiaobaihe-camera-nav')
+      if (CAMERA_NAV_SCHEMES.includes(navScheme)) commit('setCameraNavScheme', navScheme)
+
       // AI / recovery / recent 需要登录；由 login / fetchCurrentUser 成功后加载。
       if (state.currentUser) {
         await dispatch('loadUserWorkspace')
@@ -523,11 +621,50 @@ export default new Vuex.Store({
     /**
      * 所有场景修改的唯一入口。
      * `update` 接收当前场景，返回新场景；返回同一引用表示无变化。
+     *
+     * 自动关键帧（Auto Key）挂在这里，而不是挂在每个"改变换"的调用点上：
+     * 改变换的入口有 gizmo、属性面板、多选拖拽、相机浮层、人台预设、
+     * AI 命令等六七处，逐个埋点必然漏，以后新增入口还要记得补。
+     * 在唯一写入口对比前后场景，天然全覆盖。
+     *
+     * 关键：打帧结果与属性修改**合并成同一个新场景**再 commit 一次。
+     * 若分成两次 editScene，用户要按两次 Ctrl+Z 才能撤回一次拖动。
      */
     editScene({ commit, state, dispatch }, update) {
       const current = state.history.present
-      const next = update(current)
-      if (!next || next === current) return
+      const updated = update(current)
+      if (!updated || updated === current) return
+
+      /*
+       * 只算一次"这次变更动了哪些可动画目标"，供两处复用：
+       * 自动关键帧要它决定打哪些帧；"手动编辑覆盖"要它的物体 id。
+       * 分开各算一次会对同一帧遍历两遍场景，没必要。
+       */
+      const targets = collectAutoKeyTargets(current, updated)
+
+      /*
+       * 记录手动编辑覆盖（仅显示层）。
+       *
+       * 播放中不记：播放必须严格按关键帧走。
+       * 只读工程不记：本来就不允许改。
+       */
+      if (!state.timelinePlaying && !state.readOnlyProject && targets.objects.length > 0) {
+        commit(
+          'setTimelineEditOverrides',
+          targets.objects.map((target) => target.objectId)
+        )
+      }
+
+      const next = applyAutoKey(current, updated, {
+        enabled: state.autoKeyEnabled,
+        playing: state.timelinePlaying,
+        readOnly: Boolean(state.readOnlyProject),
+        timeSeconds: state.timelineTime,
+        durationSeconds: updated.timeline?.durationSeconds,
+        createId,
+        targets
+      })
+
       commit('commitScene', next)
       dispatch('scheduleAutosave')
     },

@@ -465,9 +465,59 @@
               />
             </div>
           </div>
-          <div class="field">
+          <!--
+            "看向"的启用开关。
+            只在**已经绑定**时才出现：没绑定时"是否启用"没有意义。
+            关掉后相机回到静态 target 坐标，但绑定关系保留，
+            勾回来无需重新拖拽——这是与"解除"的关键区别。
+          -->
+          <div v-if="camera.targetObjectId" class="field">
+            <span class="field__label">看向物体</span>
+            <label class="checkbox" :title="lookAtEnabledHint">
+              <input
+                type="checkbox"
+                :checked="lookAtEnabled"
+                @change="$emit('toggle-look-at', $event.target.checked)"
+              />
+              启用（锁定并跟随）
+            </label>
+          </div>
+          <div class="field" :class="{ 'is-bound': targetBindingAlive && lookAtEnabled }">
             <span class="field__label">看向</span>
-            <div class="vector-row">
+            <!--
+              绑定**生效**时看向点由物体位置决定，数字输入没有意义，
+              所以整行换成"绑定条"：显示物体名 + 解除按钮。
+              保留数字输入会让人以为改了数字就能改朝向，实际改了没反应。
+              开关关闭时绑定条置灰，但下面的坐标输入恢复可用——
+              此时相机用的就是那组坐标。
+            -->
+            <div v-if="targetBindingAlive" class="bind-row" :class="{ 'is-disabled': !lookAtEnabled }">
+              <span
+                class="bind-chip"
+                :class="{ 'is-off': !lookAtEnabled }"
+                :title="lookAtEnabled ? `相机锁定「${targetBindingName}」并跟随其移动` : `已绑定「${targetBindingName}」，但当前未启用`"
+              >
+                <span class="bind-chip__icon" aria-hidden="true">◎</span>
+                {{ targetBindingName }}
+              </span>
+              <button
+                type="button"
+                class="mini-btn"
+                title="解除绑定，改为使用固定坐标"
+                @click="$emit('bind-camera-target', null)"
+              >
+                解除
+              </button>
+            </div>
+            <div
+              v-else
+              class="vector-row"
+              :class="{ 'is-drop-target': targetDropActive }"
+              title="把左侧物体列表里的物体拖到这里，相机会锁定并跟随它"
+              @dragover.prevent="targetDropActive = true"
+              @dragleave="targetDropActive = false"
+              @drop.prevent="handleTargetDrop"
+            >
               <input
                 v-for="axis in axes"
                 :key="`ct-${axis}`"
@@ -479,17 +529,83 @@
               />
             </div>
           </div>
+          <!--
+            绑定生效但开关关闭时，仍需让用户能改那组固定坐标——
+            否则关掉开关后"看向"只剩一个灰条，无从下手。
+          -->
+          <div v-if="targetBindingAlive && !lookAtEnabled" class="field">
+            <span class="field__label">固定坐标</span>
+            <div class="vector-row">
+              <input
+                v-for="axis in axes"
+                :key="`ft-${axis}`"
+                class="input"
+                type="number"
+                step="0.1"
+                :value="round(camera.target[axis])"
+                @change="patchCameraVector('target', axis, $event)"
+              />
+            </div>
+          </div>
+          <!--
+            绑定失效（物体被删）时给一个明确的出口。
+            不提示的话用户只会看到"看向"的数字在跳，完全联想不到是绑定。
+          -->
+          <p v-if="targetBindingDangling" class="field-hint field-hint--warn">
+            绑定的物体已不存在，相机已退回固定坐标。
+            <button type="button" class="mini-btn" @click="$emit('bind-camera-target', null)">清除绑定</button>
+          </p>
+          <label class="field">
+            <span class="field__label">焦距</span>
+            <div class="focal-row">
+              <input
+                class="input"
+                type="number"
+                step="1"
+                min="3"
+                max="300"
+                :value="round(focalLengthMm)"
+                @change="patchFocalLength($event)"
+              />
+              <span class="focal-unit">mm</span>
+              <span class="focal-equiv" :title="`等效全画幅约 ${round(equivalentFocalMm)}mm`">
+                ≈{{ round(equivalentFocalMm) }}mm 全幅
+              </span>
+            </div>
+          </label>
+          <div class="field">
+            <span class="field__label">焦段</span>
+            <div class="preset-row">
+              <button
+                v-for="preset in focalPresets"
+                :key="`fl-${preset.mm}`"
+                type="button"
+                class="mini-btn"
+                :class="{ 'is-on': Math.abs(focalLengthMm - preset.mm) < 0.5 }"
+                :title="preset.label"
+                @click="$emit('update-camera', { fovDegrees: fovForFocal(preset.mm) })"
+              >
+                {{ preset.mm }}
+              </button>
+            </div>
+          </div>
           <label class="field">
             <span class="field__label">视场角</span>
-            <input
-              class="input"
-              type="number"
-              step="1"
-              min="10"
-              max="120"
-              :value="camera.fovDegrees"
-              @change="$emit('update-camera', { fovDegrees: clamp(Number($event.target.value), 10, 120) })"
-            />
+            <div class="focal-row">
+              <input
+                class="input"
+                type="number"
+                step="1"
+                :min="MIN_FOV_DEGREES"
+                :max="MAX_FOV_DEGREES"
+                :value="round(camera.fovDegrees)"
+                @change="$emit('update-camera', { fovDegrees: clampFovDegrees(Number($event.target.value)) })"
+              />
+              <span class="focal-unit">° 垂直</span>
+              <span class="focal-equiv" :title="`横向视场角 ${round(horizontalFov)}°`">
+                横向 {{ round(horizontalFov) }}°
+              </span>
+            </div>
           </label>
         </div>
 
@@ -502,12 +618,16 @@
               type="button"
               class="btn"
               :class="{ 'is-selected': isAspect(preset) }"
-              @click="$emit('update-camera', { aspectWidth: preset.width, aspectHeight: preset.height })"
+              :title="preset.hint"
+              @click="applyAspect(preset)"
             >
               {{ preset.label }}
             </button>
           </div>
           <p class="meta-line">当前 {{ camera.aspectWidth }} : {{ camera.aspectHeight }}</p>
+          <p class="field-hint">
+            换画幅相当于换传感器：<b>镜头（焦距）不变</b>，长边视野固定，短边随比例变化。
+          </p>
         </div>
 
         <div class="panel__section">
@@ -533,6 +653,17 @@
  */
 import { MANNEQUIN_PRESETS } from '@/core/mannequin'
 import { ASPECT_PRESETS, LIGHT_KIND_LABELS } from '@/core/project-document'
+import {
+  FOCAL_LENGTH_PRESETS,
+  MAX_FOV_DEGREES,
+  MIN_FOV_DEGREES,
+  aspectRatioOf,
+  clampFovDegrees,
+  equivalentFullFrameFocalLength,
+  focalLengthFromFovDegrees,
+  fovDegreesFromFocalLength,
+  horizontalFovDegrees
+} from '@/core/focal-length'
 
 const KIND_LABELS = {
   box: '方块',
@@ -563,7 +694,9 @@ export default {
     /** 当前选中物体在时间轴上的关键帧数量（>0 时变换由关键帧驱动）。 */
     objectKeyframeCount: { type: Number, default: 0 },
     /** 当前选中的导航线节点索引（仅当 object 是 path 时有意义）。 */
-    selectedNodeIndex: { type: Number, default: null }
+    selectedNodeIndex: { type: Number, default: null },
+    /** 场景全部物体：相机"看向"绑定需要从中找被绑物体，也用于拖放校验。 */
+    objects: { type: Array, default: () => [] }
   },
 
   data() {
@@ -573,11 +706,68 @@ export default {
       presets: MANNEQUIN_PRESETS,
       aspectPresets: ASPECT_PRESETS,
       lightKinds: LIGHT_KIND_LABELS,
-      paintPalette: ['#ff6b6b', '#ffb020', '#37c98b', '#2f7cf6', '#9b7bf6', '#e9eef1', '#6a747b']
+      paintPalette: ['#ff6b6b', '#ffb020', '#37c98b', '#2f7cf6', '#9b7bf6', '#e9eef1', '#6a747b'],
+      focalPresets: FOCAL_LENGTH_PRESETS,
+      MIN_FOV_DEGREES,
+      MAX_FOV_DEGREES,
+      /** 拖拽悬停在"看向"行上时为真，用来给用户一个可投放的视觉反馈。 */
+      targetDropActive: false
     }
   },
 
   computed: {
+    /** 相机绑定的物体（未绑定或物体已删则为 null）。 */
+    targetBoundObject() {
+      const id = this.camera?.targetObjectId
+      if (!id) return null
+      return this.objects.find((object) => object.id === id) ?? null
+    },
+    /** 当前焦距（mm）。由 fovDegrees 换算而来——焦距不是独立存储的参数。 */
+    focalLengthMm() {
+      return focalLengthFromFovDegrees(this.camera?.fovDegrees, this.cameraAspect) ?? 0
+    },
+    /** 等效全画幅焦距，用于给用户一个跨画幅可比的口径。 */
+    equivalentFocalMm() {
+      return equivalentFullFrameFocalLength(this.focalLengthMm, this.cameraAspect) ?? 0
+    },
+    /** 横向视场角：摄影里说"视角"通常指水平方向，与垂直的 fov 区分开。 */
+    horizontalFov() {
+      return horizontalFovDegrees(this.camera?.fovDegrees, this.cameraAspect) ?? 0
+    },
+    cameraAspect() {
+      return aspectRatioOf(this.camera)
+    },
+    /** 绑定有效：有 id 且物体还在。 */
+    targetBindingAlive() {
+      return Boolean(this.camera?.targetObjectId && this.targetBoundObject)
+    },
+    /**
+     * 绑定了 id 但物体不在了。
+     *
+     * 必须与"未绑定"区分开：前者要给用户一个明确的清除入口，
+     * 否则用户只会看到"看向"的数字在跳，联想不到是绑定。
+     */
+    targetBindingDangling() {
+      return Boolean(this.camera?.targetObjectId && !this.targetBoundObject)
+    },
+    targetBindingName() {
+      return this.targetBoundObject?.name ?? ''
+    },
+    /**
+     * 看向绑定是否**实际生效**（有引用且开关打开）。
+     *
+     * 缺省视为启用：v14 及更早的工程没有 `lookAtEnabled` 字段。
+     */
+    lookAtEnabled() {
+      return Boolean(this.camera?.targetObjectId) && this.camera.lookAtEnabled !== false
+    },
+    lookAtEnabledHint() {
+      if (!this.camera?.targetObjectId) return '先绑定一个物体'
+      if (this.targetBindingDangling) return '绑定的物体已不存在'
+      return this.lookAtEnabled
+        ? '关闭后相机改用下方固定坐标，绑定关系保留'
+        : '打开后相机重新锁定该物体'
+    },
     title() {
       if (this.target === 'light') return '灯光属性'
       if (this.target === 'camera') return '摄影机'
@@ -692,6 +882,16 @@ export default {
     isAspect(preset) {
       return this.camera.aspectWidth === preset.width && this.camera.aspectHeight === preset.height
     },
+    /**
+     * 切换画幅。
+     *
+     * 只上报画幅本身，**视场角的换算由 `Editor.updateCamera` 负责**——
+     * 那是相机的唯一写入口，放在那里 AI 命令 / 撤销重做 / 载入都会受益；
+     * 放在这个按钮里就只有点按钮这条路是对的。
+     */
+    applyAspect(preset) {
+      this.$emit('update-camera', { aspectWidth: preset.width, aspectHeight: preset.height })
+    },
     formatTime(value) {
       return `${(Math.max(Number(value) || 0, 0)).toFixed(2)}s`
     },
@@ -711,6 +911,38 @@ export default {
     removeSelectedNode() {
       if (!this.object || this.selectedNodeIndex === null) return
       this.$emit('path-remove-node', { id: this.object.id, index: this.selectedNodeIndex })
+    },
+
+    /**
+     * 改焦距 → 换算成视场角写回。
+     *
+     * 项目里焦距**不是独立存储的参数**，只存 `fovDegrees`；焦距是界面上的
+     * 另一种输入方式。存两份必然出现"改了 fov、焦距显示不同步"的漂移。
+     */
+    patchFocalLength(event) {
+      const focal = Number(event.target.value)
+      const fov = fovDegreesFromFocalLength(focal, this.cameraAspect)
+      if (!Number.isFinite(fov)) return
+      this.$emit('update-camera', { fovDegrees: clampFovDegrees(fov) })
+    },
+
+    /** 焦段预设 → 该画幅下的视场角。 */
+    fovForFocal(focalMm) {
+      const fov = fovDegreesFromFocalLength(focalMm, this.cameraAspect)
+      return clampFovDegrees(fov)
+    },
+
+    /**
+     * 把物体拖到"看向"行上 → 绑定相机 target。
+     * 数据从 `dataTransfer` 里读物体 id，而不是靠"当前选中项"——
+     * 拖放期间选中项可能已经变了，用选中项会在边界情况下绑错物体。
+     */
+    handleTargetDrop(event) {
+      this.targetDropActive = false
+      const objectId = event.dataTransfer?.getData('text/x-object-id')
+      if (!objectId) return
+      if (!this.objects.some((object) => object.id === objectId)) return
+      this.$emit('bind-camera-target', objectId)
     }
   }
 }

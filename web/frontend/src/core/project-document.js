@@ -7,12 +7,18 @@
  */
 
 /**
+ * schema 15：相机新增 `lookAtEnabled`（看向绑定是否启用）。
+ *
+ * 语义：`targetObjectId` 只记着"绑的是谁"，`lookAtEnabled` 决定这一刻用不用它。
+ * 关掉后相机改用静态 `target` 坐标，但绑定关系保留，勾回来即可恢复。
+ * 缺省（v14 及更早）视为 `true`，老工程行为不变。
+ *
+ * schema 14：相机新增 `targetObjectId`（把看向点绑定到某个物体并跟随）。
  * schema 13：新增 `kind: 'path'` 的导航线对象。
  *
- * 只增不改：v12 及更早的工程里没有 path 对象，迁移时原样保留即可，
- * 因此不需要写"版本升级改写"逻辑，只需要在类型白名单里放开 path。
+ * 一路上都是**只加字段、不改语义**，所以老工程永远能原样打开。
  */
-export const PROJECT_SCHEMA_VERSION = 13
+export const PROJECT_SCHEMA_VERSION = 15
 export const PROJECT_EXTENSION = 'block3d'
 
 /** 场景里可作为"物体"存在的类型。导航线也是物体，因此也在这里。 */
@@ -61,7 +67,21 @@ export const DEFAULT_CAMERA = {
   target: { x: 0, y: 1, z: 0 },
   fovDegrees: 42,
   aspectWidth: 16,
-  aspectHeight: 9
+  aspectHeight: 9,
+  /**
+   * 绑定的目标物体 id；null 表示看向点就是上面的静态 `target`。
+   *
+   * 必须是 nullable 而不是省略：省略会让"三端字段集合"随工程不同而变化，
+   * 后端校验和指纹比较都要处理"字段存不存在"两种分支，很容易漏。
+   */
+  targetObjectId: null,
+  /**
+   * 看向绑定是否启用。
+   *
+   * 与 `targetObjectId` 分开：那个记"绑的是谁"，这个决定"用不用"。
+   * 关掉后相机回到静态 `target`，但绑定关系保留，随时可以勾回来。
+   */
+  lookAtEnabled: true
 }
 
 export const DEFAULT_LIGHTING = {
@@ -165,12 +185,24 @@ export const LIGHT_PRESETS = {
   }
 }
 
-/** 相机画幅预设，与用户指南中列出的比例一致。 */
+/**
+ * 相机画幅预设。
+ *
+ * 顺序按"从宽到窄"排：宽银幕 → 超宽 → 横屏 → 摄影 → 方 → 竖屏。
+ * `width/height` 用整数比，界面显示 `label`；实际画幅比取 `width / height`。
+ *
+ * 注意 2.39:1 用 239:100 表达（变形宽银幕的标准比），不能用 239:100 之外的
+ * 近似值，否则和影视行业的通行标注对不上。
+ */
 export const ASPECT_PRESETS = [
-  { label: '16:9', width: 16, height: 9 },
-  { label: '9:16', width: 9, height: 16 },
-  { label: '1:1', width: 1, height: 1 },
-  { label: '4:3', width: 4, height: 3 }
+  { label: '2.39:1', width: 239, height: 100, hint: '变形宽银幕' },
+  { label: '21:9', width: 21, height: 9, hint: '超宽银幕' },
+  { label: '16:9', width: 16, height: 9, hint: '横屏（默认）' },
+  { label: '3:2', width: 3, height: 2, hint: '摄影' },
+  { label: '4:3', width: 4, height: 3, hint: '经典' },
+  { label: '1:1', width: 1, height: 1, hint: '方形' },
+  { label: '9:16', width: 9, height: 16, hint: '竖屏短视频' },
+  { label: '4:5', width: 4, height: 5, hint: '竖版图文' }
 ]
 
 export function createId() {
@@ -233,7 +265,17 @@ function isCamera(value) {
     isVector3(value.target) &&
     isFiniteNumber(value.fovDegrees) &&
     isFiniteNumber(value.aspectWidth) &&
-    isFiniteNumber(value.aspectHeight)
+    isFiniteNumber(value.aspectHeight) &&
+    /*
+     * `targetObjectId` 允许缺省（v13 及更早的工程没有这个字段），
+     * 但一旦存在就必须是 null 或非空字符串。空字符串要拒绝：
+     * 它既不是"未绑定"也不是合法 id，留着会让"是否绑定"的判断出现第三种状态。
+     */
+    (value.targetObjectId === undefined ||
+      value.targetObjectId === null ||
+      (typeof value.targetObjectId === 'string' && value.targetObjectId.length > 0)) &&
+    // `lookAtEnabled` 允许缺省（v14 及更早的工程没有），但存在时必须是布尔。
+    (value.lookAtEnabled === undefined || typeof value.lookAtEnabled === 'boolean')
   )
 }
 
@@ -279,7 +321,7 @@ function normalizeObject(object) {
  */
 export function migrateProjectDocument(raw) {
   const sceneRaw = (raw && raw.scene) || {}
-  const camera = isCamera(sceneRaw.camera) ? sceneRaw.camera : JSON.parse(JSON.stringify(DEFAULT_CAMERA))
+  const camera = normalizeCamera(isCamera(sceneRaw.camera) ? sceneRaw.camera : DEFAULT_CAMERA)
   const lighting =
     isRecord(sceneRaw.lighting) &&
     Array.isArray(sceneRaw.lighting.lights) &&
@@ -313,6 +355,34 @@ export function migrateProjectDocument(raw) {
     name: (raw && raw.name) || '未命名场景',
     scene: { objects, camera, lighting, timeline }
   }
+}
+
+/**
+ * 相机字段净化。
+ *
+ * 主要目的是补齐新增的可选字段：老工程里根本没有它们，
+ * 不补的话前端到处都要判 `undefined`。
+ * 同时把非法值归一，保证"是否绑定""是否启用"都只有两种状态，
+ * 不会出现第三种让两端判断分叉。
+ */
+function normalizeCamera(camera) {
+  const source = isRecord(camera) ? camera : DEFAULT_CAMERA
+  const bound = source.targetObjectId
+  return {
+    position: cloneVectorOrDefault(source.position, DEFAULT_CAMERA.position),
+    target: cloneVectorOrDefault(source.target, DEFAULT_CAMERA.target),
+    fovDegrees: isFiniteNumber(source.fovDegrees) ? source.fovDegrees : DEFAULT_CAMERA.fovDegrees,
+    aspectWidth: isFiniteNumber(source.aspectWidth) ? source.aspectWidth : DEFAULT_CAMERA.aspectWidth,
+    aspectHeight: isFiniteNumber(source.aspectHeight) ? source.aspectHeight : DEFAULT_CAMERA.aspectHeight,
+    targetObjectId: typeof bound === 'string' && bound.length > 0 ? bound : null,
+    // 缺省视为启用：v14 及更早的工程没有这个字段，那时绑定就是"一绑就生效"。
+    lookAtEnabled: source.lookAtEnabled !== false
+  }
+}
+
+function cloneVectorOrDefault(value, fallback) {
+  if (!isVector3(value)) return { ...fallback }
+  return { x: value.x, y: value.y, z: value.z }
 }
 
 /**
@@ -367,7 +437,11 @@ export function sceneFingerprint(objects, camera, lighting, timeline) {
       target: [round(camera.target.x), round(camera.target.y), round(camera.target.z)],
       fovDegrees: round(camera.fovDegrees),
       aspectWidth: camera.aspectWidth,
-      aspectHeight: camera.aspectHeight
+      aspectHeight: camera.aspectHeight,
+      // 绑定关系与启用状态都必须进指纹：否则"只改了绑定/开关"不会被判成
+      // "有未保存修改"，用户改完直接关窗口就丢了，而且没有任何提示。
+      targetObjectId: camera.targetObjectId ?? null,
+      lookAtEnabled: camera.lookAtEnabled !== false
     },
     lighting,
     timeline

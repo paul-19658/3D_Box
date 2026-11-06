@@ -27,6 +27,9 @@
         :key="object.id"
         class="list-row"
         :class="{ 'is-active': selectedIds.includes(object.id) }"
+        draggable="true"
+        title="拖到右侧「看向」行可让相机锁定并跟随这个物体"
+        @dragstart="startObjectDrag(object, $event)"
         @click="selectObject(object.id, $event)"
       >
         <span class="dot" :style="{ background: object.colorOverride || object.color }"></span>
@@ -107,6 +110,20 @@ export default {
           : [...this.selectedIds, id]
         : [id]
       this.$emit('select-object', ids)
+    },
+    /**
+     * 开始拖拽物体。
+     *
+     * 用自定义 MIME 类型（而不是 `text/plain`）：投放方要能判断
+     * "这是不是一个物体 id"，用 text/plain 会和从别处拖来的普通文本混淆，
+     * 比如从说明框里拖一段字到"看向"行上也会被当成绑定。
+     * 同时写一份 text/plain 作为兜底，方便拖到外部程序时至少是可读文本。
+     */
+    startObjectDrag(object, event) {
+      if (!event.dataTransfer) return
+      event.dataTransfer.effectAllowed = 'copy'
+      event.dataTransfer.setData('text/x-object-id', object.id)
+      event.dataTransfer.setData('text/plain', object.name)
     },
     rename(id, event) {
       const name = event.target.value.trim()

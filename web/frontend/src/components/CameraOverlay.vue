@@ -3,7 +3,9 @@
     <header class="camera-overlay__head">
       <span class="camera-overlay__title">摄影机</span>
       <span class="camera-overlay__fov"
-        >{{ camera.fovDegrees }}° · {{ camera.aspectWidth }}:{{ camera.aspectHeight }}</span
+        >{{ focalLabel }} · {{ round(camera.fovDegrees) }}° · {{ camera.aspectWidth }}:{{
+          camera.aspectHeight
+        }}</span
       >
     </header>
 
@@ -41,6 +43,8 @@
 </template>
 
 <script>
+import { aspectRatioOf, focalLengthFromFovDegrees } from '@/core/focal-length'
+
 /**
  * 视口左下角的摄影机浮层：直接输入机位与目标点。
  *
@@ -56,6 +60,20 @@ export default {
 
   data() {
     return { axes: ['x', 'y', 'z'] }
+  },
+
+  computed: {
+    /**
+     * 焦距摘要。
+     *
+     * 这里显示焦距而不是只显示视场角：用户拿着"50mm 镜头"的意图来构图，
+     * 视场角是渲染参数、焦距才是他脑子里的东西。
+     */
+    focalLabel() {
+      const focal = focalLengthFromFovDegrees(this.camera.fovDegrees, aspectRatioOf(this.camera))
+      if (!Number.isFinite(focal)) return '—'
+      return `${Math.round(focal)}mm`
+    }
   },
 
   methods: {

@@ -15,8 +15,8 @@
 # using the system code page unless they carry a UTF-8 BOM.
 
 param(
-    [int]$Port = 8000,
-    [int]$DevPort = 8080,
+    [int]$Port = 8500,
+    [int]$DevPort = 9090,
     [switch]$Dev,
     [switch]$Rebuild,
     [switch]$NoBrowser

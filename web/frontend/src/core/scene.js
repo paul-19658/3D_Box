@@ -17,6 +17,7 @@ import { PATH_COLOR } from './nav-path'
 import { createMannequinData } from './mannequin'
 import { validateCustomMesh } from './geometry'
 import { describeLighting } from './lighting-description'
+import { describeCameraLens } from './focal-length'
 
 export function createSceneObject(kind, existing) {
   const count = existing.filter((object) => object.kind === kind).length
@@ -282,9 +283,11 @@ export function summarizeScene(scene) {
   const visibleCount = objects.filter((object) => object.visible).length
   const lines = []
   lines.push(
-    `物体共 ${objects.length} 个（可见 ${visibleCount} 个），相机视场角 ${round(
-      scene.camera.fovDegrees
-    )} 度，画幅 ${scene.camera.aspectWidth}:${scene.camera.aspectHeight}。`
+    `物体共 ${objects.length} 个（可见 ${visibleCount} 个），相机镜头 ${describeCameraLens(
+      scene.camera
+    )}，视场角 ${round(scene.camera.fovDegrees)} 度，画幅 ${scene.camera.aspectWidth}:${
+      scene.camera.aspectHeight
+    }。`
   )
   lines.push(`相机位置(${formatVector(scene.camera.position)})，看向(${formatVector(scene.camera.target)})。`)
   lines.push(describeLighting(scene.lighting.lights).summaryLine)

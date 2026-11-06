@@ -39,6 +39,7 @@
   --shadow-pop: 0 24px 64px rgba(0, 0, 0, 0.62);
 
   --rail-width: 60px;
+  --menubar-height: 26px;
   --topbar-height: 48px;
   --timeline-height: 132px;
   --sidebar-width: 296px;
@@ -323,6 +324,121 @@ a {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
+}
+
+/*
+ * 相机"看向"绑定到物体时的整行替换。
+ *
+ * 绑定生效时看向点由物体位置决定，数字输入改了也没用，所以整行换成
+ * "物体名 + 解除"。留着输入框会让人以为改了数字就能改朝向。
+ */
+.bind-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.bind-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bind-chip__icon {
+  flex: none;
+  font-size: 11px;
+}
+
+/* 绑定关闭时：绑定条保留但置灰，提示"关系还在、当前没生效"。 */
+.bind-row.is-disabled .mini-btn {
+  opacity: 0.55;
+}
+
+.bind-chip.is-off {
+  border-color: var(--line-strong);
+  background: transparent;
+  color: var(--text-2);
+}
+
+.bind-chip.is-off .bind-chip__icon {
+  opacity: 0.5;
+}
+
+/* 拖拽悬停在"看向"行上：给一个明确的"可以放这里"的反馈。 */
+.vector-row.is-drop-target {
+  border-radius: var(--radius-s);
+  outline: 1px dashed var(--accent);
+  outline-offset: 3px;
+  background: var(--accent-soft);
+}
+
+.field-hint {
+  margin: 0 0 6px;
+  padding-left: 66px;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.field-hint--warn {
+  color: var(--warn);
+}
+
+/* 焦距行：数值 + 单位 + 等效口径提示（提示不占输入宽度）。 */
+.focal-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.focal-row .input {
+  width: 72px;
+  flex: none;
+}
+
+.focal-unit {
+  flex: none;
+  color: var(--text-2);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.focal-equiv {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 焦段预设的一排小按钮。 */
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+}
+
+.preset-row .mini-btn.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
 }
 
 .checkbox {
@@ -635,6 +751,14 @@ a {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent-strong);
+}
+
+/* 相机视角提示：用强调色，因为此时视口不再是"自由视角"，需要一眼识别。 */
+.hud-pill--camera-view {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-variant-numeric: tabular-nums;
 }
 
 /*

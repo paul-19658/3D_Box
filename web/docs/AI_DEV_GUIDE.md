@@ -172,8 +172,18 @@ AiComposer（文字 + 参考图）
 | 后端 tools 协议（OpenAI + Anthropic） | ✅ | `ai_service.py` |
 | Composer 展开收起 + 服务商切换 | ✅ | `AiComposer.vue` |
 
-**当前版本：schema 13**（12 → 13 只是新增 `kind: "path"` 的导航线对象与
-`pathNodes` / `pathBinding` 字段，旧工程原样保留即可，无需改写）。
+**当前版本：schema 15**（14 → 15 只是给相机新增 `lookAtEnabled`，
+用于临时关闭"看向物体"绑定而保留绑定关系；旧工程迁移时补 `true`）。
+
+历史：
+- 12 → 13：新增 `kind: "path"` 的导航线对象与 `pathNodes` / `pathBinding` 字段，
+  旧工程原样保留即可。
+- 13 → 14：相机新增 `targetObjectId`（可空）。
+- 14 → 15：相机新增 `lookAtEnabled`（布尔，缺省 true）。
+
+⚠️ **三端版本号必须一致**。此前 `app/src/shared/project-document.ts` 停在 12，
+而 JS 与 Python 已是 13，属于长期未发现的漂移——同一份工程在不同端的校验结果
+会分叉。改 schema 时务必三处一起核对。
 
 ### 修改 schema 的标准流程
 
@@ -238,6 +248,14 @@ AiComposer（文字 + 参考图）
 | 后端 `services/` | **必须** | 落盘与迁移出错会丢用户数据 |
 | 后端路由 | 每个端点至少一条 | 契约验证 |
 | 组件 / 三维渲染 | 不强制 | 依赖 WebGL，手工验证更划算 |
+
+**但"不强制"不等于"可以不验"**：三维相关的改动必须做一次真机验证，
+因为这里存在一整类"数据对、画面错"的 bug——store 里值变了，用户看到的却没变。
+典型例子就是相机视角下 `OrbitControls.update()` 把朝向覆盖回去：
+只读 store 会判定通过，实际画面完全没转。
+这类验证用 CDP 驱动真实浏览器（`Input.dispatchMouseEvent` / `dispatchKeyEvent`），
+并且**读出口要用只读探针**（`window.__XBH_DIAGNOSE__` 的 `editorCamera()` / `scene()`），
+不要用自己刚写的那条代码路径去验证自己。
 
 ### 写测试的三条准则
 
@@ -343,6 +361,49 @@ py -3.10 -m alembic upgrade head
 | **预演退出后镜头转不动** | 进预演禁用了 controls，退出时忘了解锁 | `previewActive` 的 watch 两侧对称：进则 detach + 禁用，出则 attach + 解锁 |
 | 预演退出后停在某一帧 | 预演是循环播放，退出时播放头还在跑 | 退出时 `stopPlayback()`，并把 `timelineTime` 归 0 |
 | **在 `data()` 里存"当前面板"** | 顶栏自己记 `panel`，别的组件读不到，也就无法被"按 Esc 退出"这类外部动作驱动 | "是否在预演"放 store；顶栏改成受控 prop + `select-panel` 事件 |
+| **SPA 回落路由直接拼请求路径** | 任意文件读取：可读到 `ai-environment.json` 的明文 API Key、`app.db`、`secret.key` 乃至系统 `win.ini` | 静态文件路径必须 `resolve()` 后按**真实归属**校验（`Path.is_relative_to`），越界回落 `index.html`。Starlette 会先解码 `%2e%2e%2f`，所以编码穿越同样要防；也不要用字符串 `startswith` 判前缀 |
+| **相机视角下中键拖拽"转了但画面没转"** | `OrbitControls.update()` 每帧 `camera.lookAt(target)`，把导航算出的 yaw/pitch 指回旧 target。**只查 store 会误判成成功**（store 的 target 确实变了），必须查画面 | `wasd` 方案下用 `shouldRunOrbitControls()` 停掉 `controls.update()`，每次导航改动后调 `applyNavOrientation()` 同步 `camera.lookAt` 与 `controls.target` |
+| **相机往前飞几米后突然不动** | 同上的另一半：`update()` 按 `position - target` 反推球坐标，相机飞近注视点时半径趋近 0、球坐标退化，位置被写回 target 后卡死 | 同上；注视距离恒为 `navState.distance`，target 跟着机位走。回归断言："连续前飞每一段都有效" |
+| 在输入框里打 wasd，镜头却飞了 | 全局 `keydown` 没排除输入态 | 键盘导航一律先过 `isEditableTarget(event.target)`（含 `contentEditable`） |
+| **自动关键帧不报错但把数据弄坏** | 同一时刻追加多个关键帧：求值取后一个、静默丢弃前一个；堆到 30 帧时中间时刻插值跳变（实测 x 从 0 跳到 64.5） | `upsertObjectKeyframe()` / `upsertCameraShot()` **同刻覆盖**且沿用原 id（换 id 会让时间轴选中态消失） |
+| 自动关键帧开了以后，撤销一次只退回半个操作 | 属性修改与打帧分成两次 `editScene`，产生两条历史 | 在 `editScene` 里把打帧结果与变更**合并为同一个新场景**再 commit 一次 |
+| 改个颜色也冒出一堆关键帧 | 对比用了整个物体对象 | 只比"会进关键帧"的字段；`objectTransformChanged()` 与 `buildObjectTransform()` 的字段集合必须**同步改**，一边加一边漏会静默少打帧 |
+| 自动关键帧在播放时把帧写到"路过"的时刻 | 播放中播放头在跑，拖物体就会写到非用户预期的时刻 | `shouldAutoKey()` 在 `playing` 时返回 false；UI 必须显示「播放中暂停记录」，否则用户以为是 bug |
+| **CDP 验证脚本莫名失败，功能其实是好的** | 上次测试的自动保存留下恢复快照 → 产品弹「发现未保存的内容」并铺 `.dialog-veil`，盖住视口、吃掉所有指针事件 | 脚本开头先关掉该对话框。另外禁用态按钮**仍在 DOM 里**，要断言 `disabled` 而不是"条目不存在" |
+| 用 PowerShell 改带中文的文件后变成非法 UTF-8 | 本机是 PowerShell 5.1，`Get-Content`/`Set-Content` 默认按 ANSI(GBK) 读写，UTF-8 内容被当 GBK 解码再编码，中文全糊、`read` 报 invalid UTF-8 | 源码/文档一律用编辑器工具改，**不要用 PowerShell 做文本往返**；必须用命令行时显式 `-Encoding UTF8` |
+| **父组件 commit 后同步调用子组件方法去"应用新配置"** | 组件读到的 prop 还是旧值（Vue 的 props 是异步更新的），于是按旧配置初始化。实例：切换相机导航方案时 `controls.enabled` 按旧方案设置，orbit 被误设成禁用，环绕整个失效 | 让子组件自己 `watch` 那个 prop 并重建内部状态；父组件只负责改 store |
+| **以为"把相机模型设成 `visible = false`"就不会被点到** | three.js 的 `Raycaster` **不检查 `visible`**（只查 layers），隐藏的机身照样被射线打中；相机视角下编辑相机就在相机原点，点一下就命中相机模型并挂上控制柄 | 拾取函数入口显式排除该状态（`pickSceneCamera()` 判 `cameraViewActive`）；`attachTransformControls()` 同样在入口拦 |
+| **依赖节流计时器提交"操作结束"** | 目标对象带阻尼时会持续触发 `change`，不断重置计时器，提交迟迟不发生（"转了但数据没动"）。实例：OrbitControls 环绕 | 用库提供的明确结束事件（OrbitControls 的 `end`）立刻提交；节流只用于过程中的显示更新 |
+| **物体一旦有关键帧就"拖不动、松手弹回"** | 时间轴求值在**每个**时刻覆盖物体变换，用户拖完立刻被求值盖掉。注意：store 数据其实已经改对了，只查数据会误判成功能正常——典型的"数据对、画面错" | 在唯一写入口 `editScene` 记下本次变更动过的物体，显示层对这些物体改用真实值；**播放头一变就清空**（Maya/Blender 约定），播放中/只读不记，绑定导航线的物体不参与 |
+| **同一时刻堆了两个关键帧** | 求值只取后一个、静默丢弃前一个；堆到 30 帧时中间时刻插值异常跳变（实测 x 从 0 跳到 64.5）。不报错，只在成片里看得出 | 记录走 `upsertObjectKeyframe()` / `upsertCameraShot()`（同刻覆盖、沿用原 id）；复制走 `findAvailableTimelineTime()` 避开已占用时刻 |
+| **把引用烘成坐标** | 相机绑定物体时若把物体位置写进 `camera.target`：播放时每帧都在改相机 → 撤销栈与脏标记被动画刷爆；导出逐帧求值基于已烘值再算，误差累积 | 存引用（`targetObjectId`）在求值时解析；解除绑定后静态 `target` 原样还在 |
+| **绑定只在播放时生效** | `displayedCamera` 停在 0 秒时提前 `return this.camera`，跳过绑定解算 | 0 秒也要解算绑定 |
+| **物体显示在 A、相机看向 B** | 求值函数用"关键帧求值结果"算 target，画面显示用 `displayedObjects`（带手动编辑覆盖），两条路径的物体列表不一致 | 视口在求值后再用 `displayedObjects` 解算一次；导出/播放时覆盖为空，两次一致 |
+| **打了镜头轨后物体绑定失效** | 相机是从 shot 数据重建的，不自带 `targetObjectId` | 绑定以**基准相机**为准，求值后补回再解算 |
+| **关掉的开关在导出时又自己打开** | 求值时只补了 `targetObjectId`，漏了 `lookAtEnabled` | 一行 `?? / !== false` 的默认值也要一起补；新增字段时检查所有"从基准相机搬运"的地方 |
+| **"是否绑定"与"是否启用"混成一个状态** | 取消勾选时顺手清掉 id，重新勾选就找不到对象；或者反过来，关掉了却还在生效 | 拆成 `targetObjectId`（记是谁）+ `lookAtEnabled`（用不用）；UI 置灰而不是消失 |
+| **验证脚本用 store 位置去比对相机朝向** | 物体在 t=0 有关键帧时，显示位置是求值结果而非 store 值，断言会把正确行为判成 bug | 比对对象要选"画面里显示的那一个"（`displayedObjects`），不是 store 原值 |
+| **三端 schema 版本号悄悄分叉** | TS 基线停在 12，JS/Python 已是 13；同一份工程在不同端校验结果不同，且只有测试才会发现 | 改 schema 时三处一起核对；`/api/meta` 里的版本号**必须引用常量**而不是写死数字（曾硬编码 13，升版时漏改） |
+| **同一约束的魔法数字写在多处** | 视场角上下限在 InspectorPanel 与 AI 命令里各写了一遍 `10/120`，加焦距时才发现它把镜头卡在约 5.7~112mm，135mm 设不出来 | 抽成单一常量来源（`MIN_FOV_DEGREES` / `MAX_FOV_DEGREES`）并从所有调用点引用 |
+| **切换方案时父组件 commit 后同步调子组件方法** | 子组件读到的 prop 还是旧值（Vue props 异步更新），按旧配置初始化。实例：切到 orbit 时 `controls.enabled` 按旧方案设成禁用，环绕整个失效 | 让子组件 `watch` 那个 prop 自己重建状态 |
+| **只改 `controls.target` 想让相机跟随物体平移** | `OrbitControls.update()` 按 `position - target` 反推球坐标再写回位置，target 一动反而把相机**按在原地**（轴心跟上了、机位没动） | 要**平移跟随**必须机位与轴心一起平移；只要"原地瞄准"就**只改 target**。（本项目现状是后者：环绕只看不跟） |
+| **拖拽绑定物体时镜头松手才"跳"一下** | 拖拽期间 `handleObjectTransform(commit:false)` 只改视口节点、不写 store，所以父组件解算的 `cameraState` 看向点是旧的；瞄准逻辑读它就等于读旧值 | 视口从**正在被拖的节点**读实时位置来解算（`liveBoundTarget()`）；其余时刻仍用父组件解算值，保证三条路径口径一致 |
+| **每帧同步的朝向被写在"移动时"分支里** | 拖物体时用户没按 WASD，`stepCameraView()` 在 intent 全零时提前 return，朝向同步被跳过 → 视线不更新 | 朝向同步移到 intent 判断**之前**，每帧都做（一次 lookAt 的开销可忽略） |
+| **验证脚本断言"相机每步位移均匀"** | 那测的是 TransformControls 对合成鼠标输入的响应曲线，不是相机行为，会误报 | 断言"轴心 == 物体实时位置"；且必须在**松手前**采样才能区分"实时更新"与"松手才更新" |
+| **工具条同时高亮两个按钮** | "选择"只看 `tool === 'select'`，而变换按钮也把 `tool` 设成 `select`，于是移动模式下"选择"和"移动"一起亮 | 给 `transformMode` 加第四态 `'select'`（无操纵器）；选择按钮要求 `transformMode === 'select'` |
+| **给 `TransformControls.setMode()` 传了非法值** | 它只接受 translate/rotate/scale；传 `'select'` 会报警并把控制柄留在原地 | 挂载前先判 `TRANSFORM_MODES.includes(mode)`，否则 `controls.detach()` |
+| **把"清操纵器"塞进通用的 `setTool('select')`** | 内部多处用 `setTool('select')` 收尾（快速建造/切割完成），顺带清操纵器会让用户建完墙体就没法直接拖 | 只有工具条选择按钮与 Q 键走单独的 `activateSelectTool()` |
+| **`quaternion.copy(start).slerp(target, k)` 把旋转锁死** | `slerp()` 原地修改，`copy` 之后 `target` 已是 `start`，等于"和自己插值" → 转角恒为 0°，拖旋转完全没反应 | 先把原始朝向 `clone()` 出来：`copy(start).slerp(raw, k)` |
+| **减速改成"在上一帧结果上累乘"** | 结果会随帧率漂移：拖得慢和拖得快，同样鼠标位移得到不同距离 | 每帧从**按下时的快照**换算（TransformControls 本来就是按指针绝对位移算值的） |
+| **测量拖拽灵敏度时用了斜视角** | 轴向透视缩短会混进比值（斜视角下 1px 可能对应 1.6 倍世界单位），测出的"比值"不是减速系数，会误判成减速失效 | 受控布置：相机正对物体、被拖轴水平投影不被缩短；并用几何公式 `2·tan(fov/2)·距离/画布高度` 做基准 |
+| **canvas 被浏览器拉伸（"画面扁扁的"）** | canvas 的 CSS 是 `width:100%` 撑满容器，绘制缓冲由 `setSize(w,h,false)` 决定（**不改样式**）；而 `resize()` 只挂在 `window.resize` 上——**布局变了但窗口没变就没人通知渲染器**。预演隐藏工具栏/侧栏，容器 1244→1600，缓冲停在 1244 → 横向拉伸 1.2862× | 用 **ResizeObserver** 盯住视口容器；进出预演再在 `$nextTick` 显式补一次（观察器是异步回调，可能晚于第一帧）。`handleResize()` 加"尺寸没变就返回" |
+| **换画幅后画面变扁/变窄，焦距却还显示原值** | `fovDegrees` 是**垂直**视场角，画幅一变它的含义就变；只改 `aspectWidth/aspectHeight` 等于同一颗镜头换了焦段（25.64mm 选 21:9 变 19.54mm） | 换画幅时按"长边定视野"重算视场角（`aspectChangePatch()`），焦距与长边视野保持不变 |
+| **把"保持镜头"的换算写在按钮的点击处理里** | 只有点那个按钮的路径是对的；AI 命令、撤销重做、工程载入都会绕过它 | 放在 `Editor.updateCamera`——相机的唯一写入口；且规则是"只给画幅、没给视场角时才重算" |
+| **镜头轨换算用了新画幅当基准** | 等于拿"已换算过的结果"再算一次，结果原地不动（实测 fov 42→42，看起来像没执行） | 换算基准必须是**旧画幅**（`previousCamera`）；镜头自带画幅就用它自己的 |
+| **TransformControls 松手时写死 `controls.enabled = true`** | `wasd` 相机视角下相机归导航独占，拖过一次物体后 OrbitControls 被悄悄打开，表现为"拖完物体后 WASD 不灵 / 视角自己转" | 解锁时按 `shouldRunOrbitControls(cameraViewActive, scheme)` 判断 |
+| **相机在中间关键帧停顿** | 逐段 smoothstep 缓动，每段两端速度归零；位置还是分段直线 | 时间参数化的向心 Catmull-Rom：穿过关键帧、速度连续、支持弧线（`core/camera-path.js`） |
+| **同刻关键帧让整条轨迹变 NaN** | 两个同刻关键帧 → 段时长 `dt = 0` → 切线公式除零 → 位置 NaN → 相机消失 | 关键帧进求值前必须过 `normalizeKnots()`：排序、丢弃非法项、**合并同刻** |
+| **焦距在两个端各算一套** | 前端按 A 口径、后端按 B 口径，导出的提示词描述的镜头与实际画面不一致 | 口径统一为 three.js `filmGauge`（长边定视野）；后端与前端公式逐字等价并用测试交叉验证 |
 
 ### 关于第一条：为什么 `template:` 字符串会静默失败
 
@@ -444,6 +505,20 @@ alias: { vue$: 'vue/dist/vue.runtime.esm.js' }
 - [ ] 新增的 three.js 对象是否放进了正确的组（`objectGroup` / `userLightGroup` / `guideGroup`）？
 - [ ] 导出时辅助图形（网格、灯光标记、坐标轴、草稿、切割平面）是否都被隐藏？
 - [ ] 临时替换材质的地方是否有 `finally` 恢复？
+- [ ] **相机视角下是否停掉了 `OrbitControls.update()`？**（`shouldRunOrbitControls()`；否则朝向被覆盖、飞近注视点会塌陷卡死）
+- [ ] 手动驱动相机后，是否同时同步了 `controls.target`，让退出时不跳？
+- [ ] 相机/HUD 相关的"生效"是否验证了**画面**，而不只是 store 值？
+
+### 时间轴与关键帧
+
+- [ ] 打帧是否走 `editScene`，且与属性变更**合并成一次** commit（一次操作 = 一次撤销）？
+- [ ] 同一时刻是**覆盖**而非追加？覆盖时是否沿用原 id？
+- [ ] 手动记录与自动记录是否共用同一个构造函数（`buildObjectTransform`）与同一个 upsert？
+- [ ] 可动画字段的对比范围与写入范围是否**一一对应**？（只改颜色/名称不该打帧）
+- [ ] 新增可动画字段时，`buildObjectTransform()` 与 `objectTransformChanged()` 是否同时改？
+- [ ] 播放中是否暂停打帧，并且 UI 有明确提示？
+- [ ] **在有动画的物体上拖拽，画面是否立刻跟随（不被关键帧拽回）？** 换播放头后是否重新由关键帧求值？
+- [ ] 复制关键帧/镜头是否避开了已占用的时刻？
 
 ### 用户可理解性
 

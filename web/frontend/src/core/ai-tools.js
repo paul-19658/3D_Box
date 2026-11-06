@@ -181,7 +181,7 @@ function withTimelinePose(ctx, timeSeconds, run) {
   }
   try {
     viewport.applyTimelineFrame(timeline, timeSeconds)
-    const frame = evaluateTimelineAtTime(timeline, scene.camera, timeSeconds)
+    const frame = evaluateTimelineAtTime(timeline, scene.camera, timeSeconds, scene.objects)
     return run(frame.camera)
   } finally {
     if (typeof viewport.restoreObjectTransforms === 'function') {

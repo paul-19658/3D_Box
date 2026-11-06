@@ -15,11 +15,13 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# schema 15：相机新增 `lookAtEnabled`（看向绑定是否启用）。
+# schema 14：相机新增可空的 `targetObjectId`（绑定并跟随某个物体）。
 # schema 13：新增 `kind: "path"` 的导航线对象（带 pathNodes）。
 # 与前端 `PROJECT_SCHEMA_VERSION` 必须始终一致，冒烟脚本会断言这个数字。
-PROJECT_SCHEMA_VERSION = 13
+PROJECT_SCHEMA_VERSION = 15
 PROJECT_EXTENSION = "block3d"
 
 PrimitiveKind = Literal[
@@ -177,6 +179,25 @@ class CameraState(BaseModel):
     fovDegrees: float
     aspectWidth: float
     aspectHeight: float
+    # schema 14：把"看向点"绑定到场景里的某个物体，相机会锁定并跟随它移动。
+    # None 表示看向点就是上面的静态 target 坐标。
+    targetObjectId: Optional[str] = None
+    # schema 15：看向绑定是否启用。关掉后相机改用静态 target，但绑定关系保留。
+    # 缺省 True —— v14 及更早的工程没有这个字段，那时绑定就是"一绑就生效"。
+    lookAtEnabled: bool = True
+
+    @field_validator("targetObjectId")
+    @classmethod
+    def _normalize_target_object_id(cls, value: Optional[str]) -> Optional[str]:
+        """空字符串既不是"未绑定"也不是合法 id，统一归一成 None。
+
+        与前端 `normalizeCamera()` 规则保持一致：只允许"已绑定"和"未绑定"
+        两种状态，否则两端对同一个工程的判断会分叉。
+        """
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
 
 class SceneLightData(BaseModel):
@@ -258,6 +279,9 @@ DEFAULT_CAMERA = CameraState(
     fovDegrees=42,
     aspectWidth=16,
     aspectHeight=9,
+    # v13 及更早的工程没有这个字段；显式写 None 让"字段集合"在两端完全一致。
+    targetObjectId=None,
+    lookAtEnabled=True,
 )
 
 DEFAULT_LIGHTING = SceneLightingState(

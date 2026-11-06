@@ -1,5 +1,32 @@
 <template>
   <div class="editor">
+    <MenuBar
+      :camera-view-active="cameraViewActive"
+      :nav-scheme="cameraNavScheme"
+      :preview-active="previewMode"
+      :monitor-open="monitorOpen"
+      :theme="theme"
+      :can-undo="canUndo"
+      :can-redo="canRedo"
+      :is-dirty="isDirty"
+      :read-only="isReadOnly"
+      :auto-key-enabled="autoKeyEnabled"
+      @new="$store.dispatch('newProject')"
+      @save="$store.dispatch('saveProject', { saveAs: false })"
+      @save-as="$store.dispatch('saveProject', { saveAs: true })"
+      @open-projects="$router.push('/projects')"
+      @open-recent="$store.commit('setRecentOpen', true)"
+      @logout="handleLogout"
+      @undo="$store.commit('undoScene')"
+      @redo="$store.commit('redoScene')"
+      @camera-view="toggleCameraView"
+      @nav-scheme="setCameraNavScheme"
+      @toggle-preview="setPreviewMode(!previewMode)"
+      @toggle-monitor="$store.commit('setMonitorOpen', !monitorOpen)"
+      @toggle-theme="toggleTheme"
+      @help-shortcuts="showShortcuts"
+    />
+
     <TopBar
       :project-name="projectName"
       :is-dirty="isDirty"
@@ -41,6 +68,7 @@
         :tool="tool"
         :transform-mode="transformMode"
         @select="setTool"
+      @select-only="activateSelectTool"
         @add="addObject"
         @add-mannequin="addMannequin"
         @add-path="beginPathDraw"
@@ -67,6 +95,8 @@
           :paint-scope="paintScope"
           :theme="theme"
           :camera-view-mode="cameraViewMode"
+          :camera-view-active="cameraViewActive"
+          :camera-nav-scheme="cameraNavScheme"
           :camera-selected="cameraSelected"
           :animation-time="timelineTime"
           :path-draft="pathDraft"
@@ -83,7 +113,7 @@
           @quick-build-end="handleQuickBuildEnd"
           @paint-face="handlePaintFace"
           @cut-pick="handleCutPick"
-          @camera-view-change="setCameraViewMode"
+          @camera-view-change="handleCameraViewChange"
           @path-node-move="handlePathNodeMove"
           @path-node-add="handlePathNodeAdd"
           @path-node-select="handlePathNodeSelect"
@@ -160,9 +190,12 @@
           :timeline-duration="timeline.durationSeconds"
           :object-keyframe-count="selectedObjectKeyframeCount"
           :selected-node-index="selectedNodeIndex"
+          :objects="objects"
           @update-object="updateObject"
           @update-light="updateLight"
           @update-camera="updateCamera"
+          @bind-camera-target="bindCameraTarget"
+          @toggle-look-at="setLookAtEnabled"
           @delete-object="deleteSelected"
           @duplicate-object="duplicateSelected"
           @apply-preset="applyMannequinPreset"
@@ -194,7 +227,10 @@
       :selected-path-node-key="selectedPathNodeKey"
       :path-tracks="pathTracks"
       :objects="objects"
+      :auto-key-enabled="autoKeyEnabled"
+      :read-only="isReadOnly"
       @update-time="setTimelineTime"
+      @toggle-auto-key="$store.commit('setAutoKeyEnabled', !autoKeyEnabled)"
       @toggle-play="togglePlay"
       @toggle-open="$store.commit('setTimelineOpen', !timelineOpen)"
       @record-camera="recordCameraShot"
@@ -246,6 +282,7 @@
  * 所有会改变场景的操作都走 `editScene`，这是撤销与自动保存的统一入口。
  */
 
+import MenuBar from '@/components/MenuBar.vue'
 import TopBar from '@/components/TopBar.vue'
 import ToolRail from '@/components/ToolRail.vue'
 import AssetPanel from '@/components/AssetPanel.vue'
@@ -268,10 +305,11 @@ import {
   createPathSceneObject
 } from '@/core/scene'
 import { placeNewObject, alignObjects, distributeObjects, placeOnGround } from '@/core/layout'
+import { aspectChangePatch } from '@/core/focal-length'
 import { MANNEQUIN_PRESETS } from '@/core/mannequin'
 import { quickBuildTransform } from '@/core/quick-build'
 import { faceColorKey, surfaceTriangles } from '@/core/face-paint'
-import { evaluateTimelineAtTime, applyTimelinePreview } from '@/core/timeline'
+import { evaluateTimelineAtTime, applyTimelinePreview, findAvailableTimelineTime } from '@/core/timeline'
 import {
   PATH_KIND,
   buildPathKeyframes,
@@ -280,12 +318,21 @@ import {
 } from '@/core/nav-path'
 import { importStaticModel, analyzeModel } from '@/core/model-io'
 import { createId } from '@/core/project-document'
+import { isEditableTarget } from '@/core/camera-nav'
+import { lookAtEnabledPatch, resolveCameraTarget, targetBindingPatch } from '@/core/camera-target'
+import {
+  buildCameraState,
+  buildObjectTransform,
+  upsertCameraShot,
+  upsertObjectKeyframe
+} from '@/core/auto-key'
 import { downloadReport, errorCount } from '@/core/diagnostics'
 
 export default {
   name: 'EditorView',
 
   components: {
+    MenuBar,
     TopBar,
     ToolRail,
     AssetPanel,
@@ -384,6 +431,20 @@ export default {
     },
     cameraViewMode() {
       return this.$store.state.cameraViewMode
+    },
+    /** 是否处于"相机视角"导航（接管场景相机，操作会写回相机属性）。 */
+    cameraViewActive() {
+      return this.$store.state.cameraViewActive
+    },
+    cameraNavScheme() {
+      return this.$store.state.cameraNavScheme
+    },
+    autoKeyEnabled() {
+      return this.$store.state.autoKeyEnabled
+    },
+    /** 当前播放头下被手动改过的物体；这些物体在显示时压过时间轴求值。 */
+    timelineEditOverrides() {
+      return this.$store.state.timelineEditOverrides
     },
     previewMode() {
       return this.$store.state.previewMode
@@ -516,6 +577,15 @@ export default {
     /**
      * 播放或拖动时间轴时，用求值结果覆盖物体变换；
      * 停止时直接返回原始物体，保证编辑态数据不被污染。
+     *
+     * 但**手动改过的物体在当前播放头必须显示用户改的值**，否则会出现
+     * "拖过去又被拽回来"：物体一旦有了关键帧，求值就会在每个时刻
+     * 覆盖它；用户在 t=2 把物体从 A 拖到 B，松手后显示立刻回到 A
+     * （t=0 关键帧的值），看起来就像"位置被锁住、拖不动"。
+     *
+     * 这正是 Maya / Blender 的行为约定：拖过的属性在**当前帧**保持
+     * 用户给的值，只有**改变时间**时才重新由动画曲线求值。
+     * 所以这里维护一份"当前播放头下的手动覆盖"，在时间变化时清空。
      */
     displayedObjects() {
       /*
@@ -526,7 +596,20 @@ export default {
        * applyTimelinePreview 在没有关键帧也没有绑定时会原样返回同一个引用，
        * 所以常态下并不会产生额外开销。
        */
-      return applyTimelinePreview(this.objects, this.timeline, this.timelineTime)
+      const preview = applyTimelinePreview(this.objects, this.timeline, this.timelineTime)
+      if (this.timelineEditOverrides.length === 0) return preview
+
+      const overridden = new Set(this.timelineEditOverrides)
+      const byId = new Map(this.objects.map((object) => [object.id, object]))
+      return preview.map((object) => {
+        if (!overridden.has(object.id)) return object
+        /*
+         * 绑定了导航线的物体不参与覆盖：既有设计是"绑定优先"——
+         * 用户明确指定它沿路径走，就不该被一次拖拽改掉路径运动。
+         */
+        if (object.pathBinding) return object
+        return byId.get(object.id) ?? object
+      })
     },
 
     /**
@@ -546,9 +629,27 @@ export default {
        * 画面会抖。预演期间统一由时间轴说了算，语义也更干净。
        */
       if (this.previewMode || this.timelinePlaying || this.timelineTime > 0) {
-        return evaluateTimelineAtTime(this.timeline, this.camera, this.timelineTime).camera
+        /*
+         * 传入物体列表：相机若绑定了某个物体，看向点要按**该时刻**物体的
+         * 位置解算，否则物体一动镜头就跟丢了。
+         *
+         * 之后还要用 `displayedObjects` 再解算一次：求值函数内部用的是
+         * "关键帧求值结果"，而画面显示的是 `displayedObjects`（可能带着
+         * 用户在当前帧的手动编辑覆盖）。两者不一致时会出现
+         * "物体显示在 A、相机却看向 B"——必须让相机跟随**画面里那一个**。
+         * 播放/导出时覆盖列表是空的，两次解算结果相同，因此不影响成片。
+         */
+        const frame = evaluateTimelineAtTime(this.timeline, this.camera, this.timelineTime, this.objects)
+        return resolveCameraTarget(frame.camera, this.displayedObjects)
       }
-      return this.camera
+      /*
+       * 停在 0 秒时也要解算绑定。
+       *
+       * 不能直接 `return this.camera`：相机可能绑定了物体（targetObjectId），
+       * 而 store 里存的是写死的 target。不解算的话，0 秒时镜头会看向
+       * 那个静态点，一按播放才跳到物体上——表现为"绑定只在播放时生效"。
+       */
+      return resolveCameraTarget(this.camera, this.displayedObjects)
     },
 
     monitorOpen() {
@@ -557,11 +658,13 @@ export default {
   },
 
   watch: {
-    timelineTime(value) {
+    timelineTime() {
       // 刻意不再调用 applyViewportCamera。
       // 预览只改场景相机（displayedCamera 计算属性已覆盖），
       // 编辑视角保持不动，用户才能一边看动画一边继续调机位。
-      void value
+      //
+      // 手动编辑覆盖的清空放在 store 的 `setTimelineTime` mutation 里，
+      // 这样所有改变播放头的入口都自动覆盖到，不依赖这里。
     },
     objects: {
       handler() {
@@ -634,20 +737,58 @@ export default {
      * 放在组件 data 里的话，别的组件想读就得靠 prop 一层层传。
      */
     setPreviewMode(active) {
+      // 进预演必须退出相机视角：预演由时间轴求值驱动相机，
+      // 相机视角又要接管相机，两者会抢同一个对象，画面会打架。
+      if (active && this.cameraViewActive) this.toggleCameraView()
       this.$store.commit('setPreviewMode', active)
     },
 
     /**
-     * 全局快捷键：预演时按 Esc 退出。
+     * 全局快捷键。
      *
-     * 预演是全屏观看，鼠标可能不在任何按钮上；没有快捷键的话
-     * 用户得先找到顶栏那个按钮才能退出来。
+     * 两条注意：
+     * 1. Esc 优先退预演，其次退相机视角——预演是"更外层"的状态；
+     * 2. 任何按键都要先排除"正在输入"的目标，否则用户在工程名输入框里
+     *    按 Esc 会莫名其妙退出预演。视口的 WASD 判定同样走这个规则
+     *    （见 core/camera-nav.js 的 isEditableTarget）。
      */
     handleGlobalKey(event) {
-      if (event.key !== 'Escape') return
-      if (!this.previewMode) return
+      if (event.key === 'Escape') {
+        if (isEditableTarget(event.target)) return
+        if (this.previewMode) {
+          event.preventDefault()
+          this.setPreviewMode(false)
+          return
+        }
+        if (this.cameraViewActive) {
+          event.preventDefault()
+          this.toggleCameraView()
+        }
+        return
+      }
+
+      /*
+       * 变换工具快捷键（对标 Maya 的 Q/W/E/R）。
+       *
+       * 唯一的冲突点是 W：相机视角下 W 是"向前飞"。所以这里在相机视角
+       * 内**整体让位**给导航，不做工具切换。用 `cameraViewActive` 而不是
+       * 方案来判断，是因为两种方案下 W 都被导航占用（环绕方案下 WASD
+       * 不参与，但那时用户也不是在"摆物体"）。
+       *
+       * 其余守卫：正在输入时不抢键、带修饰键时不当成工具快捷键
+       * （Ctrl/Cmd+R 刷新、Ctrl+E 之类必须留给浏览器）。
+       */
+      if (this.cameraViewActive) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      if (isEditableTarget(event.target)) return
+      const toolKey = { q: 'select', w: 'translate', e: 'rotate', r: 'scale' }[event.key.toLowerCase()]
+      if (!toolKey) return
       event.preventDefault()
-      this.setPreviewMode(false)
+      if (toolKey === 'select') {
+        this.activateSelectTool()
+        return
+      }
+      this.setTool(toolKey)
     },
 
     // ------------------------------------------------------------------
@@ -668,6 +809,20 @@ export default {
       this.$store.commit('setTool', tool)
       if (tool !== 'quick-build') this.$store.commit('setQuickBuildDraft', null)
       if (tool !== 'cut') this.$store.commit('setCutTool', null)
+    },
+
+    /**
+     * 纯选择工具（对标 Maya 的 Q）：进入选择模式并**摘掉操纵器**。
+     *
+     * 与 `setTool('select')` 的区别就在这里：后者被内部多处用于"收尾回到选择"
+     * （快速建造完成、切割完成等），那些场景必须**保留**操纵器，
+     * 否则用户建完墙体就没办法直接拖了。
+     */
+    activateSelectTool() {
+      this.$store.commit('setTool', 'select')
+      this.$store.commit('setTransformMode', 'select')
+      this.$store.commit('setQuickBuildDraft', null)
+      this.$store.commit('setCutTool', null)
     },
 
     addObject(kind) {
@@ -1149,8 +1304,114 @@ export default {
     // 相机
     // ------------------------------------------------------------------
 
+    /**
+     * 更新相机。**换画幅时自动保持镜头**（长边定视野模型）。
+     *
+     * 不变量放在这里而不是界面上：`updateCamera` 是相机的唯一写入口，
+     * 放在这里 AI 命令、撤销重做、工程载入等所有路径都自动受益；
+     * 放在按钮的点击处理里就只有那一个按钮是对的。
+     *
+     * 规则：补丁里**只给画幅、没给视场角**时才重算视场角；
+     * 显式带了 `fovDegrees` 就以它为准（那是用户/命令的直接意图）。
+     */
     updateCamera(update) {
-      this.edit((scene) => ({ ...scene, camera: { ...scene.camera, ...update } }))
+      const hasAspect = Number.isFinite(update.aspectWidth) && Number.isFinite(update.aspectHeight)
+      const hasExplicitFov = Number.isFinite(update.fovDegrees)
+      let patch = { ...update }
+      if (hasAspect && !hasExplicitFov) {
+        patch = { ...patch, ...aspectChangePatch(this.camera, update.aspectWidth, update.aspectHeight) }
+      }
+
+      if (!hasAspect) {
+        this.edit((scene) => ({ ...scene, camera: { ...scene.camera, ...patch } }))
+        return
+      }
+
+      /*
+       * 画幅是**全局输出设置**，所以已有关键帧（镜头轨）的视场角也要一起换算。
+       *
+       * 每个镜头都存着自己的 `fovDegrees`，而它就是"当时那个画幅下的垂直视场角"。
+       * 只改主相机不管镜头轨的话，会出现"面板上焦距写着 25mm，一按播放镜头却变成
+       * 另一个焦段"——编辑与成片不一致，比不换算更糟。
+       *
+       * 换算基准必须是**旧画幅**（`previousCamera`）。用新画幅当基准等于
+       * 拿"已经换算过的结果"再算一次，结果就是原地不动（这个坑实测踩过）。
+       */
+      const nextWidth = patch.aspectWidth
+      const nextHeight = patch.aspectHeight
+      this.edit((scene) => {
+        const previousCamera = scene.camera
+        const camera = { ...scene.camera, ...patch }
+        const shots = scene.timeline.cameraShots
+        if (shots.length === 0) return { ...scene, camera }
+        const remapped = shots.map((shot) => {
+          // 镜头自己带画幅就用它自己的（那是它被创作时的画幅），否则用旧画幅。
+          const base = { ...previousCamera, ...shot.camera }
+          return {
+            ...shot,
+            camera: {
+              ...shot.camera,
+              ...aspectChangePatch(base, nextWidth, nextHeight),
+              aspectWidth: nextWidth,
+              aspectHeight: nextHeight
+            }
+          }
+        })
+        return { ...scene, camera, timeline: { ...scene.timeline, cameraShots: remapped } }
+      })
+    },
+
+    /**
+     * 打开 / 关闭"看向物体"绑定。
+     *
+     * 与 `bindCameraTarget(null)` 的区别：那个会**丢掉绑定关系**，
+     * 这个只是暂时不用它。关掉后相机回到静态 `target` 坐标，
+     * 但 `targetObjectId` 还在，勾回来即可恢复，无需重新拖拽。
+     *
+     * 开关会写进工程文件（schema 15），导出/预览也按它求值——
+     * 否则会出现"编辑时看到的与导出的不一致"。
+     */
+    setLookAtEnabled(enabled) {
+      this.updateCamera(lookAtEnabledPatch(enabled))
+      this.$store.dispatch('notify', {
+        kind: 'info',
+        message: enabled
+          ? '已启用「看向物体」：相机会锁定并跟随该物体。'
+          : '已关闭「看向物体」：相机改用固定坐标，绑定关系仍保留。'
+      })
+      if (this.cameraViewActive) {
+        this.$nextTick(() => {
+          this.$refs.viewport?.applyCameraState(this.displayedCamera)
+          this.$refs.viewport?.resetCameraNavState?.()
+        })
+      }
+    },
+
+    /**
+     * 绑定 / 解除相机的 target 物体。
+     *
+     * 传物体 id 表示绑定，传 null 表示解除（回到固定坐标）。
+     *
+     * 绑定后必须立刻把编辑视角对齐到解算结果：绑定会让相机看向点
+     * 从静态坐标变成物体位置，画面会立刻变化，不对齐的话用户看到的
+     * 还是旧朝向，会以为"拖上去没反应"。
+     */
+    bindCameraTarget(objectId) {
+      this.updateCamera(targetBindingPatch(objectId))
+      const object = objectId ? this.objects.find((item) => item.id === objectId) : null
+      this.$store.dispatch('notify', {
+        kind: 'info',
+        message: object
+          ? `相机已锁定「${object.name}」，它会跟随该物体移动。`
+          : '相机已解除物体锁定，改为使用固定坐标。'
+      })
+      // 相机视角下要重新对齐（否则视口仍停在旧朝向）。
+      if (this.cameraViewActive) {
+        this.$nextTick(() => {
+          this.$refs.viewport?.applyCameraState(this.displayedCamera)
+          this.$refs.viewport?.resetCameraNavState?.()
+        })
+      }
     },
 
     /** 选中场景摄影机：与物体、灯光三选一。 */
@@ -1205,6 +1466,95 @@ export default {
     setCameraViewMode(mode) {
       this.$store.commit('setCameraViewMode', mode)
       if (mode !== 'none') this.$refs.viewport?.applyCameraState(this.camera)
+    },
+
+    /**
+     * 视口 HUD 上的取景 / 相机视角按钮。
+     *
+     * 视口把两类退出合并到一个事件里，这里分流：
+     * `exit` 是相机视角导航，其余值是"临时取景"模式。
+     */
+    handleCameraViewChange(mode) {
+      if (mode === 'exit') {
+        if (this.cameraViewActive) this.toggleCameraView()
+        return
+      }
+      this.setCameraViewMode(mode)
+    },
+
+    /**
+     * 进入 / 退出"相机视角"。
+     *
+     * 进入时把编辑相机对齐到场景相机——之后视口里的导航手势
+     * （WASD 飞行或 Maya 环绕）会实时写回场景相机属性。
+     *
+     * 预演期间禁止进入：预演是只读观看，此时接管相机会和
+     * 时间轴求值抢同一个相机，画面会打架。
+     */
+    toggleCameraView() {
+      if (this.previewMode) {
+        this.$store.dispatch('notify', { kind: 'info', message: '预演期间无法进入相机视角，请先退出预演。' })
+        return
+      }
+      const next = !this.cameraViewActive
+      this.$store.commit('setCameraViewActive', next)
+      if (next) {
+        /*
+         * 清掉摄影机选中态。
+         *
+         * 相机视角下编辑相机就在场景相机的眼睛位置，机身/镜头/视锥全罩在
+         * 观察者身上。若此时 `cameraSelected` 还是真的，控制柄会挂到相机
+         * 模型上并顶掉导航（见 `attachTransformControls` 的入口守卫），
+         * 表现成"只能转动镜头本身的旋转属性"。视口侧已经拦住拾取，
+         * 这里再清一次选中，保证进入瞬间就是干净状态。
+         */
+        this.$store.commit('setCameraSelected', false)
+        /*
+         * 进入：编辑相机对齐到**用户当前看到的画面**。
+         *
+         * 必须用 `displayedCamera` 而不是 `this.camera`：播放头不在 0 且
+         * 镜头轨有内容时，画面由时间轴求值决定，用基准相机会让视口
+         * 一进入就"跳"到另一个机位。
+         */
+        const view = this.displayedCamera
+        this.$refs.viewport?.applyCameraState(view)
+        this.$refs.viewport?.beginCameraView()
+        /*
+         * 镜头轨会覆盖基准相机：此时导航写入 `scene.camera` 不会改变画面。
+         * 这种情况不静默吞掉——明确告诉用户怎么让它生效（开自动关键帧）。
+         */
+        if (!this.autoKeyEnabled && view !== this.camera) {
+          this.$store.dispatch('notify', {
+            kind: 'info',
+            message: '当前播放头的镜头轨正在覆盖相机；开启「自动关键帧」后导航才会记录为镜头。'
+          })
+        }
+      } else {
+        this.$refs.viewport?.endCameraView()
+      }
+    },
+
+    setCameraNavScheme(scheme) {
+      /*
+       * 只改 store，由视口自己响应 `cameraNavScheme` 的变化重建导航状态。
+       *
+       * 这里**不能**顺手调用 `this.$refs.viewport.resetCameraNavState()`：
+       * Vue 的 props 是异步更新的，commit 之后同步调用时组件读到的还是
+       * 旧方案，于是 `controls.enabled` 会按旧方案设置——
+       * 从 wasd 切到 orbit 时 OrbitControls 被误设成禁用，
+       * 环绕完全失效（只剩中键转向，看起来就是"只能转动镜头"）。
+       */
+      this.$store.commit('setCameraNavScheme', scheme)
+    },
+
+    /** 快捷键说明：菜单里的"帮助"入口，纯提示不改状态。 */
+    showShortcuts() {
+      this.$store.dispatch('notify', {
+        kind: 'info',
+        message:
+          '相机视角：WASD 前后左右 · Q/E 升降 · Shift 加速 · 中键拖拽转向 · Esc 退出。' +
+          '自动关键帧：开启后变换会自动记录到当前播放头。'
+      })
     },
 
 
@@ -1315,21 +1665,31 @@ export default {
     },
 
     recordCameraShot() {
-      const shot = {
-        id: createId(),
-        name: `镜头 ${String(this.timeline.cameraShots.length + 1).padStart(2, '0')}`,
-        timeSeconds: this.timelineTime,
-        transition: this.timeline.cameraShots.length === 0 ? 'cut' : 'smooth',
-        camera: JSON.parse(JSON.stringify(this.camera))
-      }
+      /*
+       * 同一时刻已有镜头就**覆盖**，不再追加。
+       *
+       * 追加会在同一时刻留下两个镜头：求值只取后一个，前一个静默失效；
+       * 用户在时间轴上看到"两个镜头"却怎么调都不对，很难联想到是数据重复。
+       * 覆盖逻辑统一收在 core/auto-key.js 的 upsertCameraShot()，
+       * 与自动关键帧走同一条路径，避免两处规则不一致。
+       */
+      const shotId = createId()
       this.edit((scene) => ({
         ...scene,
         timeline: {
           ...scene.timeline,
-          cameraShots: [...scene.timeline.cameraShots, shot].sort((a, b) => a.timeSeconds - b.timeSeconds)
+          cameraShots: upsertCameraShot(scene.timeline.cameraShots, {
+            id: shotId,
+            name: `镜头 ${String(scene.timeline.cameraShots.length + 1).padStart(2, '0')}`,
+            timeSeconds: this.timelineTime,
+            camera: buildCameraState(this.camera)
+          })
         }
       }))
-      this.$store.commit('setSelectedShotId', shot.id)
+      const existing = this.timeline.cameraShots.find(
+        (shot) => Math.abs(shot.timeSeconds - this.timelineTime) < 1e-6
+      )
+      this.$store.commit('setSelectedShotId', existing ? existing.id : shotId)
     },
 
     recordObjectKeyframe() {
@@ -1338,29 +1698,34 @@ export default {
         return
       }
       const object = this.selectedObject
-      const keyframe = {
-        id: createId(),
-        objectId: object.id,
-        timeSeconds: this.timelineTime,
-        interpolation: 'smooth',
-        transform: {
-          position: { ...object.position },
-          rotation: { ...object.rotation },
-          size: { ...object.size },
-          mannequinPose: object.mannequin ? JSON.parse(JSON.stringify(object.mannequin.pose)) : undefined,
-          mannequinPresetId: object.mannequin?.presetId
-        }
-      }
+      /*
+       * 同一时刻已有该物体的关键帧就**覆盖**。
+       *
+       * 这是"改完位置再点记录关键帧"的正常用法：用户希望把当前位置写进
+       * 当前时刻，而不是在旁边多插一个同刻关键帧。同刻重复会静默劣化
+       * 插值（实测堆到 30 帧时中间时刻的 x 从 0 跳到 64.5）。
+       *
+       * `buildObjectTransform` 与自动关键帧共用同一个构造函数，
+       * 保证手动/自动两条路径产生的数据形状完全一致。
+       */
+      const keyframeId = createId()
+      const transform = buildObjectTransform(object)
       this.edit((scene) => ({
         ...scene,
         timeline: {
           ...scene.timeline,
-          objectKeyframes: [...scene.timeline.objectKeyframes, keyframe].sort(
-            (a, b) => a.timeSeconds - b.timeSeconds
-          )
+          objectKeyframes: upsertObjectKeyframe(scene.timeline.objectKeyframes, {
+            id: keyframeId,
+            objectId: object.id,
+            timeSeconds: this.timelineTime,
+            transform
+          })
         }
       }))
-      this.$store.commit('setSelectedKeyframeId', keyframe.id)
+      const existing = this.timeline.objectKeyframes.find(
+        (item) => item.objectId === object.id && Math.abs(item.timeSeconds - this.timelineTime) < 1e-6
+      )
+      this.$store.commit('setSelectedKeyframeId', existing ? existing.id : keyframeId)
     },
 
     updateDuration(durationSeconds) {
@@ -1374,11 +1739,23 @@ export default {
     duplicateShot(id) {
       const source = this.timeline.cameraShots.find((shot) => shot.id === id)
       if (!source) return
+      /*
+       * 用 findAvailableTimelineTime 而不是简单的 `+0.5`。
+       *
+       * `+0.5` 可能正好落在另一个已有镜头的时刻上，于是同一时刻出现两个镜头：
+       * 求值只取后一个，前一个静默失效。这个函数本来就是为"给新标记找一个
+       * 不重叠的时刻"写的（项目里一直有实现和单测，却没被生产代码用过）。
+       */
+      const timeSeconds = findAvailableTimelineTime(
+        source.timeSeconds + 0.5,
+        this.timeline.cameraShots.map((shot) => shot.timeSeconds),
+        this.timeline.durationSeconds
+      )
       const copy = {
         ...JSON.parse(JSON.stringify(source)),
         id: createId(),
         name: `${source.name} 副本`,
-        timeSeconds: Math.min(source.timeSeconds + 0.5, this.timeline.durationSeconds)
+        timeSeconds
       }
       this.edit((scene) => ({
         ...scene,
@@ -1404,10 +1781,18 @@ export default {
     duplicateKeyframe(id) {
       const source = this.timeline.objectKeyframes.find((keyframe) => keyframe.id === id)
       if (!source) return
+      // 同一时刻重复关键帧会让插值静默劣化，复制时必须避开已占用的时刻。
+      const timeSeconds = findAvailableTimelineTime(
+        source.timeSeconds + 0.5,
+        this.timeline.objectKeyframes
+          .filter((keyframe) => keyframe.objectId === source.objectId)
+          .map((keyframe) => keyframe.timeSeconds),
+        this.timeline.durationSeconds
+      )
       const copy = {
         ...JSON.parse(JSON.stringify(source)),
         id: createId(),
-        timeSeconds: Math.min(source.timeSeconds + 0.5, this.timeline.durationSeconds)
+        timeSeconds
       }
       this.edit((scene) => ({
         ...scene,

@@ -176,6 +176,10 @@ export default {
     camera() {
       return this.$store.getters.camera
     },
+    /** 导出逐帧求值要用：相机绑定物体时，看向点按该时刻物体的位置解算。 */
+    objects() {
+      return this.$store.getters.objects
+    },
     profiles() {
       return this.$store.state.platformProfiles?.profiles || []
     },
@@ -378,7 +382,7 @@ export default {
        * 物体变换算完就丢了，导出结果自然是一张静止画面。
        */
       const renderFrameAt = async (time) => {
-        const frame = evaluateTimelineAtTime(this.timeline, this.camera, time)
+        const frame = evaluateTimelineAtTime(this.timeline, this.camera, time, this.objects)
         this.viewport.applyCameraState(frame.camera)
         this.viewport.applyTimelineFrame(this.timeline, time)
         return frame
