@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { alignObjects, distributeObjects, placeNewObject, placeOnGround } from '@/core/layout'
+import {
+  alignObjects,
+  distributeObjects,
+  liftFloorTopAboveGround,
+  liftMannequinFeetAboveGround,
+  placeNewObject,
+  placeOnGround
+} from '@/core/layout'
 
 const object = (id, x, y, z, size = 2) => ({
   id,
@@ -46,6 +53,19 @@ describe('layout', () => {
     const objects = [object('a', 0, 5, 0, 2)]
     const result = placeOnGround(objects, new Set(['a']))
     expect(result[0].position.y).toBeCloseTo(1, 6)
+  })
+
+  it('人台 y=0 时抬到身高一半，已抬高的不动', () => {
+    expect(liftMannequinFeetAboveGround({ x: 1, y: 0, z: 2 }, 1.75).y).toBeCloseTo(0.875, 6)
+    expect(liftMannequinFeetAboveGround({ x: 1, y: 0.8, z: 2 }, 1.75).y).toBeCloseTo(0.875, 6)
+    expect(liftMannequinFeetAboveGround({ x: 1, y: 2.5, z: 2 }, 1.75).y).toBeCloseTo(2.5, 6)
+  })
+
+  it('地板上表面过低时抬到略高于参考面', () => {
+    const lifted = liftFloorTopAboveGround({ x: 0, y: -0.1, z: 0 }, { x: 20, y: 0.12, z: 20 })
+    expect(lifted.y + 0.06).toBeCloseTo(0.02, 6)
+    const ok = liftFloorTopAboveGround({ x: 0, y: 0.06, z: 0 }, { x: 4, y: 0.12, z: 4 })
+    expect(ok.y).toBeCloseTo(0.06, 6)
   })
 
   it('新物体放在空场景原点上方', () => {

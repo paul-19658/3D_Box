@@ -884,6 +884,8 @@ export default {
       })
       this.ground = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), groundMaterial)
       this.ground.rotation.x = -Math.PI / 2
+      // 略低于参考网格与用户 floor 底板，避免与共面的地板发生 Z-fighting 闪烁。
+      this.ground.position.y = -0.08
       this.ground.receiveShadow = true
       this.ground.renderOrder = -2
       scene.add(this.ground)
@@ -1330,18 +1332,22 @@ export default {
         const cached = this.importedModels?.get(object.id)
         if (cached) this.setImportedMesh(object.id, cached)
       } else {
-        const mesh = new THREE.Mesh(
-          createGeometry(object),
-          new THREE.MeshStandardMaterial({
-            color: object.colorOverride || object.color,
-            roughness: 0.82,
-            metalness: 0,
-            side: THREE.DoubleSide,
-            transparent: (object.displayMode ?? 'solid') !== 'solid',
-            opacity:
-              object.displayMode === 'transparent' ? 0.34 : object.displayMode === 'wireframe' ? 0.62 : 1
-          })
-        )
+        const material = new THREE.MeshStandardMaterial({
+          color: object.colorOverride || object.color,
+          roughness: 0.82,
+          metalness: 0,
+          side: THREE.DoubleSide,
+          transparent: (object.displayMode ?? 'solid') !== 'solid',
+          opacity:
+            object.displayMode === 'transparent' ? 0.34 : object.displayMode === 'wireframe' ? 0.62 : 1
+        })
+        // floor 与系统地面接近时，用 polygonOffset 再压一层深度冲突。
+        if (object.kind === 'floor') {
+          material.polygonOffset = true
+          material.polygonOffsetFactor = 1
+          material.polygonOffsetUnits = 1
+        }
+        const mesh = new THREE.Mesh(createGeometry(object), material)
         mesh.castShadow = true
         mesh.receiveShadow = true
         mesh.userData.objectId = object.id
@@ -3867,8 +3873,10 @@ export default {
         const white = encode()
 
         // 2. 深度：用线性深度材质，近处白、远处黑。
-        const depthMaterial = this.createDepthMaterial()
+        // 归一化范围取场景物体实际深度，而不是相机 near/far（默认 0.1~2000），
+        // 否则室内场景物体只占视锥极小一段，整张图会接近纯白。
         this.ground.visible = false
+        const depthMaterial = this.createDepthMaterial(camera)
         scene.background = new THREE.Color('#000000')
         scene.overrideMaterial = depthMaterial
         renderer.toneMapping = THREE.NoToneMapping
@@ -3975,10 +3983,51 @@ export default {
       return outline
     },
 
-    createDepthMaterial() {
-      const camera = this.camera
-      const near = camera.near
-      const far = camera.far
+    /**
+     * 计算 objectGroup 在给定相机下的 view-space 深度范围。
+     * 用于深度图可视化归一化，避免被相机 far=2000 稀释成一片白。
+     */
+    sceneDepthRange(camera) {
+      camera.updateMatrixWorld(true)
+      this.objectGroup.updateMatrixWorld(true)
+      const viewMatrix = camera.matrixWorldInverse
+      const box = new THREE.Box3()
+      const corner = new THREE.Vector3()
+      let minDepth = Infinity
+      let maxDepth = -Infinity
+
+      this.objectGroup.traverse((child) => {
+        if (!(child instanceof THREE.Mesh) || !child.visible) return
+        box.setFromObject(child)
+        if (box.isEmpty()) return
+        const { min, max } = box
+        for (const x of [min.x, max.x]) {
+          for (const y of [min.y, max.y]) {
+            for (const z of [min.z, max.z]) {
+              corner.set(x, y, z).applyMatrix4(viewMatrix)
+              const depth = -corner.z
+              if (!(depth > 0)) continue
+              if (depth < minDepth) minDepth = depth
+              if (depth > maxDepth) maxDepth = depth
+            }
+          }
+        }
+      })
+
+      if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth) || maxDepth <= minDepth) {
+        return { near: camera.near, far: camera.far }
+      }
+
+      const span = Math.max(maxDepth - minDepth, 1e-3)
+      const pad = span * 0.05
+      return {
+        near: Math.max(camera.near, minDepth - pad),
+        far: Math.min(camera.far, maxDepth + pad)
+      }
+    },
+
+    createDepthMaterial(camera = this.camera) {
+      const { near, far } = this.sceneDepthRange(camera)
       return new THREE.ShaderMaterial({
         uniforms: { nearValue: { value: near }, farValue: { value: far } },
         vertexShader: `
@@ -3994,7 +4043,7 @@ export default {
           uniform float farValue;
           varying float vDepth;
           void main() {
-            float linear = clamp((vDepth - nearValue) / (farValue - nearValue), 0.0, 1.0);
+            float linear = clamp((vDepth - nearValue) / max(farValue - nearValue, 1e-5), 0.0, 1.0);
             float value = 1.0 - linear;
             gl_FragColor = vec4(vec3(value), 1.0);
           }

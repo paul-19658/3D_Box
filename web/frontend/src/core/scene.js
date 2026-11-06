@@ -36,11 +36,12 @@ export function createSceneObject(kind, existing) {
 
 export function createMannequinSceneObject(existing, heightMeters = 1.75) {
   const count = existing.filter((object) => object.kind === 'mannequin').length
+  // 根节点在髋部：脚底 ≈ position.y - height/2，站地时 y 取身高一半。
   return {
     id: createId(),
     kind: 'mannequin',
     name: `人台 ${String(count + 1).padStart(2, '0')}`,
-    position: { x: 0, y: 0, z: 0 },
+    position: { x: 0, y: heightMeters / 2, z: 0 },
     rotation: { x: 0, y: 0, z: 0 },
     size: { x: 1, y: heightMeters, z: 1 },
     color: '#e8e6e1',
@@ -266,7 +267,10 @@ export function summarizeSceneObject(object, allObjects = []) {
   if (object.locked) parts.push('已锁定')
   if (object.kind === 'mannequin' && object.mannequin) {
     if (object.mannequin.presetId) parts.push(`动作：${object.mannequin.presetId}`)
-    parts.push(`身高 ${round(object.mannequin.heightMeters)} 米`)
+    const height = object.mannequin.heightMeters
+    parts.push(`身高 ${round(height)} 米`)
+    // 脚底高度帮助模型自检穿模：负数 = 陷进地里。
+    parts.push(`脚底约 ${round(object.position.y - height / 2)} 米`)
   }
   if (object.kind === PATH_KIND) {
     parts.push(`导航线节点 ${object.pathNodes?.length ?? 0} 个`)

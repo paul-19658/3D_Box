@@ -10,6 +10,7 @@
 
 import { BASIC_KIND_NAMES, BASIC_KIND_SIZES, MANNEQUIN_PRESET_IDS, createId } from './project-document'
 import { MANNEQUIN_PRESETS, createMannequinData, createNeutralMannequinPose } from './mannequin'
+import { liftFloorTopAboveGround, liftMannequinFeetAboveGround } from './layout'
 
 function cloneObject(object) {
   return JSON.parse(JSON.stringify(object))
@@ -327,12 +328,14 @@ export function applyAiSceneCommands(scene, commands) {
       const kind = command.kind
       const count = objects.filter((object) => object.kind === kind).length
       const size = mergeVector({ ...BASIC_KIND_SIZES[kind] }, command.size)
+      let position = mergeVector({ x: 0, y: size.y / 2, z: 0 }, command.position)
+      if (kind === 'floor') position = liftFloorTopAboveGround(position, size)
       objects.push({
         id: createId(),
         kind,
         name: command.name || `${BASIC_KIND_NAMES[kind]} ${String(count + 1).padStart(2, '0')}`,
         description: command.description,
-        position: mergeVector({ x: 0, y: size.y / 2, z: 0 }, command.position),
+        position,
         rotation: mergeVector({ x: 0, y: 0, z: 0 }, command.rotation),
         size,
         color: command.color || '#c9cdd0',
@@ -349,12 +352,16 @@ export function applyAiSceneCommands(scene, commands) {
       const presetPose =
         MANNEQUIN_PRESETS.find((item) => item.id === preset)?.pose ?? createNeutralMannequinPose()
       const count = objects.filter((object) => object.kind === 'mannequin').length
+      const position = liftMannequinFeetAboveGround(
+        mergeVector({ x: 0, y: height / 2, z: 0 }, command.position),
+        height
+      )
       objects.push({
         id: createId(),
         kind: 'mannequin',
         name: command.name || `人台 ${String(count + 1).padStart(2, '0')}`,
         description: command.description,
-        position: mergeVector({ x: 0, y: 0, z: 0 }, command.position),
+        position,
         rotation: mergeVector({ x: 0, y: 0, z: 0 }, command.rotation),
         size: { x: 1, y: height, z: 1 },
         color: '#e8e6e1',
@@ -372,19 +379,26 @@ export function applyAiSceneCommands(scene, commands) {
         skipped.push(`找不到物体：${command.name || command.id}`)
         continue
       }
-      objects = objects.map((object) =>
-        object.id === target.id
-          ? {
-              ...object,
-              name: command.name && command.name !== object.name ? command.name : object.name,
-              description: command.description ?? object.description,
-              position: mergeVector(object.position, command.position),
-              rotation: mergeVector(object.rotation, command.rotation),
-              size: mergeVector(object.size, command.size),
-              color: command.color ?? object.color
-            }
-          : object
-      )
+      objects = objects.map((object) => {
+        if (object.id !== target.id) return object
+        const size = mergeVector(object.size, command.size)
+        let position = mergeVector(object.position, command.position)
+        if (object.kind === 'mannequin') {
+          const height = object.mannequin?.heightMeters ?? size.y ?? 1.75
+          position = liftMannequinFeetAboveGround(position, height)
+        } else if (object.kind === 'floor') {
+          position = liftFloorTopAboveGround(position, size)
+        }
+        return {
+          ...object,
+          name: command.name && command.name !== object.name ? command.name : object.name,
+          description: command.description ?? object.description,
+          position,
+          rotation: mergeVector(object.rotation, command.rotation),
+          size,
+          color: command.color ?? object.color
+        }
+      })
       applied += 1
       continue
     }
