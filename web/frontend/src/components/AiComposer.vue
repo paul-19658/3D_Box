@@ -130,7 +130,13 @@
               <path d="M8 3v10M3 8h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
             </svg>
           </button>
-          <button type="button" class="round-btn" title="AI 设置" @click.stop="$emit('open-settings')">
+          <button
+            v-if="isAdmin"
+            type="button"
+            class="round-btn"
+            title="AI 设置"
+            @click.stop="$emit('open-settings')"
+          >
             <svg viewBox="0 0 16 16" aria-hidden="true">
               <circle cx="5" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.3" />
               <circle cx="11" cy="5.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3" />
@@ -244,6 +250,9 @@ export default {
   },
 
   computed: {
+    isAdmin() {
+      return this.$store.getters.isAdmin
+    },
     providers() {
       return this.settings?.providers || []
     },

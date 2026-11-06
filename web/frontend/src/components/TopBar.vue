@@ -103,7 +103,13 @@
       <button type="button" class="btn btn--ghost" title="切换主题" @click="$emit('toggle-theme')">
         {{ theme === 'dark' ? '浅色' : '深色' }}
       </button>
-      <button type="button" class="btn btn--ghost" title="AI 设置" @click="$emit('open-ai-settings')">
+      <button
+        v-if="isAdmin"
+        type="button"
+        class="btn btn--ghost"
+        title="AI 设置"
+        @click="$emit('open-ai-settings')"
+      >
         AI
       </button>
       <button

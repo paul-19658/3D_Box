@@ -220,7 +220,10 @@
 
     <RecoveryDialog v-if="recoverySnapshot" />
     <RecentDialog v-if="recentOpen" @close="$store.commit('setRecentOpen', false)" />
-    <AiSettingsDialog v-if="aiSettingsOpen" @close="$store.commit('setAiSettingsOpen', false)" />
+    <AiSettingsDialog
+      v-if="aiSettingsOpen && isAdmin"
+      @close="$store.commit('setAiSettingsOpen', false)"
+    />
     <ImageExportDialog
       v-if="imageExportOpen"
       :viewport="$refs.viewport"
