@@ -1,6 +1,15 @@
 import { APP_VERSION } from './app-meta'
 
-export const PROJECT_SCHEMA_VERSION = 12 as const
+/**
+ * schema 15：相机新增 `lookAtEnabled`（看向绑定是否启用）。
+ *
+ * schema 14：相机新增可空的 `targetObjectId`（把看向点绑定到某个物体并跟随）。
+ *
+ * 注意：本文件此前停在 12，而 `web/frontend/src/core/project-document.js`
+ * 与 `web/backend/app/models/project.py` 已经是 13（新增 `kind: 'path'` 导航线）。
+ * 三端版本号必须一致，否则同一份工程在不同端的校验结果会分叉。
+ */
+export const PROJECT_SCHEMA_VERSION = 15 as const
 export const PROJECT_EXTENSION = 'block3d'
 
 export type PrimitiveKind =
@@ -130,6 +139,16 @@ export interface CameraState {
   fovDegrees: number
   aspectWidth: number
   aspectHeight: number
+  /**
+   * schema 14：把"看向点"绑定到场景里的某个物体，相机会锁定并跟随它移动。
+   * `null` 表示看向点就是上面的静态 `target` 坐标。
+   */
+  targetObjectId?: string | null
+  /**
+   * schema 15：看向绑定是否启用。关掉后相机改用静态 `target`，但绑定关系保留。
+   * 缺省视为 `true`（v14 及更早的工程没有这个字段）。
+   */
+  lookAtEnabled?: boolean
 }
 
 export type SceneLightKind = 'point' | 'spot' | 'area' | 'sun'
@@ -197,7 +216,9 @@ export const DEFAULT_CAMERA: CameraState = {
   target: { x: 0, y: 1, z: 0 },
   fovDegrees: 42,
   aspectWidth: 16,
-  aspectHeight: 9
+  aspectHeight: 9,
+  targetObjectId: null,
+  lookAtEnabled: true
 }
 
 export const DEFAULT_LIGHTING: SceneLightingState = {
@@ -597,7 +618,17 @@ function isCamera(value: unknown): value is CameraState {
     value.aspectWidth <= 100 &&
     isFiniteNumber(value.aspectHeight) &&
     value.aspectHeight > 0 &&
-    value.aspectHeight <= 100
+    value.aspectHeight <= 100 &&
+    /*
+     * `targetObjectId` 允许缺省（v13 及更早的工程没有这个字段），
+     * 但一旦存在必须是 null 或非空字符串——空字符串会让"是否绑定"
+     * 出现第三种状态，与另外两端的归一规则不一致。
+     */
+    (value.targetObjectId === undefined ||
+      value.targetObjectId === null ||
+      (typeof value.targetObjectId === 'string' && value.targetObjectId.length > 0)) &&
+    // `lookAtEnabled` 允许缺省（v14 及更早的工程没有），存在时必须是布尔。
+    (value.lookAtEnabled === undefined || typeof value.lookAtEnabled === 'boolean')
   )
 }
 
@@ -751,8 +782,24 @@ function migratedCamera(camera: Record<string, unknown>): CameraState {
     target: camera.target as Vector3Value,
     fovDegrees: isFiniteNumber(camera.fovDegrees) ? camera.fovDegrees : DEFAULT_CAMERA.fovDegrees,
     aspectWidth: DEFAULT_CAMERA.aspectWidth,
-    aspectHeight: DEFAULT_CAMERA.aspectHeight
+    aspectHeight: DEFAULT_CAMERA.aspectHeight,
+    // schema 14 新增：老工程没有这个字段，一律补 null（= 看向静态 target）。
+    targetObjectId: normalizeTargetObjectId(camera.targetObjectId),
+    // schema 15 新增：缺省视为启用（老工程"一绑就生效"）。
+    lookAtEnabled: camera.lookAtEnabled !== false
   }
+}
+
+/**
+ * 把 `targetObjectId` 归一成 `string | null`。
+ *
+ * 空字符串既不是"未绑定"也不是合法 id，统一变成 `null`，
+ * 保证"是否绑定"只有两种状态——三端必须用同一条规则。
+ */
+function normalizeTargetObjectId(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const text = value.trim()
+  return text.length > 0 ? text : null
 }
 
 function migratedLighting(lighting: unknown): SceneLightingState {
