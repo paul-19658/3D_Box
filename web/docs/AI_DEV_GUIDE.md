@@ -172,14 +172,73 @@ AiComposer（文字 + 参考图）
 | 后端 tools 协议（OpenAI + Anthropic） | ✅ | `ai_service.py` |
 | Composer 展开收起 + 服务商切换 | ✅ | `AiComposer.vue` |
 
-**当前版本：schema 15**（14 → 15 只是给相机新增 `lookAtEnabled`，
-用于临时关闭"看向物体"绑定而保留绑定关系；旧工程迁移时补 `true`）。
+**当前版本：schema 19**（18 → 19 场景新增 `poseLibrary` 姿势库；
+17 → 18 导入模型新增 `importedAsset.files` 文件引用，
+几何体靠"按引用下载 + 重新解析"恢复；16 → 17 修正人台比例：`size` 三分量统一为身高、
+骨架包围盒基准归一；15 → 16 给场景新增 `background` 全景图背景）。
 
 历史：
 - 12 → 13：新增 `kind: "path"` 的导航线对象与 `pathNodes` / `pathBinding` 字段，
   旧工程原样保留即可。
 - 13 → 14：相机新增 `targetObjectId`（可空）。
 - 14 → 15：相机新增 `lookAtEnabled`（布尔，缺省 true）。
+- 15 → 16：场景新增 `background`（全景图背景，**只存文件名引用**，
+  图片走 `exports/upload` 落用户目录）。
+- 16 → 17：修正人台比例——人台 `size` 三个分量统一为身高（以前 `{x:1,y:身高,z:1}`，
+  被竖直拉伸 1.75 倍）；骨架包围盒基准归一为 -0.5 ~ +0.5 并与外观共用。
+- 17 → 18：导入模型新增 `importedAsset.files`（**只存文件名引用**，不存 base64）：
+
+  ```json
+  "files": {
+    "main": { "name": "椅子.gltf", "fileName": "椅子.gltf" },
+    "resources": [{ "name": "scene.bin", "fileName": "scene-1.bin" }]
+  }
+  ```
+
+  `name` 是模型内部引用的原始名（`.gltf` 的 `buffer.uri` / 纹理 `uri`、
+  `.obj` 的 `mtllib` 行），重新解析时要按这个名字交回依赖；
+  `fileName` 是上传到 `exports` 后的服务端文件名（**会去重重命名**，
+  取文件必须以它为准）。主文件与全部依赖都要传，少一个就恢复不出来。
+  老工程（v17 及更早）没有 `files`，照常打开，只是模型恢复不出来（当初也没存）。
+  恢复实现在 `SceneViewport.restoreImportedMesh`；上传实现在
+  `Editor.uploadImportedFiles`。**`primaryData` / `encoding` 已改为可选**：
+  它们曾经是必填，导致 Web 版保存的工程在打开时整条导入物体被校验拒绝。
+- 18 → 19：场景新增 `poseLibrary`（姿势库），**存工程里**而不是 localStorage：
+
+  ```json
+  "poseLibrary": [
+    { "id": "…", "name": "抱臂", "pose": { "head": {"x":0,"y":0,"z":0}, "…": {} },
+      "createdAt": "2026-11-11T08:00:00.000Z" }
+  ]
+  ```
+
+  `pose` 是**完整**关节表（10 关节 × 3 轴）：应用库姿势时 `presetId` 会被置 null、
+  全部关节都由这份 pose 驱动，缺一个关节就会让那个部位掉回中立角度，所以迁移时
+  按 `MANNEQUIN_JOINT_IDS` **补齐**（不是拒绝）。老工程（v18 及更早）没有这个字段
+  → 空数组，行为不变。
+
+### 人台姿势的三个扩展（姿势库 / 镜像 / 关节关键帧通道）
+
+| 能力 | 纯逻辑（可 Node 测） | 界面入口 | 关键取舍 |
+| --- | --- | --- | --- |
+| 姿势库 | `core/mannequin.js`：`createPoseLibraryEntry` / `applyLibraryPose` / `sanitizePoseLibraryName`；文档侧 `project-document.js` 的 `normalizePoseLibrary` | `.pose-panel` 的 `.pose-library`（内联输入框 + 保存/应用/更新/删除） | 应用时 **`presetId` 置 null** 且 `manualJoints` 填满 10 关节；空名自动编号「姿势 N」、超长截断 24 字、**重名允许**（按 id 区分） |
+| 镜像 / 对称 | `mirrorJointValue` / `mirrorMannequinPose` / `mirrorTargetJointIds` | `.pose-mirror__left` / `.pose-mirror__right` | 绕 x=0 镜像的欧拉角变换是 `(rx, ry, rz) → (rx, -ry, -rz)`（推导见 `mirrorMannequinPose` 注释）；**只处理四肢 4 对关节，不动 `head`/`spine`** |
+| 关节关键帧通道 | `core/timeline.js` 的 `evaluatePoseTrack`（逐关节独立插值）+ `core/mannequin.js` 的 `subsetPose` / `writeMannequinPoseKeyframe` | `.pose-keyframe-all`（全部关节）+ 每个关节行的 `.pose-joint__key`（单关节） | 只在该关节**真正有关键帧**的帧之间插值，两侧都没帧时取最近值；同刻覆盖不追加；预览时关键帧姿势**合并**到工程姿势上（部分姿势不会清空其它关节） |
+
+⚠️ **部分姿势（partial pose）的三处防线**，缺任何一处都会"人物塌掉/报错"：
+1. `evaluatePoseTrack` 按关节并集求值，不产出 `undefined` / NaN；
+2. `applyObjectKeyframePreview` 把关键帧姿势 **merge** 到 `object.mannequin.pose`；
+3. `constrainMannequinJoint` 把 `undefined` / NaN 一律当 0（`applyMannequinControlPose`
+   用可选链读 `pose?.[id]`）。
+
+⚠️ **镜像与世界坐标的边界**：`spine` 绕 Y/Z 扭转时整具身体**本来就不是**世界坐标
+镜像的（中轴关节被刻意排除）。世界坐标断言必须用"躯干只绕 X"的姿势；
+四肢相对躯干仍然严格镜像。`tools/verify-camera-autokey.mjs` 第 二十六 节就是这么量的。
+
+⚠️ **加字段时，所有"手工重组 scene"的地方都要补**。`openProject` / 只读查看 /
+恢复快照都是按字段拼 `{ objects, camera, lighting, timeline }` 再 `resetScene`——
+漏一处就会出现"存了但重新打开就没了"（全景图这次就踩到了）。
+`sceneFingerprint` 同理，不把新字段放进去，改了它不会被判成"有未保存修改"。
 
 ⚠️ **三端版本号必须一致**。此前 `app/src/shared/project-document.ts` 停在 12，
 而 JS 与 Python 已是 13，属于长期未发现的漂移——同一份工程在不同端的校验结果
@@ -400,6 +459,23 @@ py -3.10 -m alembic upgrade head
 | **换画幅后画面变扁/变窄，焦距却还显示原值** | `fovDegrees` 是**垂直**视场角，画幅一变它的含义就变；只改 `aspectWidth/aspectHeight` 等于同一颗镜头换了焦段（25.64mm 选 21:9 变 19.54mm） | 换画幅时按"长边定视野"重算视场角（`aspectChangePatch()`），焦距与长边视野保持不变 |
 | **把"保持镜头"的换算写在按钮的点击处理里** | 只有点那个按钮的路径是对的；AI 命令、撤销重做、工程载入都会绕过它 | 放在 `Editor.updateCamera`——相机的唯一写入口；且规则是"只给画幅、没给视场角时才重算" |
 | **镜头轨换算用了新画幅当基准** | 等于拿"已换算过的结果"再算一次，结果原地不动（实测 fov 42→42，看起来像没执行） | 换算基准必须是**旧画幅**（`previousCamera`）；镜头自带画幅就用它自己的 |
+| **可配置快捷键后，按住类动作的键清不掉** | keydown 记了"前进"，用户按住途中改了快捷键，keyup 重新解析得到别的动作 → 那个键永远清不掉，相机一直往前飞 | keydown 时记下"是哪个动作按下的"（`navPressedBindings`），keyup 按**同一份记录**清；失焦一起清 |
+| **Shift 一会儿算修饰键、一会儿不算** | `Shift+A` 的 `event.key` 已是 `'A'`，再记 `shift` 会让 `'shift+a'` 与 `'a'` 变成两个绑定；但 `Ctrl+Shift+Z` 必须与 `Ctrl+Z` 区分 | 分情况：已有 Ctrl/Alt 时 Shift 算修饰键；Shift 是唯一修饰键且键可打印时折叠进字符；非可打印键照常记 |
+| **两个组件的 window keydown 抢同一个键** | 都拿全量动作去匹配 → 同一个键被处理两次（空格既切播放又触发别的） | 每个组件只把自己拥有的动作交给 `matchAction({ actions })`；各管各的 |
+| **把"不同 scope 用同一个键"判成冲突** | `W` 既是"移动工具"又是"相机前进"，但两者不会同时生效——一律报冲突会让面板永远是红的 | 冲突判据是"**scope 是否重叠**"：`global` 与谁都重叠，`editor` 与 `cameraNav` 互斥 |
+| **AI 报 400 就以为是自己请求格式错** | 网关过载返回的是**泛化的 400**（`AnthropicException` + `400001` + `internal MaaS component`），看起来像参数错。实测同一份请求体时而 200 时而 400、连发 10 次全成功 → 请求本身合法 | 判定上游问题要**重放原始请求体**（日志的 `upstream.requestBody` 有完整记录），别照错误文案猜 |
+| **对 400 一律重试** | 真正的参数错 / 鉴权错 / 模型名错重试多少次都一样，只会把失败拖慢一倍 | 只重试**有特征**的瞬时 400；再加**时间预算**，慢失败（上游卡几十秒才报错）不再重试，否则用户要等两三分钟 |
+| **错误正文只截头部** | 网关把结论放末尾（`No fallback was attempted.`），`[:400]` 正好切断在 `failed with the ` 处，排查时只能看到半句 | `shorten_error_detail()`：上限放大到 2000 且**头尾都保留** |
+| **加了新场景字段，存盘后重开就丢** | `openProject` / 只读查看 / 恢复快照都手工拼 `{ objects, camera, lighting, timeline }` 再 `resetScene`，漏字段 | 加字段时搜一遍所有 `resetScene(` 调用点；`sceneFingerprint` 也要带上，否则改了不算"未保存" |
+| **全景图被当成平面贴图铺在背景上（被拉伸）** | 没设 `texture.mapping`，three 默认按平面 UV 采样 | `EquirectangularReflectionMapping` + `colorSpace = SRGBColorSpace`（不声明色彩空间整张图会偏暗发灰） |
+| **换几张全景图后显存吃满** | 换图时只替换引用、没 `dispose()` 旧纹理；一张 4K 全景图在 GPU 上几十 MB | 换图/移除/销毁统一走 `disposeBackgroundTexture()`；异步加载用 token 丢弃过期结果 |
+| **旋转全景图时整个场景跟着转** | 转动相机来实现"转背景"，场景当然一起转 | 用 `scene.backgroundRotation`（three 专门给背景的旋转量） |
+| **人物被拉成细长条** | 人台 `size` 存 `{x:1, y:身高, z:1}`，而视口按 `root.scale.set(size.x, size.y, size.z)` 缩放 → 只竖直拉伸 | 骨架与外观都是"单位身高"模型，`size` 三个分量必须相等；改身高时三个一起改 |
+| **关节手柄比画出来的身体低一截、脚底陷进地面** | 两套基准各写各的：骨架实际 0.9883 高 / 脚底 -0.5475，外观按 1.0 / -0.5 归一化 → 髋差 13% 身高（24cm） | 骨架包围盒锁成 `MANNEQUIN_RIG_BOUNDS`（-0.5 ~ +0.5），外观归一化直接引用它；测试断言真实骨架落在该范围 |
+| **人台肩/头位置偏高（手柄对不上）** | 骨架比例按"教科书 7.5 头身"，而随附 GLB 是 6 头身（肩 0.77，不是 0.82） | 按 GLB 的**实测骨骼位置**定比例表；换模型必须重新量 |
+| **拖了姿势滑块，白模动了但画面上的人没动** | 人台有两层姿势：骨架始终跟 `pose`，而外观 GLB 在有动作预设时只让 `manualJoints` 里的关节被 `pose` 覆盖 | 改关节时把该关节记进 `manualJoints`（`core/mannequin.js` 的 `applyJointAngle()` 已统一处理） |
+| **姿势面板不实时刷新** | 改了 `mannequin.pose` 但视口没重放 | 不用改视口：`objects` 深度 watcher → `rebuildObjects` → 复用分支 `applyObjectTransform()` → 内部已调 `applyMannequinPose()`。若哪天它不再调，面板就会失效 |
+| **滑块能拖出反折的关节（肘/膝）** | 面板自己写死范围，或绕过限位写入 | 滑块 min/max 直接取 `MANNEQUIN_JOINTS[].limits`，写入统一走 `constrainMannequinJoint()` |
 | **TransformControls 松手时写死 `controls.enabled = true`** | `wasd` 相机视角下相机归导航独占，拖过一次物体后 OrbitControls 被悄悄打开，表现为"拖完物体后 WASD 不灵 / 视角自己转" | 解锁时按 `shouldRunOrbitControls(cameraViewActive, scheme)` 判断 |
 | **相机在中间关键帧停顿** | 逐段 smoothstep 缓动，每段两端速度归零；位置还是分段直线 | 时间参数化的向心 Catmull-Rom：穿过关键帧、速度连续、支持弧线（`core/camera-path.js`） |
 | **同刻关键帧让整条轨迹变 NaN** | 两个同刻关键帧 → 段时长 `dt = 0` → 切线公式除零 → 位置 NaN → 相机消失 | 关键帧进求值前必须过 `normalizeKnots()`：排序、丢弃非法项、**合并同刻** |

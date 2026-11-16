@@ -84,6 +84,7 @@
           :preview-active="previewMode"
           :monitor-open="monitorOpen"
           :lighting="lighting"
+          :background="sceneBackground"
           :selected-ids="selectedIds"
           :selected-light-id="selectedLightId"
           :transform-mode="transformMode"
@@ -97,10 +98,12 @@
           :camera-view-mode="cameraViewMode"
           :camera-view-active="cameraViewActive"
           :camera-nav-scheme="cameraNavScheme"
+          :keybindings="keybindings"
           :camera-selected="cameraSelected"
           :animation-time="timelineTime"
           :path-draft="pathDraft"
           :selected-path-node="selectedPathNode"
+          @panorama-dropped="uploadPanorama"
           @selection-change="handleSelection"
           @selection-clear="clearSelection"
           @object-transform="handleObjectTransform"
@@ -184,6 +187,7 @@
           :object="selectedObject"
           :light="selectedLight"
           :camera="camera"
+          :background="sceneBackground"
           :paint-color="paintColor"
           :paint-scope="paintScope"
           :paths="paths"
@@ -191,9 +195,21 @@
           :object-keyframe-count="selectedObjectKeyframeCount"
           :selected-node-index="selectedNodeIndex"
           :objects="objects"
+          :pose-library="poseLibrary"
           @update-object="updateObject"
           @update-light="updateLight"
           @update-camera="updateCamera"
+          @update-background="updateBackground"
+          @update-joint-angle="updateJointAngle"
+          @reset-mannequin-pose="resetMannequinPose"
+          @save-pose="savePoseLibraryEntry"
+          @apply-library-pose="applyPoseLibraryEntry"
+          @update-library-pose="updatePoseLibraryEntry"
+          @delete-library-pose="deletePoseLibraryEntry"
+          @mirror-pose="mirrorPose"
+          @keyframe-pose="recordPoseKeyframe"
+          @upload-panorama="uploadPanorama"
+          @remove-panorama="removePanorama"
           @bind-camera-target="bindCameraTarget"
           @toggle-look-at="setLookAtEnabled"
           @delete-object="deleteSelected"
@@ -256,6 +272,7 @@
 
     <RecoveryDialog v-if="recoverySnapshot" />
     <RecentDialog v-if="recentOpen" @close="$store.commit('setRecentOpen', false)" />
+    <ShortcutSettingsDialog v-if="shortcutDialogOpen" />
     <AiSettingsDialog
       v-if="aiSettingsOpen && isAdmin"
       @close="$store.commit('setAiSettingsOpen', false)"
@@ -286,6 +303,7 @@
  */
 
 import MenuBar from '@/components/MenuBar.vue'
+import { api } from '@/api/client'
 import TopBar from '@/components/TopBar.vue'
 import ToolRail from '@/components/ToolRail.vue'
 import AssetPanel from '@/components/AssetPanel.vue'
@@ -296,6 +314,7 @@ import AiComposer from '@/components/AiComposer.vue'
 import AiSettingsDialog from '@/components/AiSettingsDialog.vue'
 import RecoveryDialog from '@/components/RecoveryDialog.vue'
 import RecentDialog from '@/components/RecentDialog.vue'
+import ShortcutSettingsDialog from '@/components/ShortcutSettingsDialog.vue'
 import ImageExportDialog from '@/components/ImageExportDialog.vue'
 import VideoExportDialog from '@/components/VideoExportDialog.vue'
 import ModelExportDialog from '@/components/ModelExportDialog.vue'
@@ -309,18 +328,35 @@ import {
 } from '@/core/scene'
 import { placeNewObject, alignObjects, distributeObjects, placeOnGround } from '@/core/layout'
 import { aspectChangePatch } from '@/core/focal-length'
-import { MANNEQUIN_PRESETS } from '@/core/mannequin'
+import { KEYBINDING_ACTIONS, SCOPES, matchAction } from '@/core/keybindings'
+import {
+  MANNEQUIN_MIRROR_PAIRS,
+  MANNEQUIN_PRESETS,
+  applyJointAngle,
+  applyLibraryPose,
+  createPoseLibraryEntry,
+  mirrorMannequinPose,
+  resetMannequinPose,
+  sanitizeMannequinPose,
+  writeMannequinPoseKeyframe
+} from '@/core/mannequin'
 import { quickBuildTransform } from '@/core/quick-build'
 import { faceColorKey, surfaceTriangles } from '@/core/face-paint'
-import { evaluateTimelineAtTime, applyTimelinePreview, findAvailableTimelineTime } from '@/core/timeline'
+import {
+  evaluateTimelineAtTime,
+  applyTimelinePreview,
+  findAvailableTimelineTime,
+  frameIndexToTime,
+  timeToFrameIndex
+} from '@/core/timeline'
 import {
   PATH_KIND,
   buildPathKeyframes,
   createPathBinding,
   pathInsertionPoint
 } from '@/core/nav-path'
-import { importStaticModel, analyzeModel } from '@/core/model-io'
-import { createId } from '@/core/project-document'
+import { importStaticModel, analyzeModel, isBinaryAssetName } from '@/core/model-io'
+import { createId, DEFAULT_BACKGROUND } from '@/core/project-document'
 import { isEditableTarget } from '@/core/camera-nav'
 import { lookAtEnabledPatch, resolveCameraTarget, targetBindingPatch } from '@/core/camera-target'
 import {
@@ -329,7 +365,7 @@ import {
   upsertCameraShot,
   upsertObjectKeyframe
 } from '@/core/auto-key'
-import { downloadReport, errorCount } from '@/core/diagnostics'
+import { downloadReport, errorCount, record } from '@/core/diagnostics'
 
 export default {
   name: 'EditorView',
@@ -346,6 +382,7 @@ export default {
     AiSettingsDialog,
     RecoveryDialog,
     RecentDialog,
+    ShortcutSettingsDialog,
     ImageExportDialog,
     VideoExportDialog,
     ModelExportDialog,
@@ -377,6 +414,14 @@ export default {
     },
     lighting() {
       return this.$store.getters.lighting
+    },
+    /** 全景图背景配置（`scene.background`）。 */
+    sceneBackground() {
+      return this.$store.getters.background
+    },
+    /** 姿势库（`scene.poseLibrary`）。老工程没有该字段时为空数组。 */
+    poseLibrary() {
+      return this.$store.getters.poseLibrary
     },
     timeline() {
       return this.$store.getters.timeline
@@ -444,6 +489,17 @@ export default {
     },
     autoKeyEnabled() {
       return this.$store.state.autoKeyEnabled
+    },
+    /** 当前快捷键绑定表。 */
+    keybindings() {
+      return this.$store.state.keybindings
+    },
+    /** 通用动作里由本组件负责的那几个（撤销/保存归 App.vue）。 */
+    ownedGlobalActions() {
+      return KEYBINDING_ACTIONS.filter((action) => action.id === 'timeline.play')
+    },
+    shortcutDialogOpen() {
+      return this.$store.state.shortcutDialogOpen
     },
     /** 当前播放头下被手动改过的物体；这些物体在显示时压过时间轴求值。 */
     timelineEditOverrides() {
@@ -758,6 +814,11 @@ export default {
     handleGlobalKey(event) {
       if (event.key === 'Escape') {
         if (isEditableTarget(event.target)) return
+        /*
+         * Esc 是**刻意不开放配置**的：它同时被"退出预演""退出相机视角"
+         * "关闭菜单""关闭对话框"共用，是全局的"取消"键。允许改它会把
+         * 这些互不相干的出口一起改掉，用户很难预期。
+         */
         if (this.previewMode) {
           event.preventDefault()
           this.setPreviewMode(false)
@@ -770,28 +831,51 @@ export default {
         return
       }
 
+      // 正在输入时不抢键（工程名、数值框里打字不该触发工具切换）。
+      if (isEditableTarget(event.target)) return
+
       /*
-       * 变换工具快捷键（对标 Maya 的 Q/W/E/R）。
+       * 工具快捷键走可配置注册表（默认 Q/W/E/R，可在"快捷键设置"里改，
+       * 也可整套切成 Maya / Blender 预设）。
        *
-       * 唯一的冲突点是 W：相机视角下 W 是"向前飞"。所以这里在相机视角
-       * 内**整体让位**给导航，不做工具切换。用 `cameraViewActive` 而不是
-       * 方案来判断，是因为两种方案下 W 都被导航占用（环绕方案下 WASD
-       * 不参与，但那时用户也不是在"摆物体"）。
-       *
-       * 其余守卫：正在输入时不抢键、带修饰键时不当成工具快捷键
-       * （Ctrl/Cmd+R 刷新、Ctrl+E 之类必须留给浏览器）。
+       * 唯一的冲突点是 W：相机视角下 W 是"向前飞"。所以这里在相机视角内
+       * **整体让位**给导航——注册表里两者 scope 不同（editor vs cameraNav），
+       * 冲突检测也因此不会把它们判成冲突。
        */
       if (this.cameraViewActive) return
-      if (event.ctrlKey || event.metaKey || event.altKey) return
-      if (isEditableTarget(event.target)) return
-      const toolKey = { q: 'select', w: 'translate', e: 'rotate', r: 'scale' }[event.key.toLowerCase()]
-      if (!toolKey) return
-      event.preventDefault()
-      if (toolKey === 'select') {
-        this.activateSelectTool()
+      const action = matchAction(this.keybindings, event, { scopes: [SCOPES.EDITOR] })
+      if (action) {
+        event.preventDefault()
+        this.applyShortcutAction(action.id)
         return
       }
-      this.setTool(toolKey)
+
+      /*
+       * 通用动作里由本组件负责的部分。
+       *
+       * 只把自己拥有的动作 id 交给匹配器：`App.vue` 也在监听 window 的 keydown
+       * 处理撤销/保存。两边都拿全量动作去匹配的话，同一个键会被处理两次
+       * （比如空格既切播放又被当成别的）。各管各的，就不会互相抢。
+       */
+      const globalAction = matchAction(this.keybindings, event, { actions: this.ownedGlobalActions })
+      if (!globalAction) return
+      event.preventDefault()
+      if (globalAction.id === 'timeline.play') this.togglePlay()
+    },
+
+    /** 把一个（已在注册表里解析出来的）动作落到具体行为上。 */
+    applyShortcutAction(actionId) {
+      const toolByAction = {
+        'tool.select': 'select',
+        'tool.translate': 'translate',
+        'tool.rotate': 'rotate',
+        'tool.scale': 'scale'
+      }
+      const tool = toolByAction[actionId]
+      if (tool) {
+        if (tool === 'select') this.activateSelectTool()
+        else this.setTool(tool)
+      }
     },
 
     // ------------------------------------------------------------------
@@ -1258,7 +1342,9 @@ export default {
           return {
             ...object,
             position: { ...object.position, y: feetY + height / 2 },
-            size: { ...object.size, y: height },
+            // 三个分量必须一起改：视口按 size 的三个分量缩放根节点，
+            // 只改 y 会把人物竖直拉伸（骨架与外观都是"单位身高"模型）。
+            size: { x: height, y: height, z: height },
             mannequin: object.mannequin ? { ...object.mannequin, heightMeters: height } : null
           }
         })
@@ -1553,14 +1639,9 @@ export default {
       this.$store.commit('setCameraNavScheme', scheme)
     },
 
-    /** 快捷键说明：菜单里的"帮助"入口，纯提示不改状态。 */
+    /** 快捷键设置面板：菜单里的"帮助 → 键盘快捷键…"入口。 */
     showShortcuts() {
-      this.$store.dispatch('notify', {
-        kind: 'info',
-        message:
-          '相机视角：WASD 前后左右 · Q/E 升降 · Shift 加速 · 中键拖拽转向 · Esc 退出。' +
-          '自动关键帧：开启后变换会自动记录到当前播放头。'
-      })
+      this.$store.commit('setShortcutDialogOpen', true)
     },
 
 
@@ -1831,6 +1912,49 @@ export default {
       this.$refs.modelInput.click()
     },
 
+    /**
+     * 把导入模型的主文件与依赖资源上传到 exports 目录。
+     *
+     * 工程里**只存文件引用**：模型动辄几十 MB，存 base64 会让每次保存都重传一遍，
+     * 撤销栈里也各留一份。上传成功后返回 `{ main, resources }`，直接写进
+     * `importedAsset.files`，由视口在重新打开工程时按引用取回并重新解析。
+     *
+     * 上传失败返回 null：模型仍然可以看（内存里有解析结果），但重新打开工程
+     * 就恢复不出来，所以调用方要明确告诉用户，不能装作成功。
+     */
+    async uploadImportedFiles(primary, files) {
+      const byName = new Map(files.map((file) => [file.name, file]))
+      const uploadOne = async (name) => {
+        const file = byName.get(name)
+        if (!file) return null
+        const result = await api.exports.upload(file.name, file)
+        if (!result || !result.fileName) throw new Error(`上传 ${name} 未返回文件名。`)
+        /*
+         * 必须以服务端返回的 `fileName` 为准：同名文件会被去重重命名
+         * （加 `-1` / `-2`），用本地名去取会 404。
+         */
+        return { name, fileName: result.fileName }
+      }
+      try {
+        const main = await uploadOne(primary.name)
+        if (!main) throw new Error('主文件上传失败。')
+        const resources = []
+        for (const file of files) {
+          if (file === primary) continue
+          const entry = await uploadOne(file.name)
+          if (entry) resources.push(entry)
+        }
+        return { main, resources }
+      } catch (error) {
+        record(
+          'warn',
+          'import',
+          `导入模型文件上传失败，重新打开工程后将无法恢复几何体：${error?.message || error}`
+        )
+        return null
+      }
+    },
+
     async handleModelFiles(event) {
       const files = [...event.target.files]
       event.target.value = ''
@@ -1847,7 +1971,8 @@ export default {
         if (file === primary) continue
         resources.push({
           name: file.name,
-          data: /\.(bin|glb)$/i.test(file.name) ? await file.arrayBuffer() : await file.text()
+          // 纹理必须按二进制读，见 core/model-io.js 的 isBinaryAssetName。
+          data: isBinaryAssetName(file.name) ? await file.arrayBuffer() : await file.text()
         })
       }
 
@@ -1855,6 +1980,14 @@ export default {
       try {
         const data =
           format === 'obj' || format === 'gltf' ? await primary.text() : await primary.arrayBuffer()
+        /*
+         * 先上传、再解析、最后一次性写进 store。
+         *
+         * 顺序很重要：几何体在重新打开工程时靠"按引用取回 + 重新解析"恢复，
+         * 所以文件必须先落到服务器，工程里才有可引用的文件名。
+         * 上传失败也要继续导入（用户至少能立刻看到模型），但引用留空并提示。
+         */
+        const uploaded = await this.uploadImportedFiles(primary, files)
         const root = await importStaticModel(data, format, resources)
         const report = analyzeModel(root)
         if (report.issues.some((issue) => issue.severity === 'error')) {
@@ -1863,7 +1996,8 @@ export default {
         const asset = {
           format,
           sourceName: primary.name,
-          report
+          report,
+          ...(uploaded ? { files: uploaded } : {})
         }
         const object = {
           ...createSceneObject('box', this.objects),
@@ -1873,18 +2007,284 @@ export default {
           previewQuality: 'original',
           exportQuality: 'original'
         }
+        // 走 edit()：进撤销栈，并让"未保存"标记生效。
         this.edit((scene) => ({ ...scene, objects: [...scene.objects, object] }))
         this.importedModels.set(object.id, root)
         this.$store.commit('setSelection', [object.id])
-        this.$store.dispatch('notify', {
-          kind: report.triangleCount > 500_000 ? 'info' : 'success',
-          message: `已导入 ${primary.name}，共 ${report.triangleCount.toLocaleString()} 个三角面。`
-        })
+        if (!uploaded) {
+          this.$store.dispatch('notify', {
+            kind: 'info',
+            message: `已导入 ${primary.name}，但模型文件上传失败——重新打开工程后需要重新导入。`
+          })
+        } else {
+          this.$store.dispatch('notify', {
+            kind: report.triangleCount > 500_000 ? 'info' : 'success',
+            message: `已导入 ${primary.name}，共 ${report.triangleCount.toLocaleString()} 个三角面。`
+          })
+        }
       } catch (error) {
         this.$store.dispatch('notify', { kind: 'error', message: `导入失败：${error.message}` })
       } finally {
         this.$store.commit('setBusy', false)
       }
+    },
+
+    // ------------------------------------------------------------------
+    // 人台姿势（关节参数）
+    // ------------------------------------------------------------------
+
+    /**
+     * 改一个关节的一个轴的角度。
+     *
+     * 合并逻辑放在 `core/mannequin.js` 的 `applyJointAngle()` 里：限位、
+     * 以及"必须把该关节记进 manualJoints"（否则会被动作预设盖住，
+     * 拖了滑块画面却不动）这两条都在那里统一处理，这里只管写进工程。
+     */
+    updateJointAngle({ id, jointId, axis, value }) {
+      this.edit((scene) => ({
+        ...scene,
+        objects: scene.objects.map((object) => {
+          if (object.id !== id || !object.mannequin) return object
+          const patch = applyJointAngle(object.mannequin, jointId, axis, value)
+          if (!patch) return object
+          return { ...object, mannequin: { ...object.mannequin, ...patch } }
+        })
+      }))
+    },
+
+    /** 重置姿势：回到预设姿势（选了预设时）或中立姿势，并清空手动覆盖。 */
+    resetMannequinPose({ id }) {
+      this.edit((scene) => ({
+        ...scene,
+        objects: scene.objects.map((object) => {
+          if (object.id !== id || !object.mannequin) return object
+          return {
+            ...object,
+            mannequin: { ...object.mannequin, ...resetMannequinPose(object.mannequin) }
+          }
+        })
+      }))
+    },
+
+    // ------------------------------------------------------------------
+    // 姿势库（保存 / 应用 / 更新 / 删除自定义姿势）
+    // ------------------------------------------------------------------
+    /*
+     * 库条目是**工程内容**（写在 `scene.poseLibrary`），所以全部走 `edit()`：
+     * 进撤销栈、点亮"未保存修改"、随存盘一起进 `.block3d`。
+     * 名字净化、空名自动编号、深拷贝都在 `core/mannequin.js` 里，组件只管写。
+     */
+
+    /** 把当前整套关节角度命名保存进工程。 */
+    savePoseLibraryEntry({ id, name }) {
+      const object = this.objects.find((item) => item.id === id)
+      if (!object?.mannequin) return
+      const existingNames = (this.poseLibrary ?? []).map((entry) => entry.name)
+      const entry = createPoseLibraryEntry(name, object.mannequin.pose, { existingNames })
+      this.edit((scene) => ({
+        ...scene,
+        poseLibrary: [...(scene.poseLibrary ?? []), entry]
+      }))
+      this.$store.dispatch('notify', { kind: 'success', message: `已保存姿势「${entry.name}」` })
+    },
+
+    /** 把库里的姿势应用到人台（`presetId` 置 null、全部关节记为手动）。 */
+    applyPoseLibraryEntry({ id, entryId }) {
+      const object = this.objects.find((item) => item.id === id)
+      const entry = (this.poseLibrary ?? []).find((item) => item.id === entryId)
+      if (!object?.mannequin || !entry) return
+      const patch = applyLibraryPose(object.mannequin, entry)
+      if (!patch) return
+      this.edit((scene) => ({
+        ...scene,
+        objects: scene.objects.map((item) =>
+          item.id === id ? { ...item, mannequin: { ...item.mannequin, ...patch } } : item
+        )
+      }))
+    },
+
+    /** 用当前姿势覆盖同名条目（按 id 定位；名字不参与匹配，重名也各自独立）。 */
+    updatePoseLibraryEntry({ id, entryId }) {
+      const object = this.objects.find((item) => item.id === id)
+      if (!object?.mannequin) return
+      if (!(this.poseLibrary ?? []).some((entry) => entry.id === entryId)) return
+      const pose = sanitizeMannequinPose(object.mannequin.pose)
+      this.edit((scene) => ({
+        ...scene,
+        poseLibrary: (scene.poseLibrary ?? []).map((entry) =>
+          entry.id === entryId ? { ...entry, pose } : entry
+        )
+      }))
+    },
+
+    deletePoseLibraryEntry({ entryId }) {
+      if (!(this.poseLibrary ?? []).some((entry) => entry.id === entryId)) return
+      this.edit((scene) => ({
+        ...scene,
+        poseLibrary: (scene.poseLibrary ?? []).filter((entry) => entry.id !== entryId)
+      }))
+    },
+
+    // ------------------------------------------------------------------
+    // 镜像 / 对称
+    // ------------------------------------------------------------------
+
+    /**
+     * 把一侧四肢的角度镜像到另一侧。
+     *
+     * 数学（绕 x=0 平面镜像时 `(rx, ry, rz) → (rx, -ry, -rz)`）与
+     * "只处理四肢配对关节、不动 head/spine"的取舍都写在
+     * `core/mannequin.js` 的 `mirrorMannequinPose()` 里。
+     *
+     * 这里额外做一件事：把**两侧**的 8 个四肢关节都记进 `manualJoints`。
+     * 有动作预设时外观层只让 `manualJoints` 里的关节跟随 `pose`，
+     * 只记被覆盖的那一侧会让外观出现"左边跟预设、右边跟镜像"的错位。
+     */
+    mirrorPose({ id, fromSide }) {
+      const object = this.objects.find((item) => item.id === id)
+      if (!object?.mannequin) return
+      const from = fromSide === 'right' ? 'right' : 'left'
+      const to = from === 'left' ? 'right' : 'left'
+      const pose = mirrorMannequinPose(object.mannequin.pose, from, to)
+      const mirroredSides = MANNEQUIN_MIRROR_PAIRS.flatMap((pair) => [pair.left, pair.right])
+      const manualJoints = [...new Set([...(object.mannequin.manualJoints ?? []), ...mirroredSides])]
+      this.edit((scene) => ({
+        ...scene,
+        objects: scene.objects.map((item) =>
+          item.id === id
+            ? { ...item, mannequin: { ...item.mannequin, pose, manualJoints } }
+            : item
+        )
+      }))
+      this.$store.dispatch('notify', {
+        kind: 'success',
+        message: `已把${from === 'left' ? '左' : '右'}侧四肢镜像到${to === 'left' ? '左' : '右'}侧（头/躯干未改动）。`
+      })
+    },
+
+    // ------------------------------------------------------------------
+    // 关节关键帧通道
+    // ------------------------------------------------------------------
+
+    /**
+     * 在播放头时刻给这个物体的姿势打帧。
+     *
+     * `jointIds` 为 null/空 → 全部关节；只给一个关节 → 那个关节单独一条通道。
+     *
+     * 三个复用点（不另造一套）：
+     * 1. 关键时刻对齐到 `TIMELINE_FRAME_RATE` 的帧格上（`timeToFrameIndex` /
+     *    `frameIndexToTime`）：播放头是连续拖动的，1.0208s 与 1.0417s 留两条帧
+     *    毫无意义；对齐后"同一帧再点一次"就天然是覆盖；
+     * 2. id 用 `createId()`，与手动打帧、自动打帧、复制帧完全一致；
+     * 3. 同刻覆盖走 `core/auto-key.js` 的 `upsertObjectKeyframe`，
+     *    与自动关键帧共用同一条写入规则。
+     *
+     * 刻意**不用** `findAvailableTimelineTime`：它的作用是"给新标记让开一个
+     * 不重叠的时刻"，而这里要的恰恰是"就在这一帧覆盖"。让开反而会造出
+     * 两条几乎同刻的帧（正是要避免的情况）。复制关键帧那条路径仍然用它。
+     */
+    recordPoseKeyframe({ id, jointIds }) {
+      const object = this.objects.find((item) => item.id === id)
+      if (!object?.mannequin) return
+      const duration = this.timeline?.durationSeconds ?? 0
+      // 对齐到帧格：拖播放头得到的 1.0208s 会落到第 25 帧（1.0417s）
+      const timeSeconds = frameIndexToTime(timeToFrameIndex(this.timelineTime, duration), duration)
+      const keyframeId = createId()
+      const ids = Array.isArray(jointIds) && jointIds.length > 0 ? jointIds : null
+      this.edit((scene) => {
+        const result = writeMannequinPoseKeyframe(scene.timeline.objectKeyframes, {
+          id: keyframeId,
+          objectId: object.id,
+          timeSeconds,
+          interpolation: 'smooth',
+          transform: buildObjectTransform(object),
+          pose: object.mannequin.pose,
+          jointIds: ids,
+          presetId: object.mannequin.presetId,
+          manualJoints: object.mannequin.manualJoints
+        })
+        return {
+          ...scene,
+          timeline: { ...scene.timeline, objectKeyframes: result.keyframes }
+        }
+      })
+      const existing = this.timeline.objectKeyframes.find(
+        (item) => item.objectId === object.id && Math.abs(item.timeSeconds - timeSeconds) < 1e-6
+      )
+      this.$store.commit('setSelectedKeyframeId', existing ? existing.id : keyframeId)
+      const at = timeSeconds.toFixed(2)
+      this.$store.dispatch('notify', {
+        kind: 'success',
+        message: ids ? `已在 ${at}s 为「${ids.join('、')}」打帧。` : `已在 ${at}s 为全部关节打帧。`
+      })
+    },
+
+    // ------------------------------------------------------------------
+    // 全景图背景
+    // ------------------------------------------------------------------
+
+    /**
+     * 改全景图参数（旋转 / 亮度 / 是否参与光照）。
+     *
+     * 参数是**工程数据**（会改变画面，进 `.block3d`），所以走 `edit()` 记历史；
+     * 图片文件本身不进来，只存文件名引用。
+     */
+    updateBackground(patch) {
+      this.edit((scene) => ({
+        ...scene,
+        background: { ...(scene.background || DEFAULT_BACKGROUND), ...patch }
+      }))
+    },
+
+    /**
+     * 上传全景图并把引用写进工程。
+     *
+     * 图片走 `exports/upload` 落到用户目录（二进制直传，不像 base64 那样膨胀 33%），
+     * 工程里只记文件名——几 MB 的图塞进 JSON 会让每次保存都重传一遍。
+     */
+    async uploadPanorama(file) {
+      if (!file) return
+      if (!/^image\/(png|jpeg|webp)$/i.test(file.type)) {
+        this.$store.dispatch('notify', {
+          kind: 'error',
+          message: '全景图需要是 PNG / JPEG / WebP 格式。'
+        })
+        return
+      }
+      this.$store.commit('setBusy', true)
+      try {
+        const result = await api.exports.upload(file.name || 'panorama.jpg', file)
+        const fileName = result.fileName
+        if (!fileName) throw new Error('上传未返回文件名。')
+        this.edit((scene) => ({
+          ...scene,
+          background: {
+            ...(scene.background || DEFAULT_BACKGROUND),
+            panoramaFileName: fileName,
+            panoramaSourceName: file.name || fileName
+          }
+        }))
+        this.$store.dispatch('notify', {
+          kind: 'success',
+          message: `已应用全景图背景：${file.name || fileName}`
+        })
+      } catch (error) {
+        this.$store.dispatch('notify', { kind: 'error', message: `全景图上传失败：${error.message}` })
+      } finally {
+        this.$store.commit('setBusy', false)
+      }
+    },
+
+    /** 移除全景图背景（只清引用，用户目录里的文件不动，避免误删导出）。 */
+    removePanorama() {
+      this.edit((scene) => ({
+        ...scene,
+        background: {
+          ...(scene.background || DEFAULT_BACKGROUND),
+          panoramaFileName: '',
+          panoramaSourceName: ''
+        }
+      }))
     },
 
     // ------------------------------------------------------------------

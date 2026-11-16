@@ -179,6 +179,167 @@ describe('findAvailableTimelineTime', () => {
   })
 })
 
+/**
+ * 关节关键帧通道：姿势按**关节**独立插值。
+ *
+ * 旧实现假设相邻关键帧有相同的关节集合（`Object.keys(previousPose).map`），
+ * 一旦某个关键帧只写了部分关节就直接抛异常 / 插出 undefined。这组断言锁住：
+ * 1. 全部帧都带完整姿势时，行为与旧实现**逐值相同**（向后兼容）；
+ * 2. 某关节缺帧时取"最近的已有值"，绝不产出 NaN / undefined；
+ * 3. 同刻帧不会除以 0；
+ * 4. 单个关节的通道不受其它关节缺帧影响。
+ */
+describe('关节关键帧通道', () => {
+  const jointKf = (id, time, pose, interpolation = 'smooth') => ({
+    id,
+    objectId: 'obj-1',
+    timeSeconds: time,
+    interpolation,
+    transform: {
+      ...transform(0),
+      mannequinPose: pose,
+      mannequinPresetId: 'stand',
+      mannequinManualJoints: []
+    }
+  })
+
+  const poseOf = (track) => track.get('obj-1').mannequinPose
+
+  it('全部关键帧都带完整姿势时与旧行为逐值一致（smoothstep 0.25 → 6.25）', () => {
+    const full = (y) => ({
+      head: { x: 0, y, z: 0 },
+      spine: { x: 0, y: 0, z: 0 },
+      leftShoulder: { x: 0, y: 0, z: 0 }
+    })
+    const tracks = evaluateObjectKeyframes([jointKf('a', 0, full(0)), jointKf('b', 2, full(40))], 0.5)
+    const pose = poseOf(tracks)
+    // smoothstep(0.25) = 3t²-2t³ = 0.15625 → 40 × 0.15625 = 6.25
+    expect(pose.head.y).toBeCloseTo(6.25, 6)
+    // 并集仍然只有这三个关节，没有凭空多出来的键
+    expect(Object.keys(pose).sort()).toEqual(['head', 'leftShoulder', 'spine'])
+  })
+
+  it('线性插值按比例推进', () => {
+    const pose = (y) => ({ head: { x: 0, y, z: 0 } })
+    const tracks = evaluateObjectKeyframes(
+      [jointKf('a', 0, pose(0), 'linear'), jointKf('b', 2, pose(40), 'linear')],
+      1
+    )
+    expect(poseOf(tracks).head.y).toBeCloseTo(20, 6)
+  })
+
+  it('只有一个关键帧时整个时间范围都返回它（不产出 NaN）', () => {
+    const tracks0 = evaluateObjectKeyframes([jointKf('a', 2, { head: { x: 1, y: 2, z: 3 } })], 0)
+    const tracks9 = evaluateObjectKeyframes([jointKf('a', 2, { head: { x: 1, y: 2, z: 3 } })], 9)
+    expect(poseOf(tracks0).head).toEqual({ x: 1, y: 2, z: 3 })
+    expect(poseOf(tracks9).head).toEqual({ x: 1, y: 2, z: 3 })
+  })
+
+  it('某关节只在一侧关键帧里定义时取最近的已有值（不插出 undefined）', () => {
+    const tracks = evaluateObjectKeyframes(
+      [
+        jointKf('a', 0, { head: { x: 0, y: 10, z: 0 } }),
+        jointKf('b', 2, { spine: { x: 0, y: 30, z: 0 } })
+      ],
+      1
+    )
+    const pose = poseOf(tracks)
+    // head 只在 a 里：保持 10；spine 只在 b 里：取 30（最近的已有值）
+    expect(pose.head.y).toBe(10)
+    expect(pose.spine.y).toBe(30)
+    expect(Object.values(pose.head).every(Number.isFinite)).toBe(true)
+    expect(Object.values(pose.spine).every(Number.isFinite)).toBe(true)
+  })
+
+  it('关节只在中间关键帧定义时，时间在它之前/之后也取它的值', () => {
+    const track = [
+      jointKf('a', 0, { spine: { x: 0, y: 0, z: 0 } }),
+      jointKf('b', 1, { spine: { x: 0, y: 0, z: 0 }, head: { x: 0, y: 45, z: 0 } }),
+      jointKf('c', 2, { spine: { x: 0, y: 40, z: 0 } })
+    ]
+    const before = poseOf(evaluateObjectKeyframes(track, 0.5))
+    const after = poseOf(evaluateObjectKeyframes(track, 1.5))
+    expect(before.head.y).toBe(45)
+    expect(after.head.y).toBe(45)
+    // spine 自己有 a→c 的完整通道，正常插值
+    expect(before.spine.y).toBeGreaterThanOrEqual(0)
+    expect(after.spine.y).toBeGreaterThan(0)
+  })
+
+  it('单关节通道不受其它关节缺帧影响（只给左臂打帧，其它关节照旧）', () => {
+    const track = [
+      jointKf('a', 0, { leftShoulder: { x: 0, y: 0, z: 0 }, spine: { x: 0, y: 0, z: 0 } }),
+      // 中间这一帧只给左臂打了帧
+      jointKf('b', 1, { leftShoulder: { x: 0, y: 90, z: 0 } }, 'linear'),
+      jointKf('c', 2, { leftShoulder: { x: 0, y: 0, z: 0 }, spine: { x: 0, y: 60, z: 0 } })
+    ]
+    const atHalf = poseOf(evaluateObjectKeyframes(track, 0.5))
+    // 左臂在 a→b 之间按线性插值：0 → 90 走一半 = 45
+    expect(atHalf.leftShoulder.y).toBeCloseTo(45, 6)
+    // 躯干自己 a→c 的通道：smoothstep(0.25) × 60 = 9.375
+    expect(atHalf.spine.y).toBeCloseTo(9.375, 6)
+  })
+
+  it('同刻帧不会除以 0（手改过的工程也不能产出 NaN）', () => {
+    const tracks = evaluateObjectKeyframes(
+      [
+        jointKf('a', 0, { head: { x: 0, y: 0, z: 0 } }),
+        jointKf('b', 1, { head: { x: 0, y: 20, z: 0 } }),
+        jointKf('c', 1, { head: { x: 0, y: 30, z: 0 } }),
+        jointKf('d', 2, { head: { x: 0, y: 40, z: 0 } })
+      ],
+      1
+    )
+    const value = poseOf(tracks).head.y
+    expect(Number.isFinite(value)).toBe(true)
+    expect(value).toBeGreaterThanOrEqual(20)
+    expect(value).toBeLessThanOrEqual(30)
+  })
+
+  it('关键帧里混进 NaN 时被忽略，不污染结果', () => {
+    const tracks = evaluateObjectKeyframes(
+      [
+        jointKf('a', 0, { head: { x: 0, y: 10, z: 0 } }),
+        jointKf('b', 1, { head: { x: Number.NaN, y: 20, z: 0 }, spine: { x: 0, y: 5, z: 0 } })
+      ],
+      0.5
+    )
+    const pose = poseOf(tracks)
+    // NaN 的那个轴被整条关节样本忽略 → head 退化成 a 的值 10
+    expect(pose.head.y).toBe(10)
+    expect(Number.isFinite(pose.spine.y)).toBe(true)
+  })
+
+  it('预览叠加把关键帧姿势合并到工程姿势上（其它关节不会被清空）', () => {
+    const objects = [
+      {
+        id: 'obj-1',
+        kind: 'mannequin',
+        position: { x: 0, y: 0, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        size: { x: 1, y: 1, z: 1 },
+        mannequin: {
+          heightMeters: 1.75,
+          presetId: 'stand',
+          manualJoints: [],
+          pose: {
+            head: { x: 0, y: 0, z: 0 },
+            spine: { x: 11, y: 12, z: 13 },
+            leftKnee: { x: 44, y: 0, z: 0 }
+          }
+        }
+      }
+    ]
+    const tracks = evaluateObjectKeyframes([jointKf('a', 0, { head: { x: 0, y: 45, z: 0 } })], 0)
+    const preview = applyObjectKeyframePreview(objects, tracks)
+    // 关键帧只定义了 head：它被覆盖
+    expect(preview[0].mannequin.pose.head.y).toBe(45)
+    // 其它关节仍然用工程里当前的姿势（旧实现会直接把它们清空 → 人物塌掉）
+    expect(preview[0].mannequin.pose.spine).toEqual({ x: 11, y: 12, z: 13 })
+    expect(preview[0].mannequin.pose.leftKnee).toEqual({ x: 44, y: 0, z: 0 })
+  })
+})
+
 describe('evaluateTimelineAtTime', () => {
   it('同时返回相机与所有物体变换', () => {
     const timeline = {

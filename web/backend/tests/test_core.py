@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -237,6 +238,294 @@ def test_camera_target_binding_round_trips() -> None:
     migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
     assert migrated["scene"]["camera"]["targetObjectId"] == "box-1"
     assert migrated["scene"]["camera"]["lookAtEnabled"] is True
+
+
+def test_v15_project_gets_empty_background() -> None:
+    """v15 及更早的工程没有 background 字段，迁移后必须是"没有背景"。"""
+    raw = {
+        "name": "v15 工程",
+        "schemaVersion": 15,
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+            }
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["scene"]["background"] == {
+        "panoramaFileName": "",
+        "panoramaSourceName": "",
+        "rotateDegrees": 0,
+        "intensity": 1,
+        "affectsLighting": False,
+    }
+
+
+def test_background_round_trips_and_normalizes() -> None:
+    """全景图背景：只存文件名引用；旋转归一到 [0,360)、亮度截到 0~4。"""
+    raw = {
+        "name": "带背景",
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+            },
+            "background": {
+                "panoramaFileName": "pano-1.jpg",
+                "panoramaSourceName": "外景.jpg",
+                "rotateDegrees": -90,
+                "intensity": 9,
+                "affectsLighting": True,
+            },
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    background = migrated["scene"]["background"]
+    assert background["panoramaFileName"] == "pano-1.jpg"
+    assert background["panoramaSourceName"] == "外景.jpg"
+    assert background["rotateDegrees"] == 270  # -90 归一到 [0,360)
+    assert background["intensity"] == 4  # 截到上限
+    assert background["affectsLighting"] is True
+
+
+def test_broken_background_falls_back_to_empty() -> None:
+    """背景字段坏掉不该让整份工程打不开。"""
+    raw = {
+        "name": "坏背景",
+        "scene": {
+            "camera": {
+                "position": {"x": 1, "y": 2, "z": 3},
+                "target": {"x": 0, "y": 1, "z": 0},
+                "fovDegrees": 42,
+                "aspectWidth": 16,
+                "aspectHeight": 9,
+            },
+            "background": {"rotateDegrees": "不是数字", "intensity": "也不是"},
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["scene"]["background"]["panoramaFileName"] == ""
+    assert migrated["scene"]["background"]["rotateDegrees"] in (0, 0.0)
+
+
+def _imported_object(imported_asset: dict) -> dict:
+    """一个最小的导入模型物体（其余字段与前端 createSceneObject 一致）。"""
+    return {
+        "id": "imp-1",
+        "kind": "imported",
+        "name": "椅子.gltf",
+        "position": {"x": 0, "y": 1, "z": 0},
+        "rotation": {"x": 0, "y": 0, "z": 0},
+        "size": {"x": 1, "y": 1, "z": 1},
+        "color": "#c9cdd0",
+        "visible": True,
+        "locked": False,
+        "importedAsset": imported_asset,
+    }
+
+
+def _model_report() -> dict:
+    return {
+        "meshCount": 1,
+        "triangleCount": 12,
+        "materialCount": 1,
+        "textureCount": 0,
+        "cameraCount": 0,
+        "lightCount": 0,
+        "bounds": {"x": 1, "y": 1, "z": 1},
+        "issues": [],
+    }
+
+
+def _imported_camera() -> dict:
+    return {
+        "position": {"x": 1, "y": 2, "z": 3},
+        "target": {"x": 0, "y": 1, "z": 0},
+        "fovDegrees": 42,
+        "aspectWidth": 16,
+        "aspectHeight": 9,
+    }
+
+
+def test_v17_imported_asset_files_pass_through() -> None:
+    """v17 → v18：导入模型的 `files`（文件引用）必须原样透传。
+
+    这是"重新打开工程模型就没了"的核心：几何体靠 `files` 里的文件名重新下载
+    再解析恢复，所以后端一旦把字段吃掉，前端就算想恢复也无从下手。
+    """
+    raw = {
+        "name": "带导入模型的工程",
+        "schemaVersion": 17,
+        "scene": {
+            "objects": [
+                _imported_object(
+                    {
+                        "format": "gltf",
+                        "sourceName": "椅子.gltf",
+                        "report": _model_report(),
+                        "files": {
+                            "main": {"name": "椅子.gltf", "fileName": "椅子.gltf"},
+                            "resources": [
+                                {"name": "scene.bin", "fileName": "scene-1.bin"},
+                                {"name": "wood.png", "fileName": "wood.png"},
+                            ],
+                        },
+                    }
+                )
+            ],
+            "camera": _imported_camera(),
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["schemaVersion"] == 19
+    assert PROJECT_SCHEMA_VERSION == 19
+    objects = migrated["scene"]["objects"]
+    assert len(objects) == 1
+    asset = objects[0]["importedAsset"]
+    assert asset["format"] == "gltf"
+    assert asset["sourceName"] == "椅子.gltf"
+    assert asset["report"]["triangleCount"] == 12
+    # `name` 是模型内部引用的原始名，`fileName` 是服务端去重后的存储名，两个都要留。
+    assert asset["files"]["main"] == {"name": "椅子.gltf", "fileName": "椅子.gltf"}
+    assert asset["files"]["resources"] == [
+        {"name": "scene.bin", "fileName": "scene-1.bin"},
+        {"name": "wood.png", "fileName": "wood.png"},
+    ]
+
+
+def test_imported_asset_without_files_still_opens() -> None:
+    """没有文件引用的老工程必须照常打开（模型恢复不出来是预期的）。
+
+    回归点：`primaryData` / `encoding` 曾经是必填，而 Web 版从来不写这两个字段，
+    于是**整条导入物体在打开时被校验拒绝**——比"只剩占位方块"更糟。
+    """
+    raw = {
+        "name": "老导入工程",
+        "schemaVersion": 17,
+        "scene": {
+            "objects": [
+                _imported_object(
+                    {"format": "obj", "sourceName": "老模型.obj", "report": _model_report()}
+                )
+            ],
+            "camera": _imported_camera(),
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    objects = migrated["scene"]["objects"]
+    assert len(objects) == 1
+    asset = objects[0]["importedAsset"]
+    assert asset["sourceName"] == "老模型.obj"
+    assert asset.get("files") is None
+
+
+def test_electron_inline_imported_asset_still_valid() -> None:
+    """Electron 版把模型内嵌进工程（primaryData / encoding），这条路径不能被破坏。"""
+    raw = {
+        "name": "内嵌模型",
+        "scene": {
+            "objects": [
+                _imported_object(
+                    {
+                        "format": "glb",
+                        "sourceName": "内嵌.glb",
+                        "primaryData": "AAAA",
+                        "encoding": "base64",
+                        "report": _model_report(),
+                    }
+                )
+            ],
+            "camera": _imported_camera(),
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    asset = migrated["scene"]["objects"][0]["importedAsset"]
+    assert asset["primaryData"] == "AAAA"
+    assert asset["encoding"] == "base64"
+
+
+def test_v18_project_gets_empty_pose_library() -> None:
+    """v18 及更早的工程没有 `poseLibrary`，迁移后必须是空列表而不是缺字段。
+
+    缺字段会让前端到处判 `undefined`，而空列表是唯一确定的"还没存过姿势"。
+    """
+    raw = {"name": "v18 工程", "schemaVersion": 18, "scene": {"objects": []}}
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    assert migrated["schemaVersion"] == 19
+    assert migrated["scene"]["poseLibrary"] == []
+
+
+def test_pose_library_round_trips_and_fills_missing_joints() -> None:
+    """姿势库：名字/时间原样保留，关节表补齐成完整 10 关节。
+
+    补齐是必须的：应用库姿势时前端会把 `presetId` 置 null、全部关节都跟随
+    这份 pose，缺一个关节就会让那个部位掉回中立角度（"只有半条姿势生效"）。
+    """
+    raw = {
+        "name": "带姿势库的工程",
+        "schemaVersion": 18,
+        "scene": {
+            "poseLibrary": [
+                {
+                    "id": "pose-a",
+                    "name": "抱臂",
+                    "pose": {"head": {"x": 12, "y": -8, "z": 0}},
+                    "createdAt": "2026-11-11T08:00:00Z",
+                }
+            ]
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    library = migrated["scene"]["poseLibrary"]
+    assert len(library) == 1
+    entry = library[0]
+    assert entry["id"] == "pose-a"
+    assert entry["name"] == "抱臂"
+    assert entry["createdAt"] == "2026-11-11T08:00:00Z"
+    assert entry["pose"]["head"] == {"x": 12.0, "y": -8.0, "z": 0.0}
+    # 缺失关节补成 0，且**正好**是 MANNEQUIN_JOINT_IDS 这 10 个
+    assert set(entry["pose"].keys()) == {
+        "head",
+        "spine",
+        "leftShoulder",
+        "rightShoulder",
+        "leftElbow",
+        "rightElbow",
+        "leftHip",
+        "rightHip",
+        "leftKnee",
+        "rightKnee",
+    }
+    assert entry["pose"]["leftKnee"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+
+
+def test_broken_pose_library_entries_are_skipped() -> None:
+    """坏条目单独丢掉：缺 id / 重复 id / 不是对象，都不能让整份工程打不开。"""
+    raw = {
+        "name": "坏姿势库",
+        "scene": {
+            "poseLibrary": [
+                "不是对象",
+                {"name": "没有 id", "pose": {}},
+                {"id": "dup", "name": "第一条", "pose": {"head": {"x": 1, "y": 2, "z": 3}}},
+                {"id": "dup", "name": "重复 id", "pose": {"head": {"x": 9, "y": 9, "z": 9}}},
+                {"id": "good", "name": "", "pose": {"head": {"x": 4, "y": 5, "z": 6}}},
+            ]
+        },
+    }
+    migrated = migrate_document(raw, "0.22.0", "2026-01-01T00:00:00Z")
+    library = migrated["scene"]["poseLibrary"]
+    assert [entry["id"] for entry in library] == ["dup", "good"]
+    assert library[0]["name"] == "第一条"
+    assert library[1]["name"] == ""
+    assert library[1]["pose"]["head"] == {"x": 4.0, "y": 5.0, "z": 6.0}
 
 
 def test_v14_camera_defaults_look_at_enabled_to_true() -> None:
@@ -1266,3 +1555,241 @@ def test_ai_chat_writes_agent_log_on_config_error(tmp_path) -> None:
     assert entry["request"]["messages"][0]["content"] == "你好"
     assert entry["result"]["status"] == "error"
     assert "durationMs" in entry
+
+
+# ----------------------------------------------------------------------
+# 上游瞬时拒绝的重试 + 错误正文截断
+# ----------------------------------------------------------------------
+#
+# 背景：网关过载时会返回一个泛化的 400（AnthropicException + 400001
+# "rejected by an internal MaaS component"）。实测同一个字节完全相同的请求
+# 时而 200 时而 400，且把失败请求连发 10 次 10/10 成功——所以对这一个特征做
+# 一次退避重试是有意义的，而其它 400 绝不能重试。
+
+TRANSIENT_400_BODY = (
+    '{"error":{"message":"litellm.BadRequestError: AnthropicException - '
+    '{\\"error\\":{\\"type\\":\\"400001\\",\\"message\\":\\"The request is invalid: '
+    'the request was rejected by an internal MaaS component.\\"}}",'
+    '"type":"invalid_request_error","code":"400"}}'
+)
+
+
+def test_transient_error_detection() -> None:
+    from app.services.ai_service import looks_like_transient_upstream_error
+
+    # 命中：400 + 上游过载特征
+    assert looks_like_transient_upstream_error(400, TRANSIENT_400_BODY) is True
+    assert looks_like_transient_upstream_error(400, "… internal maas component …") is True
+    assert looks_like_transient_upstream_error(400, "AnthropicException") is True
+
+    # 不命中：其它 400（重试也没用，不能重试）
+    assert looks_like_transient_upstream_error(400, "invalid model name") is False
+    assert looks_like_transient_upstream_error(400, "invalid_api_key") is False
+    assert looks_like_transient_upstream_error(400, "") is False
+    # 不命中：不是 400
+    assert looks_like_transient_upstream_error(401, TRANSIENT_400_BODY) is False
+    assert looks_like_transient_upstream_error(500, TRANSIENT_400_BODY) is False
+    assert looks_like_transient_upstream_error(200, TRANSIENT_400_BODY) is False
+
+
+def test_retry_transient_upstream_recovers(monkeypatch) -> None:
+    """第一次瞬时 400、重试后 200 → 返回 200 且记下重试次数。"""
+    import asyncio
+
+    import httpx
+
+    from app.services import ai_service
+
+    monkeypatch.setattr(ai_service, "AI_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+
+    class FakeClient:
+        """初次响应由调用方传入，所以 FakeClient 的第一次 post 就是"重试"。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, headers=None, json=None):
+            self.calls += 1
+            return httpx.Response(200, text='{"ok":true}')
+
+    record = {}
+    client = FakeClient()
+    response = asyncio.run(
+        ai_service.AiService._retry_transient_upstream(
+            client,
+            httpx.Response(400, text=TRANSIENT_400_BODY),
+            "http://x/chat/completions",
+            {},
+            {},
+            time.perf_counter(),
+            record,
+        )
+    )
+    assert response.status_code == 200
+    assert client.calls == 1  # 初次响应已由调用方发出，这里只多打 1 次
+    assert record["transientRetries"] == 1
+    assert record["transientFinalStatus"] == 200
+
+
+def test_retry_transient_upstream_gives_up_after_max(monkeypatch) -> None:
+    """重试次数用尽后仍失败 → 原样返回最后一个响应，不无限重试。"""
+    import asyncio
+
+    import httpx
+
+    from app.services import ai_service
+
+    monkeypatch.setattr(ai_service, "AI_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, headers=None, json=None):
+            self.calls += 1
+            return httpx.Response(400, text=TRANSIENT_400_BODY)
+
+    record = {}
+    client = FakeClient()
+    response = asyncio.run(
+        ai_service.AiService._retry_transient_upstream(
+            client,
+            httpx.Response(400, text=TRANSIENT_400_BODY),
+            "http://x/chat/completions",
+            {},
+            {},
+            time.perf_counter(),
+            record,
+        )
+    )
+    assert response.status_code == 400
+    assert client.calls == ai_service.AI_TRANSIENT_RETRY_MAX
+    assert record["transientRetries"] == ai_service.AI_TRANSIENT_RETRY_MAX
+    assert record["transientFinalStatus"] == 400
+
+
+def test_retry_skips_non_transient_error(monkeypatch) -> None:
+    """普通 400（真正的参数错误）不重试——否则只是把失败拖慢一倍。"""
+    import asyncio
+
+    import httpx
+
+    from app.services import ai_service
+
+    monkeypatch.setattr(ai_service, "AI_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, headers=None, json=None):
+            self.calls += 1
+            return httpx.Response(200, text="{}")
+
+    client = FakeClient()
+    record = {}
+    response = asyncio.run(
+        ai_service.AiService._retry_transient_upstream(
+            client,
+            httpx.Response(400, text='{"error":{"message":"invalid model"}}'),
+            "http://x/chat/completions",
+            {},
+            {},
+            time.perf_counter(),
+            record,
+        )
+    )
+    assert response.status_code == 400
+    assert client.calls == 0
+    assert "transientRetries" not in record
+
+
+def test_retry_skips_success(monkeypatch) -> None:
+    """成功响应不该被重试。"""
+    import asyncio
+
+    import httpx
+
+    from app.services import ai_service
+
+    monkeypatch.setattr(ai_service, "AI_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+
+    class FakeClient:
+        calls = 0
+
+        async def post(self, url, headers=None, json=None):
+            FakeClient.calls += 1
+            return httpx.Response(200, text="{}")
+
+    response = asyncio.run(
+        ai_service.AiService._retry_transient_upstream(
+            FakeClient(), httpx.Response(200, text="{}"), "http://x", {}, {}, time.perf_counter(), {}
+        )
+    )
+    assert response.status_code == 200
+    assert FakeClient.calls == 0
+
+
+def test_retry_respects_time_budget(monkeypatch) -> None:
+    """已耗时超过预算就不再重试（慢失败再等一轮只会更糟）。"""
+    import asyncio
+
+    import httpx
+
+    from app.services import ai_service
+
+    monkeypatch.setattr(ai_service, "AI_TRANSIENT_RETRY_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(ai_service, "AI_TRANSIENT_RETRY_BUDGET_SECONDS", 0.0)
+
+    class FakeClient:
+        calls = 0
+
+        async def post(self, url, headers=None, json=None):
+            FakeClient.calls += 1
+            return httpx.Response(200, text="{}")
+
+    response = asyncio.run(
+        ai_service.AiService._retry_transient_upstream(
+            FakeClient(),
+            httpx.Response(400, text=TRANSIENT_400_BODY),
+            "http://x",
+            {},
+            {},
+            time.perf_counter(),
+            {},
+        )
+    )
+    assert response.status_code == 400
+    assert FakeClient.calls == 0
+
+
+def test_shorten_error_detail_keeps_head_and_tail() -> None:
+    """截断必须保留尾部：网关把结论（有没有 fallback）放在最后。"""
+    from app.services.ai_service import AI_ERROR_DETAIL_LIMIT, shorten_error_detail
+
+    assert AI_ERROR_DETAIL_LIMIT == 2000
+
+    # 短正文原样返回
+    assert shorten_error_detail("short") == "short"
+    assert shorten_error_detail(None) == ""
+    assert shorten_error_detail("  padded  ") == "padded"
+
+    # 长正文：长度受限，头尾都在
+    head = "HEAD-" + "a" * 3000
+    tail = "b" * 3000 + "-TAIL"
+    out = shorten_error_detail(head + tail)
+    assert len(out) <= AI_ERROR_DETAIL_LIMIT
+    assert out.startswith("HEAD-")
+    assert out.endswith("-TAIL")
+    assert "…" in out
+
+    # 旧实现（只取前 400 字符）会把这句丢掉，现在必须留住
+    real = (
+        '{"error":{"message":"litellm.BadRequestError: AnthropicException - '
+        '{\\"error\\":{\\"type\\":\\"400001\\"}}"}}' + " " * 500 +
+        "LiteLLM: model group 'deepseek-v4.1-flash' failed with the error above. "
+        "No fallback was attempted."
+    )
+    kept = shorten_error_detail(real)
+    assert "No fallback was attempted" in kept
+

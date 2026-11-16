@@ -1,6 +1,21 @@
 import { APP_VERSION } from './app-meta'
 
 /**
+ * schema 19：场景新增 `poseLibrary`（姿势库：命名保存的完整人台关节表）。
+ *
+ * Web 版把人台整套关节角度命名保存在工程里，随时一键切回。
+ * 本 Electron 版**只同步版本号与类型**，不实现姿势库界面；
+ * 打开 Web 版工程时该字段原样透传（`parseProjectDocument` 只校验
+ * objects / camera / lighting / timeline，其余字段不丢）。
+ *
+ * schema 18：导入模型在工程里新增 `importedAsset.files`（**文件引用**）。
+ *
+ * Web 版（`web/frontend/src/core/project-document.js`）把导入模型的主文件与
+ * 依赖资源上传到 `exports` 目录，工程里只记文件名，重新打开时按引用取回。
+ * 本 Electron 版仍然把模型内嵌进工程（`primaryData` / `encoding`），
+ * 这里**只同步版本号**，不改内嵌的读写路径，也不认识 `files`——
+ * 打开 Web 版工程时该物体仍然只保留 format / sourceName / report。
+ *
  * schema 15：相机新增 `lookAtEnabled`（看向绑定是否启用）。
  *
  * schema 14：相机新增可空的 `targetObjectId`（把看向点绑定到某个物体并跟随）。
@@ -9,7 +24,7 @@ import { APP_VERSION } from './app-meta'
  * 与 `web/backend/app/models/project.py` 已经是 13（新增 `kind: 'path'` 导航线）。
  * 三端版本号必须一致，否则同一份工程在不同端的校验结果会分叉。
  */
-export const PROJECT_SCHEMA_VERSION = 15 as const
+export const PROJECT_SCHEMA_VERSION = 19 as const
 export const PROJECT_EXTENSION = 'block3d'
 
 export type PrimitiveKind =
@@ -211,6 +226,19 @@ export interface TimelineState {
   objectKeyframes: ObjectKeyframeNode[]
 }
 
+/**
+ * 姿势库条目（schema 19）。
+ *
+ * `pose` 是**完整**关节表：应用时 `presetId` 会被置为 null、全部关节都由这份
+ * pose 驱动，缺一个关节就会让那个部位掉回中立角度。
+ */
+export interface PoseLibraryEntry {
+  id: string
+  name: string
+  pose: MannequinPose
+  createdAt: string
+}
+
 export const DEFAULT_CAMERA: CameraState = {
   position: { x: 7.5, y: 5.5, z: 8.5 },
   target: { x: 0, y: 1, z: 0 },
@@ -255,6 +283,8 @@ export interface ProjectDocument {
     camera: CameraState
     lighting: SceneLightingState
     timeline: TimelineState
+    /** schema 19：姿势库。缺省视为空（v18 及更早的工程没有这个字段）。 */
+    poseLibrary?: PoseLibraryEntry[]
   }
 }
 
@@ -264,6 +294,7 @@ export interface ProjectContentInput {
   camera: CameraState
   lighting: SceneLightingState
   timeline: TimelineState
+  poseLibrary?: PoseLibraryEntry[]
 }
 
 export function createProjectDocument(input: ProjectContentInput): ProjectDocument {
@@ -276,7 +307,8 @@ export function createProjectDocument(input: ProjectContentInput): ProjectDocume
       objects: input.objects,
       camera: input.camera,
       lighting: input.lighting,
-      timeline: input.timeline
+      timeline: input.timeline,
+      poseLibrary: input.poseLibrary ?? []
     }
   }
 }

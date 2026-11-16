@@ -112,6 +112,43 @@ function textToBase64(text) {
 }
 
 /**
+ * 依赖资源该按二进制读、还是按文本读。
+ *
+ * 这条规则同时决定两件事，所以必须只有一份：
+ * 1. 导入时怎么读用户选中的文件（`Editor.handleModelFiles`）；
+ * 2. 重新打开工程时怎么从 `/api/exports/<fileName>` 取回依赖（`SceneViewport`）。
+ *
+ * 纹理必须按二进制读：GLTFLoader 走 `fetch` → `blob()` → `createImageBitmap`，
+ * 传进去的字符串会被当成文本编码，图片字节被破坏（表现为纹理全黑/加载失败）。
+ * 只有 `.gltf` / `.obj` / `.mtl` 这类才是文本。
+ */
+const BINARY_ASSET_EXTENSIONS = new Set([
+  'bin',
+  'glb',
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
+  'gif',
+  'bmp',
+  'avif',
+  'tga',
+  'hdr',
+  'exr',
+  'ktx2',
+  'basis',
+  'dds'
+])
+
+export function isBinaryAssetName(name) {
+  const extension = String(name || '')
+    .toLowerCase()
+    .split('.')
+    .pop()
+  return BINARY_ASSET_EXTENSIONS.has(extension)
+}
+
+/**
  * 导入静态模型。
  *
  * @param {ArrayBuffer|string} data 主文件内容

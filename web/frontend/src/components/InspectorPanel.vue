@@ -146,7 +146,13 @@
           <p class="section-title">人台</p>
           <label class="field">
             <span class="field__label">动作</span>
-            <select class="select" :value="object.mannequin.presetId" @change="preset($event)">
+            <select class="select" :value="presetValue" @change="preset($event)">
+              <!--
+                `presetId === null` 表示"没有动作预设"（应用姿势库 / 手摆姿势后就是这个状态）。
+                没有这一项时下拉框会显示第一个预设（站立），而数据是 null——
+                用户会以为"我明明选的是站立"，其实外观完全由手动关节驱动。
+              -->
+              <option v-if="!object.mannequin.presetId" value="">自定义姿势</option>
               <option v-for="item in presets" :key="item.id" :value="item.id">{{ item.label }}</option>
             </select>
           </label>
@@ -162,6 +168,169 @@
               @change="$emit('update-height', { id: object.id, heightMeters: Number($event.target.value) })"
             />
           </label>
+        </div>
+
+        <!--
+          姿势参数面板（Live2D / VTube 那种"一条参数一根滑块"）。
+
+          每个关节三个轴 —— 与 MANNEQUIN_JOINTS 的 limits 一一对应，
+          滑块范围直接取限位，所以不可能拖出反折的角度。
+        -->
+        <div v-if="object.mannequin" class="panel__section pose-panel">
+          <div class="pose-panel__head">
+            <p class="section-title">姿势（关节参数）</p>
+            <div class="pose-panel__actions">
+              <button
+                type="button"
+                class="mini-btn pose-keyframe-all"
+                title="在当前播放头时刻为这个物体的全部关节插入（或覆盖）姿势关键帧"
+                @click="$emit('keyframe-pose', { id: object.id, jointIds: null })"
+              >
+                为全部关节打帧
+              </button>
+              <button
+                type="button"
+                class="mini-btn"
+                title="回到预设姿势（没有预设则回到中立姿势）"
+                @click="$emit('reset-mannequin-pose', { id: object.id })"
+              >
+                重置全部
+              </button>
+            </div>
+          </div>
+
+          <!--
+            一键镜像：把一侧四肢的角度**对称**到另一侧。
+
+            只处理四肢配对关节（肩/肘/髋/膝），不动 `head` / `spine`：
+            用户自己扭过的躯干是刻意摆的，一键镜像把它一起改掉反而更意外。
+            取舍与数学推导见 core/mannequin.js 的 mirrorMannequinPose()。
+          -->
+          <div class="pose-mirror">
+            <span class="pose-mirror__label">左右镜像</span>
+            <button
+              type="button"
+              class="mini-btn pose-mirror__left"
+              title="把左侧四肢的角度镜像到右侧（头/躯干保持不动）"
+              @click="$emit('mirror-pose', { id: object.id, fromSide: 'left' })"
+            >
+              左 → 右
+            </button>
+            <button
+              type="button"
+              class="mini-btn pose-mirror__right"
+              title="把右侧四肢的角度镜像到左侧（头/躯干保持不动）"
+              @click="$emit('mirror-pose', { id: object.id, fromSide: 'right' })"
+            >
+              右 → 左
+            </button>
+          </div>
+
+          <!--
+            姿势库：把当前整套关节角度命名保存，随时切回。
+
+            名字用**内联输入框**而不是 window.prompt：prompt 是浏览器原生模态，
+            自动化测试驱动不了，用户也没法一边看着画面一边想名字。
+          -->
+          <div class="pose-library">
+            <p class="pose-library__title">姿势库</p>
+            <div class="pose-library__save">
+              <input
+                v-model="poseName"
+                class="input pose-library__input"
+                type="text"
+                :maxlength="poseNameMaxLength"
+                placeholder="给当前姿势起个名字"
+                @keyup.enter="savePose"
+              />
+              <button type="button" class="mini-btn pose-library__save-btn" @click="savePose">
+                保存当前姿势
+              </button>
+            </div>
+            <p v-if="poseLibrary.length === 0" class="pose-library__empty">
+              还没有保存过姿势。调好关节角度、起个名字保存，随时可以切回来。
+            </p>
+            <div v-else class="pose-library__list">
+              <div v-for="entry in poseLibrary" :key="entry.id" class="pose-library__entry">
+                <span class="pose-library__entry-name" :title="entry.name || '未命名姿势'">
+                  {{ entry.name || '未命名姿势' }}
+                </span>
+                <button
+                  type="button"
+                  class="mini-btn pose-library__apply"
+                  title="把这个姿势应用到当前人台"
+                  @click="applyPoseEntry(entry)"
+                >
+                  应用
+                </button>
+                <button
+                  type="button"
+                  class="mini-btn pose-library__update"
+                  title="用当前姿势覆盖这一条"
+                  @click="updatePoseEntry(entry)"
+                >
+                  更新为当前
+                </button>
+                <button
+                  type="button"
+                  class="mini-btn pose-library__delete"
+                  title="从工程里删掉这一条"
+                  @click="deletePoseEntry(entry)"
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div v-for="group in jointGroups" :key="group.label" class="pose-group">
+            <p class="pose-group__title">{{ group.label }}</p>
+            <div v-for="joint in group.joints" :key="joint.id" class="pose-joint">
+              <div class="pose-joint__head">
+                <span class="pose-joint__label">{{ joint.label }}</span>
+                <span class="pose-joint__tools">
+                  <!--
+                    逐关节打帧：只把这个关节写进当前时刻的关键帧，
+                    其它关节的通道不受影响——"只动画左臂"就是这么来的。
+                  -->
+                  <button
+                    type="button"
+                    class="mini-btn pose-joint__key"
+                    :title="`在当前时刻为「${joint.label}」插入（或覆盖）关键帧`"
+                    @click="keyframeJoint(joint.id)"
+                  >
+                    打帧
+                  </button>
+                  <span
+                    class="pose-joint__overridden"
+                    :class="{ 'is-on': isManuallyPosed(joint.id) }"
+                    :title="isManuallyPosed(joint.id) ? '已手动调整（会覆盖动作预设）' : '跟随动作预设'"
+                  >
+                    {{ isManuallyPosed(joint.id) ? '手动' : '预设' }}
+                  </span>
+                </span>
+              </div>
+              <label v-for="axis in jointAxes" :key="axis.key" class="pose-axis">
+                <span class="pose-axis__name" :title="axis.title">{{ axis.label }}</span>
+                <input
+                  class="pose-axis__range"
+                  type="range"
+                  :min="joint.limits[axis.key][0]"
+                  :max="joint.limits[axis.key][1]"
+                  step="1"
+                  :value="jointAngle(joint.id, axis.key)"
+                  :disabled="isAxisLocked(joint, axis.key)"
+                  :title="`${joint.label} ${axis.label}：${joint.limits[axis.key][0]}° ~ ${joint.limits[axis.key][1]}°`"
+                  @input="changeJoint(joint.id, axis.key, $event.target.value)"
+                />
+                <span class="pose-axis__value">{{ round(jointAngle(joint.id, axis.key)) }}°</span>
+              </label>
+            </div>
+          </div>
+          <p class="field-hint">
+            拖动即实时预览。手动调过的关节会显示「手动」，并覆盖上方选择的动作预设；
+            点「重置全部」可回到预设姿势。
+          </p>
         </div>
 
         <div v-if="object.kind === 'imported' && object.importedAsset" class="panel__section">
@@ -631,6 +800,78 @@
         </div>
 
         <div class="panel__section">
+          <p class="section-title">全景图背景</p>
+          <!--
+            全景图当天空盒贴到场景四周，任何机位都像"站在那张图里"。
+            图走 exports/upload 落到用户目录，工程里只记文件名。
+          -->
+          <div v-if="background.panoramaFileName" class="panorama-row">
+            <span
+              class="bind-chip"
+              :title="`来自 ${background.panoramaSourceName || background.panoramaFileName}`"
+            >
+              <span class="bind-chip__icon" aria-hidden="true">◉</span>
+              {{ background.panoramaSourceName || background.panoramaFileName }}
+            </span>
+            <button type="button" class="mini-btn" title="移除背景" @click="$emit('remove-panorama')">
+              移除
+            </button>
+          </div>
+          <div class="btn-grid">
+            <button type="button" class="btn" @click="pickPanorama">
+              {{ background.panoramaFileName ? '更换全景图…' : '选择全景图…' }}
+            </button>
+          </div>
+
+          <label class="field">
+            <span class="field__label">水平旋转</span>
+            <input
+              class="input"
+              type="range"
+              min="0"
+              max="360"
+              step="1"
+              :value="background.rotateDegrees"
+              @input="patchBackground({ rotateDegrees: Number($event.target.value) })"
+            />
+            <span class="focal-unit">{{ round(background.rotateDegrees) }}°</span>
+          </label>
+
+          <label class="field">
+            <span class="field__label">背景亮度</span>
+            <input
+              class="input"
+              type="number"
+              min="0"
+              max="4"
+              step="0.1"
+              :value="round(background.intensity)"
+              @change="patchBackground({ intensity: Number($event.target.value) })"
+            />
+          </label>
+
+          <label class="checkbox">
+            <input
+              type="checkbox"
+              :checked="background.affectsLighting"
+              @change="patchBackground({ affectsLighting: $event.target.checked })"
+            />
+            同时作为环境光照（IBL）
+          </label>
+          <p class="field-hint">
+            推荐 <b>2:1 等距圆柱</b>全景图（如 4096×2048）。也可以直接把图片拖到视口里。
+            开启"环境光照"会让物体染上全景图的色调，想要真实感再打开。
+          </p>
+          <input
+            ref="panoramaInput"
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            class="hidden-input"
+            @change="handlePanoramaFile"
+          />
+        </div>
+
+        <div class="panel__section">
           <p class="section-title">添加灯光</p>
           <div class="btn-grid">
             <button type="button" class="btn" @click="$emit('add-light', 'sun')">日光</button>
@@ -651,7 +892,7 @@
  * 数值输入统一用 `change` 而不是 `input`：拖拽或连续输入时不会每敲一个字符
  * 就往撤销栈压一帧，避免 Ctrl+Z 需要按很多次。
  */
-import { MANNEQUIN_PRESETS } from '@/core/mannequin'
+import { MANNEQUIN_PRESETS, POSE_LIBRARY_NAME_MAX_LENGTH, mannequinJointGroups } from '@/core/mannequin'
 import { ASPECT_PRESETS, LIGHT_KIND_LABELS } from '@/core/project-document'
 import {
   FOCAL_LENGTH_PRESETS,
@@ -685,6 +926,8 @@ export default {
     object: { type: Object, default: null },
     light: { type: Object, default: null },
     camera: { type: Object, required: true },
+    /** 全景图背景配置（`scene.background`），见 core/project-document.js。 */
+    background: { type: Object, default: () => ({}) },
     paintColor: { type: String, default: '#ff6b6b' },
     paintScope: { type: String, default: 'object' },
     /** 场景里所有导航线对象（供"绑定到导航线"下拉框使用）。 */
@@ -696,7 +939,9 @@ export default {
     /** 当前选中的导航线节点索引（仅当 object 是 path 时有意义）。 */
     selectedNodeIndex: { type: Number, default: null },
     /** 场景全部物体：相机"看向"绑定需要从中找被绑物体，也用于拖放校验。 */
-    objects: { type: Array, default: () => [] }
+    objects: { type: Array, default: () => [] },
+    /** 姿势库（`scene.poseLibrary`），见 core/mannequin.js。 */
+    poseLibrary: { type: Array, default: () => [] }
   },
 
   data() {
@@ -704,6 +949,16 @@ export default {
       activeTab: 'props',
       axes: ['x', 'y', 'z'],
       presets: MANNEQUIN_PRESETS,
+      /** 「保存当前姿势」输入框的内容。由组件自己持有，保存后清空。 */
+      poseName: '',
+      /** 与 core/mannequin.js 的截断长度保持一致，避免输入框允许打出保存不了的名字。 */
+      poseNameMaxLength: POSE_LIBRARY_NAME_MAX_LENGTH,
+      /** 姿势面板的三个旋转轴（label 用于界面显示，key 对应 pose 里的字段）。 */
+      jointAxes: [
+        { key: 'x', label: 'X', title: '前后俯仰' },
+        { key: 'y', label: 'Y', title: '左右扭转' },
+        { key: 'z', label: 'Z', title: '侧向摆动' }
+      ],
       aspectPresets: ASPECT_PRESETS,
       lightKinds: LIGHT_KIND_LABELS,
       paintPalette: ['#ff6b6b', '#ffb020', '#37c98b', '#2f7cf6', '#9b7bf6', '#e9eef1', '#6a747b'],
@@ -716,6 +971,10 @@ export default {
   },
 
   computed: {
+    /** 关节按身体部位分组（供姿势参数面板渲染）。 */
+    jointGroups() {
+      return mannequinJointGroups()
+    },
     /** 相机绑定的物体（未绑定或物体已删则为 null）。 */
     targetBoundObject() {
       const id = this.camera?.targetObjectId
@@ -834,6 +1093,53 @@ export default {
   },
 
   methods: {
+    /** 读某个关节某个轴当前的角度（没有数据时按 0，与中立姿势一致）。 */
+    jointAngle(jointId, axis) {
+      return this.object?.mannequin?.pose?.[jointId]?.[axis] ?? 0
+    },
+    /** 动作下拉框的当前值；`presetId` 为 null 时选「自定义姿势」。 */
+    presetValue() {
+      return this.object?.mannequin?.presetId || ''
+    },
+    /** 该关节是否被手动调整过（手动过的会覆盖动作预设）。 */
+    isManuallyPosed(jointId) {
+      return (this.object?.mannequin?.manualJoints ?? []).includes(jointId)
+    },
+    /**
+     * 限位上下界相同（如膝盖的 Y/Z 是 [0,0]）时滑块没有意义，
+     * 禁用掉而不是给一根拖不动的滑块——否则用户会以为界面坏了。
+     */
+    isAxisLocked(joint, axis) {
+      const limits = joint.limits[axis]
+      return limits[0] === limits[1]
+    },
+    changeJoint(jointId, axis, value) {
+      this.$emit('update-joint-angle', {
+        id: this.object.id,
+        jointId,
+        axis,
+        value: Number(value)
+      })
+    },
+    /** 保存当前整套关节角度为库条目。名字净化与默认名由 core/mannequin.js 决定。 */
+    savePose() {
+      this.$emit('save-pose', { id: this.object.id, name: this.poseName })
+      // 保存后清空输入框：下一次保存通常是另一个姿势，留着旧名字容易误覆盖。
+      this.poseName = ''
+    },
+    applyPoseEntry(entry) {
+      this.$emit('apply-library-pose', { id: this.object.id, entryId: entry.id })
+    },
+    updatePoseEntry(entry) {
+      this.$emit('update-library-pose', { id: this.object.id, entryId: entry.id })
+    },
+    deletePoseEntry(entry) {
+      this.$emit('delete-library-pose', { id: this.object.id, entryId: entry.id })
+    },
+    /** 只给一个关节打帧（`jointIds: [id]` 走通道粒度的路径）。 */
+    keyframeJoint(jointId) {
+      this.$emit('keyframe-pose', { id: this.object.id, jointIds: [jointId] })
+    },
     round(value) {
       return Math.round(value * 100) / 100
     },
@@ -877,7 +1183,10 @@ export default {
       this.$emit('update-camera', { [key]: { ...this.camera[key], [axis]: number } })
     },
     preset(event) {
-      this.$emit('apply-preset', { id: this.object.id, presetId: event.target.value })
+      const presetId = event.target.value
+      // 空值是上面那个「自定义姿势」占位项，不是可应用的动作。
+      if (!presetId) return
+      this.$emit('apply-preset', { id: this.object.id, presetId })
     },
     isAspect(preset) {
       return this.camera.aspectWidth === preset.width && this.camera.aspectHeight === preset.height
@@ -891,6 +1200,22 @@ export default {
      */
     applyAspect(preset) {
       this.$emit('update-camera', { aspectWidth: preset.width, aspectHeight: preset.height })
+    },
+    /** 打开全景图文件选择框。 */
+    pickPanorama() {
+      this.$refs.panoramaInput?.click()
+    },
+    /** 选中文件后交给父组件上传（面板不碰网络，见 docs/AI_DEV_GUIDE.md 的分层约定）。 */
+    handlePanoramaFile(event) {
+      const file = event.target.files?.[0]
+      // 必须清空 value：否则连续选同一个文件不会再触发 change。
+      event.target.value = ''
+      if (!file) return
+      this.$emit('upload-panorama', file)
+    },
+    /** 改背景参数（旋转 / 亮度 / 是否参与光照）。 */
+    patchBackground(patch) {
+      this.$emit('update-background', patch)
     },
     formatTime(value) {
       return `${(Math.max(Number(value) || 0, 0)).toFixed(2)}s`

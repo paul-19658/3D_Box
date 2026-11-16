@@ -6,6 +6,7 @@
 import {
   BASIC_KIND_NAMES,
   BASIC_KIND_SIZES,
+  DEFAULT_BACKGROUND,
   DEFAULT_CAMERA,
   DEFAULT_LIGHTING,
   DEFAULT_TIMELINE,
@@ -36,14 +37,21 @@ export function createSceneObject(kind, existing) {
 
 export function createMannequinSceneObject(existing, heightMeters = 1.75) {
   const count = existing.filter((object) => object.kind === 'mannequin').length
-  // 根节点在髋部：脚底 ≈ position.y - height/2，站地时 y 取身高一半。
+  /*
+   * 根节点在髋部（骨架的 0 点）：骨架包围盒是 -0.5 ~ +0.5，
+   * 所以站地时 y 取身高一半，脚底正好落在 0。
+   *
+   * `size` 三个分量**必须相等**：视口按 `root.scale.set(size.x, size.y, size.z)`
+   * 缩放，只改 y 会把人物竖直拉伸。骨架与外观都是"单位身高"模型，
+   * 等比放大到 heightMeters 才能保持人体比例。
+   */
   return {
     id: createId(),
     kind: 'mannequin',
     name: `人台 ${String(count + 1).padStart(2, '0')}`,
     position: { x: 0, y: heightMeters / 2, z: 0 },
     rotation: { x: 0, y: 0, z: 0 },
-    size: { x: 1, y: heightMeters, z: 1 },
+    size: { x: heightMeters, y: heightMeters, z: heightMeters },
     color: '#e8e6e1',
     visible: true,
     locked: false,
@@ -155,7 +163,10 @@ export function createInitialScene() {
     objects: [box],
     camera: JSON.parse(JSON.stringify(DEFAULT_CAMERA)),
     lighting: JSON.parse(JSON.stringify(DEFAULT_LIGHTING)),
-    timeline: JSON.parse(JSON.stringify(DEFAULT_TIMELINE))
+    timeline: JSON.parse(JSON.stringify(DEFAULT_TIMELINE)),
+    background: JSON.parse(JSON.stringify(DEFAULT_BACKGROUND)),
+    // 姿势库（schema 19）：新工程里还没有保存过任何自定义姿势。
+    poseLibrary: []
   }
 }
 

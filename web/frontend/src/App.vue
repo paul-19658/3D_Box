@@ -29,6 +29,13 @@
 </template>
 
 <script>
+import { KEYBINDING_ACTIONS, matchAction } from '@/core/keybindings'
+
+/** 通用动作里由外壳负责的那几个（工具键与播放归 Editor.vue）。 */
+const OWNED_GLOBAL_ACTIONS = KEYBINDING_ACTIONS.filter((action) =>
+  ['edit.undo', 'edit.redo', 'file.save'].includes(action.id)
+)
+
 /**
  * 应用外壳：只负责全局主题、通知与忙碌遮罩。
  * 具体业务界面在 views 下，避免这里变成第二个"巨型组件"。
@@ -45,6 +52,12 @@ export default {
     },
     busy() {
       return this.$store.state.busy
+    },
+    keybindings() {
+      return this.$store.state.keybindings
+    },
+    ownedGlobalActions() {
+      return OWNED_GLOBAL_ACTIONS
     }
   },
 
@@ -67,17 +80,25 @@ export default {
         target instanceof HTMLElement &&
         (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
 
-      const mod = event.ctrlKey || event.metaKey
-      if (mod && event.key.toLowerCase() === 'z' && !typing) {
-        event.preventDefault()
-        if (event.shiftKey) this.$store.commit('redoScene')
-        else this.$store.commit('undoScene')
-        return
-      }
-      if (mod && event.key.toLowerCase() === 's') {
+      /*
+       * 撤销 / 重做 / 保存走可配置注册表。
+       *
+       * 这里**只匹配本组件拥有的动作**：`Editor.vue` 也在监听 window 的
+       * keydown（工具键、播放）。两边都拿全量动作去匹配的话，同一个键会被
+       * 处理两次。各管各的，就不会互相抢。
+       */
+      const action = matchAction(this.keybindings, event, { actions: this.ownedGlobalActions })
+      if (!action) return
+      if (action.id === 'file.save') {
         event.preventDefault()
         this.$store.dispatch('saveProject', { saveAs: event.shiftKey })
+        return
       }
+      // 撤销/重做在读输入框时不该触发（用户可能只是想撤销输入的文字）。
+      if (typing) return
+      event.preventDefault()
+      if (action.id === 'edit.undo') this.$store.commit('undoScene')
+      if (action.id === 'edit.redo') this.$store.commit('redoScene')
     }
   }
 }

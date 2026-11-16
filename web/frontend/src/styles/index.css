@@ -396,6 +396,207 @@ a {
   color: var(--warn);
 }
 
+/*
+ * 姿势参数面板（Live2D / VTube 那种"一条参数一根滑块"）。
+ *
+ * 10 个关节 × 3 轴 = 30 根滑块，所以刻意做得紧凑：
+ * 关节名单独一行，三根轴各占一行的 12px 网格；数值右对齐定宽，
+ * 避免拖动时左右跳动。
+ */
+.pose-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pose-panel__head .section-title {
+  margin-bottom: 4px;
+}
+
+.pose-group {
+  margin: 6px 0 2px;
+}
+
+.pose-group__title {
+  margin: 0 0 2px;
+  color: var(--text-2);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.pose-joint {
+  margin-bottom: 6px;
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
+  background: var(--bg-2);
+}
+
+.pose-joint__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.pose-joint__label {
+  font-size: 12px;
+  color: var(--text-0);
+}
+
+.pose-joint__overridden {
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  color: var(--text-2);
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.pose-joint__overridden.is-on {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.pose-axis {
+  display: grid;
+  grid-template-columns: 12px 1fr 42px;
+  align-items: center;
+  gap: 6px;
+  height: 18px;
+}
+
+.pose-axis__name {
+  color: var(--text-2);
+  font-size: 10px;
+  text-align: center;
+}
+
+.pose-axis__range {
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.pose-axis__range:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.pose-axis__value {
+  color: var(--text-1);
+  font-size: 10px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ */
+/* 姿势面板里的扩展工具：打帧 / 镜像 / 姿势库                          */
+/* ------------------------------------------------------------------ */
+
+.pose-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 逐关节打帧按钮与「手动/预设」标记放在同一行右端。 */
+.pose-joint__tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pose-joint__key {
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+}
+
+/*
+ * 镜像一行。刻意放在打帧按钮下面、关节列表上面：
+ * 它是"对整套姿势的一次操作"，与逐关节的滑块不是同一层级。
+ */
+.pose-mirror {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 8px;
+}
+
+.pose-mirror__label {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.pose-library {
+  margin: 0 0 8px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+}
+
+.pose-library__title {
+  margin: 0 0 4px;
+  color: var(--text-2);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.pose-library__save {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pose-library__input {
+  flex: 1;
+  min-width: 0;
+}
+
+.pose-library__empty {
+  margin: 6px 0 0;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.pose-library__list {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/*
+ * 条目是四列：名字（可省略号）+ 三个按钮。
+ * 名字必须 `min-width: 0` + `text-overflow`，否则超长名字会把按钮挤到看不见。
+ */
+.pose-library__entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.pose-library__entry-name {
+  overflow: hidden;
+  color: var(--text-0);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pose-library__apply,
+.pose-library__update,
+.pose-library__delete {
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+}
+
 /* 焦距行：数值 + 单位 + 等效口径提示（提示不占输入宽度）。 */
 .focal-row {
   display: flex;
@@ -720,6 +921,19 @@ a {
   outline: none;
 }
 
+/*
+ * 拖拽建墙/地面时的实时尺寸标签。
+ *
+ * 用等宽数字（tabular-nums），否则数值每帧变化时标签宽度会抖动，
+ * 眼睛一直在跳，反而看不清尺寸变化。
+ */
+.hud-pill--measure {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
 .viewport-hud {
   position: absolute;
   top: 12px;
@@ -728,6 +942,37 @@ a {
   align-items: center;
   gap: 6px;
   pointer-events: none;
+}
+
+/*
+ * 把图片拖进视口 → 设为全景图背景时的提示。
+ *
+ * 用整块透明遮罩 + 居中文字：用户拖到视口上方就需要知道"松手会发生什么"，
+ * 没有反馈时很容易在半路松手或者以为不支持拖拽。
+ */
+.viewport.is-panorama-drop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 2px dashed var(--accent);
+  background: var(--accent-soft);
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.viewport-drop-hint {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 10px 18px;
+  border-radius: var(--radius-s);
+  background: var(--bg-1);
+  border: 1px solid var(--accent);
+  color: var(--accent-strong);
+  font-size: 13px;
+  pointer-events: none;
+  z-index: 5;
 }
 
 .hud-pill {

@@ -51,7 +51,7 @@ def main() -> int:
 
     meta = call("/api/meta")
     check("appName 中文未损坏", meta.get("appName") == "3D导演台 测试版", repr(meta.get("appName")))
-    check("schema 版本为 15", meta.get("projectSchemaVersion") == 15)
+    check("schema 版本为 19", meta.get("projectSchemaVersion") == 19)
     check(
         "serverMp4Encode 为布尔",
         isinstance(meta.get("serverMp4Encode"), bool),
@@ -65,7 +65,7 @@ def main() -> int:
     check("平台预设 5 条", len(profiles.get("profiles", [])) == 5)
 
     document = {
-        "schemaVersion": 15,
+        "schemaVersion": 19,
         "appVersion": "0.22.0",
         "savedAt": "2026-10-19T00:00:00Z",
         "name": "冒烟场景",
@@ -109,6 +109,15 @@ def main() -> int:
                 ]
             },
             "timeline": {"durationSeconds": 5, "cameraShots": [], "objectKeyframes": []},
+            # 姿势库（schema 19）：只带一个关节，验证后端会补齐成完整关节表。
+            "poseLibrary": [
+                {
+                    "id": "pose-1",
+                    "name": "冒烟姿势",
+                    "pose": {"head": {"x": 12, "y": -8, "z": 0}},
+                    "createdAt": "2026-10-19T00:00:00Z",
+                }
+            ],
         },
     }
 
@@ -124,6 +133,20 @@ def main() -> int:
 
     opened = call(f"/api/projects/{project_id}")
     check("打开后物体数量一致", len(opened.get("document", {}).get("scene", {}).get("objects", [])) == 1)
+    stored_library = opened.get("document", {}).get("scene", {}).get("poseLibrary") or []
+    check(
+        "姿势库存盘后读回（名字 + 完整关节表）",
+        len(stored_library) == 1
+        and stored_library[0].get("name") == "冒烟姿势"
+        and len(stored_library[0].get("pose") or {}) == 10
+        and stored_library[0]["pose"]["head"] == {"x": 12, "y": -8, "z": 0},
+        str(stored_library[:1]),
+    )
+    check(
+        "存盘文档 schema 版本为 19",
+        opened.get("document", {}).get("schemaVersion") == 19,
+        str(opened.get("document", {}).get("schemaVersion")),
+    )
 
     descriptor = call("/api/scene-descriptor", "POST", {"projectName": "冒烟场景", "scene": document["scene"]})
     check("场景说明 schemaVersion 为 2", descriptor.get("schemaVersion") == 2)

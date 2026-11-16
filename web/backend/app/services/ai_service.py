@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -173,6 +174,80 @@ def looks_like_tools_reasoning_conflict(detail: str) -> bool:
     return "reasoning_effort" in text and (
         "function tools" in text or "/v1/responses" in text or "responses" in text
     )
+
+
+# ----------------------------------------------------------------------
+# 上游"瞬时拒绝"的重试
+# ----------------------------------------------------------------------
+#
+# 背景（实测数据，来自 workspace/logs/2026-11-10.log）：
+#
+# 同一个**字节完全相同**的请求体发给网关，时而 200、时而 400：
+#
+#   请求                     重放 3 次            失败耗时        成功耗时
+#   7 条消息（含 tool_calls） 200 / 200 / 200      —             0.09~10.2s
+#   7 条消息                  400 / 400 / 200      0.70s / 0.81s  23.6s
+#   9 条消息                  400 / 200 / 200      0.75s          0.10~58.1s
+#   3 条消息                  200 / 200 / 200      —              0.06s
+#
+# 另外把失败请求连发 10 次，10/10 成功且每次仅 0.06~0.12s。
+#
+# 结论：**不是请求格式的问题**，是网关/上游过载后返回了一个泛化的 400
+# （`AnthropicException` + `400001` + "rejected by an internal MaaS component"）。
+# 所以对**这一个特征**做一次退避重试是有效的；其它 400（真正的参数/格式错误）
+# 绝不能重试，否则只是把失败拖慢一倍。
+
+# 追加尝试次数（1 = 总共最多 2 次）。实测偶有需要第 3 次才成功的情况，
+# 但这个值每加 1，最坏等待时间就翻一倍，先取 1。
+AI_TRANSIENT_RETRY_MAX = 1
+
+# 每次重试前的退避秒数。
+AI_TRANSIENT_RETRY_BACKOFF_SECONDS = 1.0
+
+# 重试的总时间预算（秒）。
+#
+# 失败尝试有时长达 23~58 秒（上游过载，先卡住再报错）。这种"慢失败"再重试一次
+# 大概率还是慢，用户会等两三分钟。所以一旦本次请求已耗时超过这个预算就不再重试，
+# 宁可早点把错误抛出来。快失败（<1 秒）才是重试能救回来的那种。
+AI_TRANSIENT_RETRY_BUDGET_SECONDS = 20.0
+
+# 上游错误正文里出现这些片段，才认定是"瞬时拒绝"。
+_TRANSIENT_UPSTREAM_MARKERS = (
+    "anthropicexception",
+    "internal maas component",
+)
+
+
+def looks_like_transient_upstream_error(status_code: int, detail: str) -> bool:
+    """判断这个响应是不是"上游瞬时拒绝"（可以安全重试）。
+
+    只认 400 + 特定特征串。真正的参数错误、鉴权失败、模型不存在都不在此列——
+    那些重试多少次都一样，重试只会让用户多等一轮。
+    """
+    if status_code != 400:
+        return False
+    text = (detail or "").lower()
+    return any(marker in text for marker in _TRANSIENT_UPSTREAM_MARKERS)
+
+
+# 上游错误正文保留的最大长度。
+AI_ERROR_DETAIL_LIMIT = 2000
+
+
+def shorten_error_detail(text: str, limit: int = AI_ERROR_DETAIL_LIMIT) -> str:
+    """把上游错误正文压到 `limit` 以内，**头尾都保留**。
+
+    只截头部是不够的：网关的报错常把结论放在最后，例如
+    `LiteLLM: model group 'x' failed with the error above. No fallback was attempted.`
+    截在 400 字符时正好切在 "failed with the " 处，最有用的一句（有没有配 fallback）
+    就丢了——这正是当初排查困难的原因。
+    """
+    body = (text or "").strip()
+    if len(body) <= limit:
+        return body
+    head = int(limit * 0.6)
+    tail = max(limit - head - 1, 0)
+    return f"{body[:head]}…{body[-tail:]}" if tail else body[:limit]
 
 
 def resolve_max_tokens(configured: int | None) -> int:
@@ -434,6 +509,7 @@ class AiService:
 
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
+                    request_started = time.perf_counter()
                     response = await client.post(url, headers=headers, json=body)
                     # 部分网关/新模型在 chat+tools 上仍会因 reasoning 默认值报 400，自动改走 Responses。
                     if (
@@ -460,6 +536,17 @@ class AiService:
                             "retriedAsResponses": True,
                         }
                         response = await client.post(url, headers=headers, json=body)
+
+                    # 上游瞬时拒绝（过载）→ 退避重试。判定见模块顶部说明。
+                    response = await self._retry_transient_upstream(
+                        client,
+                        response,
+                        url,
+                        headers,
+                        body,
+                        request_started,
+                        record=entry.get("upstream"),
+                    )
             except httpx.TimeoutException:
                 result = {"status": "error", "message": "AI 接口响应超时，请稍后重试。"}
                 return result
@@ -472,7 +559,8 @@ class AiService:
             entry["upstream"] = upstream
 
             if response.status_code >= 400:
-                detail = response.text[:400]
+                # 头尾都保留：网关常把结论放在末尾（例如有没有配 fallback）。
+                detail = shorten_error_detail(response.text)
                 upstream["errorBody"] = detail
                 result = {
                     "status": "error",
@@ -513,6 +601,42 @@ class AiService:
             entry["result"] = result
             entry["durationMs"] = int((time.perf_counter() - started) * 1000)
             write_agent_call_log(self.agent_log_dir, entry)
+
+    @staticmethod
+    async def _retry_transient_upstream(
+        client: httpx.AsyncClient,
+        response: httpx.Response,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        request_started: float,
+        record: Optional[dict[str, Any]] = None,
+    ) -> httpx.Response:
+        """上游"瞬时拒绝"时退避重试，返回最终响应。
+
+        只对 `looks_like_transient_upstream_error()` 认定的响应生效，
+        并且受时间预算约束——慢失败（上游卡了几十秒才报错）不再重试，
+        否则用户要等两三分钟才看到错误。
+
+        `record` 传入 `entry["upstream"]` 时会写入重试次数，便于事后从日志
+        分辨"偶发成功"与"上游一直不行"。
+
+        抽成独立方法是为了可单测：用假 client 就能验证"重试几次、什么条件下不重试"，
+        不必真的打网络。
+        """
+        attempts = 0
+        while (
+            attempts < AI_TRANSIENT_RETRY_MAX
+            and looks_like_transient_upstream_error(response.status_code, response.text)
+            and (time.perf_counter() - request_started) < AI_TRANSIENT_RETRY_BUDGET_SECONDS
+        ):
+            attempts += 1
+            await asyncio.sleep(AI_TRANSIENT_RETRY_BACKOFF_SECONDS)
+            response = await client.post(url, headers=headers, json=body)
+        if attempts and record is not None:
+            record["transientRetries"] = attempts
+            record["transientFinalStatus"] = response.status_code
+        return response
 
     @staticmethod
     def _prepare_messages(

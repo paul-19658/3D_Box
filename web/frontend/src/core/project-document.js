@@ -7,6 +7,68 @@
  */
 
 /**
+ * schema 19：场景新增 `poseLibrary`（姿势库）。
+ *
+ * 语义：用户把人台的整套关节角度命名保存下来，随时一键切回。
+ *
+ * ```json
+ * "poseLibrary": [
+ *   {
+ *     "id": "…",
+ *     "name": "抱臂",
+ *     "pose": { "head": { "x": 0, "y": 0, "z": 0 }, "…": {} },
+ *     "createdAt": "2026-11-11T08:00:00.000Z"
+ *   }
+ * ]
+ * ```
+ *
+ * 为什么放在**工程里**而不是浏览器本地存储：姿势是创作内容的一部分，
+ * 换台机器打开同一个工程必须还在；放 localStorage 会随缓存清理一起丢。
+ *
+ * `pose` 存的是**完整**关节表（10 个关节 × 3 轴），缺关节的条目在迁移时补齐，
+ * 因为应用姿势时 `presetId` 会被置 null、全部关节都由这份 pose 驱动，
+ * 缺一个关节就会让它掉回中立角度。
+ *
+ * 缺省（v18 及更早）没有这个字段 → 空数组，行为完全不变。
+ *
+ * schema 18：导入模型新增 `importedAsset.files`（文件引用）。
+ *
+ * 语义：导入的 glTF / OBJ 不再"只在内存里活着"。主文件与全部依赖资源
+ * （`.gltf` 的 `.bin` / 纹理、`.obj` 的 `.mtl` / 纹理）先走
+ * `POST /api/exports/upload` 落到用户目录，工程里只记**文件名引用**：
+ *
+ * ```json
+ * "files": {
+ *   "main": { "name": "椅子.gltf", "fileName": "椅子.gltf" },
+ *   "resources": [{ "name": "scene.bin", "fileName": "scene-1.bin" }]
+ * }
+ * ```
+ *
+ * - `name` 是模型**内部引用的原始名**（`.gltf` 的 `buffer.uri` / 纹理 `uri`、
+ *   `.obj` 的 `mtllib` 行）——重新解析时要按这个名字交回依赖；
+ * - `fileName` 是上传后的服务端文件名。服务端会去重重命名（同名加 `-1` / `-2`），
+ *   所以两者可能不同，取文件必须用 `fileName`。
+ *
+ * 为什么只存引用：模型动辄几十 MB，存 base64 会让**每次保存都重传一遍**、
+ * 撤销栈里也各留一份。缺省（v17 及更早）没有这个字段，
+ * 老工程照常打开，只是模型恢复不出来（当初也没存文件）。
+ *
+ * schema 17：修正人台比例。
+ *
+ * 两处修正（不新增字段，改的是既有字段的取值约定）：
+ * 1. 人台 `size` 三个分量统一为身高。以前存 `{ x: 1, y: 身高, z: 1 }`，
+ *    而视口按三个分量为根节点缩放 → 人物被竖直拉伸 1.75 倍（又细又长）。
+ * 2. 控制骨架的人体比例与包围盒基准修正为"脚底 -0.5、头顶 +0.5、总高 1"，
+ *    外观模型按同一基准归一化；以前两套基准不一致，髋关节比画出来的髋部
+ *    低了 13% 身高（≈24cm），脚底还陷进地面 8cm。
+ * 迁移时把老工程的人台 size 统一即可，其余字段不变。
+ *
+ * schema 16：场景新增 `background`（全景图背景）。
+ *
+ * 语义：把等距圆柱全景图当天空盒贴到场景四周，任何机位都像"站在那张图里"。
+ * 只存图片的**文件名引用**，图片本身走 `exports/upload` 落到用户目录。
+ * 缺省（v15 及更早）为"没有背景"，老工程行为不变。
+ *
  * schema 15：相机新增 `lookAtEnabled`（看向绑定是否启用）。
  *
  * 语义：`targetObjectId` 只记着"绑的是谁"，`lookAtEnabled` 决定这一刻用不用它。
@@ -18,7 +80,7 @@
  *
  * 一路上都是**只加字段、不改语义**，所以老工程永远能原样打开。
  */
-export const PROJECT_SCHEMA_VERSION = 15
+export const PROJECT_SCHEMA_VERSION = 19
 export const PROJECT_EXTENSION = 'block3d'
 
 /** 场景里可作为"物体"存在的类型。导航线也是物体，因此也在这里。 */
@@ -106,6 +168,37 @@ export const DEFAULT_TIMELINE = {
   durationSeconds: 5,
   cameraShots: [],
   objectKeyframes: []
+}
+
+/**
+ * 全景图背景（等距圆柱 / equirectangular）。
+ *
+ * 语义是"站在全景图里面"：把它当作天空盒贴到场景四周，任何机位都能看到，
+ * 成片预演与导出也一样。
+ *
+ * **只存引用，不存图本身**。全景图动辄几 MB，塞进工程 JSON 会：
+ * 每次保存都重传一遍、撤销栈里各留一份、AI 场景概况也跟着变肥。
+ * 所以图片走 `POST /api/exports/upload` 落到用户目录，
+ * 这里只记 `fileName`（取图地址是 `/api/exports/<fileName>`）。
+ *
+ * 字段全是原始类型（字符串 / 数字 / 布尔），三端校验都能写成一行。
+ */
+export const DEFAULT_BACKGROUND = {
+  /** 全景图文件名；空串表示没有背景。 */
+  panoramaFileName: '',
+  /** 上传时的原始文件名，只用于界面显示与"从哪来"的提示。 */
+  panoramaSourceName: '',
+  /** 水平旋转（度）：把全景图的"正前方"转到想要的方向。 */
+  rotateDegrees: 0,
+  /** 背景亮度，1 = 原始亮度。 */
+  intensity: 1,
+  /**
+   * 是否同时当环境光照（IBL）用。
+   *
+   * 默认关：全景图常常是"随便拍的参考环境"，直接拿来打光会把场景染成
+   * 图里的色调，用户往往只是想有个背景。要真实感再手动打开。
+   */
+  affectsLighting: false
 }
 
 /** 与固定场景光保持单一来源：视口渲染与光照描述都引用这里。 */
@@ -216,13 +309,29 @@ export function cloneVector(value) {
   return { x: value.x, y: value.y, z: value.z }
 }
 
-export function createProjectDocument({ name, objects, camera, lighting, timeline, appVersion }) {
+export function createProjectDocument({
+  name,
+  objects,
+  camera,
+  lighting,
+  timeline,
+  background,
+  poseLibrary,
+  appVersion
+}) {
   return {
     schemaVersion: PROJECT_SCHEMA_VERSION,
     appVersion: appVersion || '0.22.0',
     savedAt: new Date().toISOString(),
     name: (name || '').trim() || '未命名场景',
-    scene: { objects, camera, lighting, timeline }
+    scene: {
+      objects,
+      camera,
+      lighting,
+      timeline,
+      background: normalizeBackground(background),
+      poseLibrary: normalizePoseLibrary(poseLibrary)
+    }
   }
 }
 
@@ -289,6 +398,56 @@ function isPathBinding(value) {
 }
 
 /**
+ * 单个文件引用：`name`（模型内部引用的原始名）+ `fileName`（上传后的服务端文件名）。
+ *
+ * `fileName` 缺失就整条丢掉——没有文件名就没有可下载的东西，
+ * 留着只会在恢复时得到一次必然失败的请求。
+ * `name` 缺失时退回 `fileName`：至少 `.obj` 的 mtl 还能按文件名找回去。
+ */
+function normalizeImportedFileEntry(value) {
+  if (!isRecord(value)) return null
+  const fileName = typeof value.fileName === 'string' ? value.fileName.trim() : ''
+  if (!fileName) return null
+  const name = typeof value.name === 'string' && value.name.trim() ? value.name.trim() : fileName
+  return { name, fileName }
+}
+
+/**
+ * 导入模型的文件引用净化（schema 18）。
+ *
+ * 主文件缺失即视为"没有文件引用"（返回 null）：
+ * 老工程（v17 及更早）本来就没有这个字段，半损坏的引用也该落到同一条路径上——
+ * 模型恢复不出来，但工程必须照常打开。
+ */
+export function normalizeImportedFiles(value) {
+  if (!isRecord(value)) return null
+  const main = normalizeImportedFileEntry(value.main)
+  if (!main) return null
+  return {
+    main,
+    resources: Array.isArray(value.resources)
+      ? value.resources.map(normalizeImportedFileEntry).filter(Boolean)
+      : []
+  }
+}
+
+/**
+ * 导入模型记录的净化。
+ *
+ * 关键取舍：**引用坏了只丢 `files`，不丢整个 `importedAsset`**。
+ * 整个丢掉会让物体退化成"未知方块"——检查器里连"这是个导入模型、
+ * 原文件叫什么、多少面"都没了，用户更不知道自己丢了什么。
+ */
+function normalizeImportedAsset(value) {
+  if (!isRecord(value)) return null
+  const asset = { ...value }
+  const files = normalizeImportedFiles(asset.files)
+  if (files) asset.files = files
+  else delete asset.files
+  return asset
+}
+
+/**
  * 补齐单个物体的可选字段。
  *
  * 关键点：**path 对象的节点必须过一遍净化**。
@@ -309,6 +468,32 @@ function normalizeObject(object) {
   }
   if (next.pathBinding !== undefined && !isPathBinding(next.pathBinding)) {
     delete next.pathBinding
+  }
+  /*
+   * 导入模型的文件引用（schema 18）。
+   *
+   * 老工程（v17 及更早）的 `importedAsset` 只有 format / sourceName / report，
+   * 必须原样保留——模型恢复不出来是预期的，当初也没存文件。
+   */
+  if (next.importedAsset !== undefined) {
+    const asset = normalizeImportedAsset(next.importedAsset)
+    if (asset) next.importedAsset = asset
+    else delete next.importedAsset
+  }
+  /*
+   * 人台的 `size` 三个分量必须相等。
+   *
+   * schema 16 及更早的工程存的是 `{ x: 1, y: 身高, z: 1 }`，而视口按三个分量为
+   * 根节点缩放，等于把人物竖直拉伸 1.75 倍（看起来又细又长）。
+   * 这里按 `mannequin.heightMeters`（缺省用 size.y）统一，老工程一打开就修好。
+   */
+  if (next.kind === 'mannequin') {
+    const height = isFiniteNumber(next.mannequin?.heightMeters)
+      ? next.mannequin.heightMeters
+      : isFiniteNumber(next.size?.y)
+        ? next.size.y
+        : 1.75
+    next.size = { x: height, y: height, z: height }
   }
   return next
 }
@@ -353,7 +538,131 @@ export function migrateProjectDocument(raw) {
     appVersion: (raw && raw.appVersion) || '0.22.0',
     savedAt: (raw && raw.savedAt) || new Date().toISOString(),
     name: (raw && raw.name) || '未命名场景',
-    scene: { objects, camera, lighting, timeline }
+    scene: {
+      objects,
+      camera,
+      lighting,
+      timeline,
+      background: normalizeBackground(sceneRaw.background),
+      poseLibrary: normalizePoseLibrary(sceneRaw.poseLibrary)
+    }
+  }
+}
+
+/**
+ * 关节限位表的 **文档侧副本**。
+ *
+ * 权威定义在 `core/mannequin.js`（那里的 `MANNEQUIN_JOINTS` 还带 label / group）。
+ * 这里刻意复制一份而不是 import：`mannequin.js` 已经 import 了本文件
+ * （`MANNEQUIN_JOINT_IDS` / `createId`），反向 import 会形成循环依赖，
+ * 在 webpack 与 vitest 里谁先初始化成了不确定的事。
+ * 两边的数字由 `project-document.test.js` 里的断言锁死。
+ */
+const MANNEQUIN_JOINT_LIMITS = {
+  head: { x: [-45, 45], y: [-70, 70], z: [-30, 30] },
+  spine: { x: [-35, 35], y: [-50, 50], z: [-30, 30] },
+  leftShoulder: { x: [-120, 120], y: [-80, 80], z: [-175, 70] },
+  rightShoulder: { x: [-120, 120], y: [-80, 80], z: [-70, 175] },
+  leftElbow: { x: [0, 145], y: [-20, 20], z: [-15, 15] },
+  rightElbow: { x: [0, 145], y: [-20, 20], z: [-15, 15] },
+  leftHip: { x: [-110, 65], y: [-45, 45], z: [-45, 35] },
+  rightHip: { x: [-110, 65], y: [-45, 45], z: [-35, 45] },
+  leftKnee: { x: [0, 150], y: [0, 0], z: [0, 0] },
+  rightKnee: { x: [0, 150], y: [0, 0], z: [0, 0] }
+}
+
+/**
+ * 姿势库净化（schema 19）。
+ *
+ * 取舍与 `background` 一致：**坏的条目单独丢掉，不拖累整份工程**。
+ * 但比 background 严格一点——条目少了 `id` 或 `pose` 就没法被"应用/更新/删除"，
+ * 留着只是列表里的死行，所以直接过滤。
+ *
+ * 关节表按 `MANNEQUIN_JOINT_IDS` 重建：未知关节丢掉（渲染层根本不认识），
+ * 缺失关节补 0、非数字补 0、越界夹回限位。应用姿势时 `presetId` 会置 null、
+ * 全部关节都由这份 pose 驱动，所以**缺一个关节就会让那个部位掉回中立角度**，
+ * 补齐比"原样保留缺项"安全。
+ */
+export function normalizePoseLibrary(value) {
+  if (!Array.isArray(value)) return []
+  const entries = []
+  const usedIds = new Set()
+  for (const raw of value) {
+    if (!isRecord(raw)) continue
+    const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+    if (!id || usedIds.has(id)) continue
+    const pose = normalizePoseRecord(raw.pose)
+    if (!pose) continue
+    usedIds.add(id)
+    const name = typeof raw.name === 'string' ? raw.name.replace(/\s+/g, ' ').trim() : ''
+    entries.push({
+      id,
+      // 名字**不编造**：空名原样留着，由界面显示「未命名姿势」。
+      // 这里补一个默认名会让"存盘 → 重新打开"后的数据与存盘时不一致，
+      // 后端也会开始出现两种写法（空串 / 未命名姿势）。
+      name: name.slice(0, 24),
+      pose,
+      createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : ''
+    })
+  }
+  return entries
+}
+
+/** 单个姿势的关节表净化：只保留已知关节，数值必须是有限数并落在限位内。 */
+function normalizePoseRecord(pose) {
+  if (!isRecord(pose)) return null
+  const result = {}
+  for (const jointId of MANNEQUIN_JOINT_IDS) {
+    const definition = MANNEQUIN_JOINT_LIMITS[jointId]
+    const value = pose[jointId]
+    const source = isRecord(value) ? value : {}
+    const clamp = (number, limits) =>
+      Number.isFinite(number) ? Math.min(Math.max(number, limits[0]), limits[1]) : 0
+    result[jointId] = {
+      x: clamp(toFinite(source.x), definition.x),
+      y: clamp(toFinite(source.y), definition.y),
+      z: clamp(toFinite(source.z), definition.z)
+    }
+  }
+  return result
+}
+
+function toFinite(value) {
+  if (value === null || value === undefined || value === '') return Number.NaN
+  return Number(value)
+}
+
+/**
+ * 全景图背景字段净化。
+ *
+ * 老工程（v15 及更早）完全没有这个字段，所以 `undefined` 必须能走通并落到
+ * "没有背景"。同时把非法值归一，避免出现"文件名是 0 / 旋转是 NaN"这种
+ * 三端判断分叉的状态。
+ */
+export function normalizeBackground(background) {
+  const source = isRecord(background) ? background : {}
+  const fileName = typeof source.panoramaFileName === 'string' ? source.panoramaFileName.trim() : ''
+  /*
+   * 注意不能直接用 `Number(x)`：`Number(null)` 是 0、`Number('')` 也是 0，
+   * 会把"字段缺失"当成"用户填了 0"（亮度会变成全黑）。先挡掉空值。
+   */
+  const toNumber = (value) => {
+    if (value === null || value === undefined || value === '') return Number.NaN
+    return Number(value)
+  }
+  const rotate = toNumber(source.rotateDegrees)
+  const intensity = toNumber(source.intensity)
+  return {
+    panoramaFileName: fileName,
+    panoramaSourceName:
+      typeof source.panoramaSourceName === 'string' ? source.panoramaSourceName.trim() : '',
+    // 旋转归一到 [0, 360)，免得出现 -720 / 1080 这类等价但不一致的写法。
+    rotateDegrees: Number.isFinite(rotate) ? ((rotate % 360) + 360) % 360 : DEFAULT_BACKGROUND.rotateDegrees,
+    // 亮度限制在 0~4：再高只会把背景烧成白块，没有实际意义。
+    intensity: Number.isFinite(intensity)
+      ? Math.min(Math.max(intensity, 0), 4)
+      : DEFAULT_BACKGROUND.intensity,
+    affectsLighting: source.affectsLighting === true
   }
 }
 
@@ -390,8 +699,12 @@ function cloneVectorOrDefault(value, fallback) {
  *
  * 刻意不含 savedAt：否则每次保存都会让指纹变化，脏标记永远为真。
  * 用 JSON 字符串而非哈希，是为了让调试时能直接看出差异。
+ *
+ * `poseLibrary` 必须一起进指纹：它是**工程内容**，新增/删除/更新库条目
+ * 都改变了文件内容。不进来的话用户存了姿势、直接关窗口就丢了，
+ * 而且全程没有任何"有未保存修改"的提示。
  */
-export function sceneFingerprint(objects, camera, lighting, timeline) {
+export function sceneFingerprint(objects, camera, lighting, timeline, background, poseLibrary) {
   const round = (value) => Math.round(value * 1_000_000) / 1_000_000
   return JSON.stringify({
     objects: objects.map((object) => ({
@@ -444,6 +757,12 @@ export function sceneFingerprint(objects, camera, lighting, timeline) {
       lookAtEnabled: camera.lookAtEnabled !== false
     },
     lighting,
-    timeline
+    timeline,
+    // 全景图同样"会改变画面"，必须进指纹：否则换了背景不会被认为有未保存修改，
+    // 直接关窗口就丢了。
+    background: normalizeBackground(background),
+    // 姿势库只影响"能不能切回某个姿势"，不影响当前画面，但它确实是工程内容，
+    // 所以进指纹（否则存了姿势不算脏，用户以为没保存过）。
+    poseLibrary: normalizePoseLibrary(poseLibrary)
   })
 }

@@ -41,6 +41,12 @@ export function snapQuickBuildEnd(kind, start, point) {
 }
 
 export function quickBuildTransform(draft) {
+  /*
+   * 缺 start/end 时返回 null，**不能直接读 `.x`**：
+   * 刚按下还没移动的那一帧草稿是 `{ kind, start, end: null }`，
+   * 预览与 HUD 一旦读到就会抛 TypeError 把整次渲染打断。
+   */
+  if (!draft || !draft.start || !draft.end) return null
   const deltaX = draft.end.x - draft.start.x
   const deltaZ = draft.end.z - draft.start.z
 
@@ -74,10 +80,18 @@ export function quickBuildTransform(draft) {
   }
 }
 
+/**
+ * 拖拽中的实时尺寸文本（显示在视口 HUD 上）。
+ *
+ * 旧实现返回的是 "长度 3.2"：没单位、只保留一位小数，
+ * 而且**从来没有调用方**——建模时看不到任何尺寸反馈。
+ * 现在它是拖拽预览的唯一尺寸来源，所以要说清楚单位与精度。
+ */
 export function quickBuildMeasurement(draft) {
   const transform = quickBuildTransform(draft)
-  if (!transform) return draft.kind === 'wall' ? '墙体起点' : '地面起点'
+  if (!transform) return '请拖出尺寸'
+  // 墙只能拖长度（高度与厚度是固定的）；地面拖两边。
   return draft.kind === 'wall'
-    ? `长度 ${transform.size.x.toFixed(1)}`
-    : `${transform.size.x.toFixed(1)} × ${transform.size.z.toFixed(1)}`
+    ? `长度 ${transform.size.x.toFixed(2)} m`
+    : `${transform.size.x.toFixed(2)} × ${transform.size.z.toFixed(2)} m`
 }

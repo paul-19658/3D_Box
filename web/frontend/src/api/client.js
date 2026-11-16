@@ -144,7 +144,17 @@ export const api = {
       }
       return postMultipart('/exports/encode-mp4', form, '服务器编码失败')
     },
-    downloadUrl: (fileName) => `${BASE}/exports/${encodeURIComponent(fileName)}`
+    downloadUrl: (fileName) => `${BASE}/exports/${encodeURIComponent(fileName)}`,
+    /**
+     * 取回一个导出文件（导入模型的主文件 / 依赖资源）。
+     *
+     * 刻意返回原始 `Response` 而不是解析好的内容：模型资源可能是二进制
+     * （`.glb` / `.bin` / 纹理），也可能是文本（`.gltf` / `.obj` / `.mtl`），
+     * 由调用方按扩展名决定读 `arrayBuffer()` 还是 `text()`。
+     * 同源请求，Cookie 由浏览器自动带上（与下载地址同一套鉴权）。
+     */
+    fetchAsset: (fileName) =>
+      fetch(`${BASE}/exports/${encodeURIComponent(fileName)}`, { credentials: 'same-origin' })
   },
 
   sceneDescriptor: (projectName, scene) =>

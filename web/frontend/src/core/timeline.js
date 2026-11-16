@@ -63,6 +63,110 @@ function cloneVector(value) {
   return { x: value.x, y: value.y, z: value.z }
 }
 
+/**
+ * 只接受"三个分量都是有限数"的向量，其余（缺字段 / NaN / 字符串）返回 null。
+ *
+ * 关键帧数据可能来自手改过的工程或旧版本，脏值必须在这里挡掉：
+ * 一个 NaN 混进姿势会污染整条关节链的矩阵，画面直接消失，而且极难排查。
+ */
+function finiteVector(value) {
+  if (!value || typeof value !== 'object') return null
+  const x = Number(value.x)
+  const y = Number(value.y)
+  const z = Number(value.z)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null
+  return { x, y, z }
+}
+
+/**
+ * 逐关节独立插值（"按关节的通道"）。
+ *
+ * ## 为什么不能"整套姿势一起插值"
+ *
+ * 旧实现假设相邻两个关键帧有**相同**的关节集合：
+ * `Object.keys(previousPose).map(...)`。一旦某个关键帧只写了部分关节
+ * （按关节打帧、"只动画左臂"就是这么用的），轻则插出 `undefined`
+ * （`interpolateVector` 读 `second.x` 直接抛异常），重则整条轨道
+ * 静默少掉关节、模型塌回中立角度。
+ *
+ * ## 现在的语义
+ *
+ * 对每个关节**单独**取它自己的时间轴：
+ * - 只在"真正定义了这个关节"的关键帧之间插值；
+ * - 该关节两侧都没有帧时取**最近的已有值**（不外插、不留空洞）；
+ * - 任何情况下都不产出 NaN / undefined。
+ *
+ * ## 向后兼容
+ *
+ * 全部关键帧都带完整姿势时（旧数据、自动打帧写出来的帧），
+ * 每个关节的"已定义帧"就是整条轨道本身，插值区间与旧实现逐帧一致，
+ * 结果数值完全相同——只是多了"并集"这一层（并集等于同一组关节）。
+ *
+ * @returns {object|undefined} 该时刻的姿势；轨道里没有任何姿势数据时返回 undefined
+ */
+function evaluatePoseTrack(keyframes, timeSeconds) {
+  /*
+   * 先收集轨道里出现过的关节，顺序按"首次出现"稳定下来。
+   * 结果姿势是这些关节的并集：只出现在远端关键帧里的关节，在中间时刻取它
+   * 最近的值，而不是凭空消失。
+   */
+  const jointIds = []
+  const seen = new Set()
+  for (const keyframe of keyframes) {
+    const pose = keyframe.transform?.mannequinPose
+    if (!pose || typeof pose !== 'object') continue
+    for (const jointId of Object.keys(pose)) {
+      if (seen.has(jointId) || !finiteVector(pose[jointId])) continue
+      seen.add(jointId)
+      jointIds.push(jointId)
+    }
+  }
+  if (jointIds.length === 0) return undefined
+
+  const result = {}
+  for (const jointId of jointIds) {
+    // 只保留"这个关节真的有关键帧"的帧，其它帧对它不存在。
+    const samples = []
+    for (const keyframe of keyframes) {
+      const value = finiteVector(keyframe.transform?.mannequinPose?.[jointId])
+      if (!value) continue
+      samples.push({ time: Number(keyframe.timeSeconds), value, interpolation: keyframe.interpolation })
+    }
+    if (samples.length === 0) continue
+
+    // 只有一个样本，或时间落在首样本之前 / 末样本之后：取最近的已有值。
+    if (samples.length === 1 || timeSeconds <= samples[0].time) {
+      result[jointId] = cloneVector(samples[0].value)
+      continue
+    }
+    const last = samples[samples.length - 1]
+    if (timeSeconds >= last.time) {
+      result[jointId] = cloneVector(last.value)
+      continue
+    }
+
+    // 找到时间区间 [previous, next]：next 是第一个"时间 >= 目标时刻"的样本。
+    let nextIndex = 1
+    while (nextIndex < samples.length && samples[nextIndex].time < timeSeconds) nextIndex += 1
+    const next = samples[nextIndex]
+    const previous = samples[nextIndex - 1]
+    const span = next.time - previous.time
+    if (!(span > 1e-6)) {
+      /*
+       * 同刻帧（手改过的工程里可能出现）：除零保护。
+       * 正常写入路径不会产生同刻帧（`upsertObjectKeyframe` 会覆盖），
+       * 但这里必须兜住——除以 0 会得到 Infinity/NaN 并污染整条链。
+       */
+      result[jointId] = cloneVector(next.value)
+      continue
+    }
+    const raw = (timeSeconds - previous.time) / span
+    const amount = next.interpolation === 'smooth' ? smoothstep(raw) : raw
+    result[jointId] = interpolateVector(previous.value, next.value, amount, true)
+  }
+  return Object.keys(result).length > 0 ? result : undefined
+}
+
 function cloneCamera(camera) {
   return {
     position: cloneVector(camera.position),
@@ -195,9 +299,25 @@ export function sortedObjectKeyframes(keyframes) {
 }
 
 function evaluateTrack(keyframes, timeSeconds) {
-  if (timeSeconds <= keyframes[0].timeSeconds) return cloneTransform(keyframes[0].transform)
+  /*
+   * 姿势按**关节通道**独立求值，且必须在首尾快速返回之前算好：
+   * "时间在第一个关键帧之前"只说明位置等整体变换取第一帧，
+   * 不代表每个关节都取第一帧——某个关节可能第一次出现在后面的帧里，
+   * 那时它应该取"最近的已有值"（也就是那一帧的值），而不是消失。
+   */
+  const mannequinPose = evaluatePoseTrack(keyframes, timeSeconds)
+
+  if (timeSeconds <= keyframes[0].timeSeconds) {
+    const transform = cloneTransform(keyframes[0].transform)
+    if (mannequinPose !== undefined) transform.mannequinPose = mannequinPose
+    return transform
+  }
   const last = keyframes[keyframes.length - 1]
-  if (timeSeconds >= last.timeSeconds) return cloneTransform(last.transform)
+  if (timeSeconds >= last.timeSeconds) {
+    const transform = cloneTransform(last.transform)
+    if (mannequinPose !== undefined) transform.mannequinPose = mannequinPose
+    return transform
+  }
 
   for (let index = 1; index < keyframes.length; index += 1) {
     const next = keyframes[index]
@@ -205,20 +325,6 @@ function evaluateTrack(keyframes, timeSeconds) {
     if (timeSeconds > next.timeSeconds) continue
     const raw = (timeSeconds - previous.timeSeconds) / (next.timeSeconds - previous.timeSeconds)
     const amount = next.interpolation === 'smooth' ? smoothstep(raw) : raw
-    const previousPose = previous.transform.mannequinPose
-    const nextPose = next.transform.mannequinPose
-    let mannequinPose
-    if (!previousPose && !nextPose) mannequinPose = undefined
-    else if (!previousPose) mannequinPose = nextPose
-    else if (!nextPose) mannequinPose = previousPose
-    else {
-      mannequinPose = Object.fromEntries(
-        Object.keys(previousPose).map((jointId) => [
-          jointId,
-          interpolateVector(previousPose[jointId], nextPose[jointId], amount, true)
-        ])
-      )
-    }
     return {
       position: interpolateVector(previous.transform.position, next.transform.position, amount),
       rotation: interpolateVector(previous.transform.rotation, next.transform.rotation, amount, true),
@@ -271,7 +377,19 @@ export function applyObjectKeyframePreview(objects, preview) {
         object.mannequin && cloned.mannequinPose
           ? {
               ...object.mannequin,
-              pose: cloned.mannequinPose,
+              /*
+               * **合并**而不是整体替换。
+               *
+               * 按关节打帧时，一个关键帧里可能只有被打了帧的那几个关节
+               * （"只动画左臂"）。整体替换会让其它关节变成 undefined，
+               * 控制骨架拿不到角度、外观层也摆不出来——表现为人物突然塌成
+               * 一个奇怪姿势。合并的语义是"关键帧只覆盖它真正定义了的关节，
+               * 其余关节仍用工程里当前的姿势"。
+               *
+               * 关键帧带完整姿势时（旧数据 / 自动打帧），并集覆盖全部关节，
+               * 结果与整体替换完全一致，向后兼容。
+               */
+              pose: { ...(object.mannequin.pose ?? {}), ...cloned.mannequinPose },
               presetId: cloned.mannequinPresetId,
               manualJoints: cloned.mannequinManualJoints,
               // 过渡信息要一起带上：两个关键帧预设不同时，

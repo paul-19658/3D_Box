@@ -175,7 +175,9 @@ def save_project(
         project_id=result["projectId"],
         owner_id=user.id,
         name=str(result.get("name") or result["projectId"]),
-        schema_version=int(result.get("schemaVersion") or 15),
+        # 兜底值必须与 PROJECT_SCHEMA_VERSION 同步：文档里没写版本号时
+        # 按当前版本记账，写死旧数字会让列表里的版本列永远落后一档。
+        schema_version=int(result.get("schemaVersion") or PROJECT_SCHEMA_VERSION),
         file_size_bytes=int(result.get("fileSizeBytes") or 0),
     )
     return result

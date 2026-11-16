@@ -1,6 +1,15 @@
 <template>
-  <div class="viewport">
+  <div
+    class="viewport"
+    :class="{ 'is-panorama-drop': panoramaDropActive }"
+    @dragover="handlePanoramaDragOver"
+    @dragleave="handlePanoramaDragLeave"
+    @drop="handlePanoramaDrop"
+  >
     <canvas ref="canvas" class="viewport-canvas"></canvas>
+    <div v-if="panoramaDropActive" class="viewport-drop-hint" aria-hidden="true">
+      松手即应用为全景图背景
+    </div>
     <div class="viewport-hud">
       <button
         v-if="cameraViewActive"
@@ -30,6 +39,12 @@
       </button>
       <span v-if="tool === 'quick-build'" class="hud-pill hud-pill--hint">
         按住拖出{{ quickBuildDraft && quickBuildDraft.kind === 'wall' ? '墙体' : '地面' }}
+      </span>
+      <span
+        v-if="tool === 'quick-build' && quickBuildDraft && quickBuildDraft.start"
+        class="hud-pill hud-pill--measure"
+      >
+        {{ quickBuildSizeLabel }}
       </span>
       <span v-if="tool === 'paint'" class="hud-pill hud-pill--hint">
         点击面片涂色 · {{ paintScope === 'face' ? '整面' : '整物体' }}
@@ -83,6 +98,7 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js'
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js'
 
 import { createGeometry } from '@/core/geometry'
+import { api } from '@/api/client'
 import { createMannequinRig, applyMannequinPose } from '@/core/mannequin'
 import { createMannequinVisual, mannequinVisualState } from '@/core/mannequin-visual'
 import {
@@ -92,6 +108,7 @@ import {
   closestPointOnSegmentsToRay
 } from '@/core/nav-path'
 import { applyTimelinePreview, evaluateTimelineAtTime } from '@/core/timeline'
+import { quickBuildMeasurement, quickBuildTransform } from '@/core/quick-build'
 import { record } from '@/core/diagnostics'
 import { FIXED_FILL_LIGHT, FIXED_HEMISPHERE_LIGHT } from '@/core/project-document'
 import { resolveShadowCasterIds } from '@/core/lighting-description'
@@ -111,6 +128,23 @@ import {
   shouldRunOrbitControls
 } from '@/core/camera-nav'
 import { objectFocusPoint } from '@/core/camera-target'
+import { SCOPES, matchAction } from '@/core/keybindings'
+
+/**
+ * 飞行动作 id → `navKeys` 字段名。
+ *
+ * 注册表里的动作是"语义"（前进/后退/…），视口内部用的是短字段名。
+ * 放一张显式映射表，比在两边用字符串拼来拼去可靠。
+ */
+const NAV_FIELD_BY_ACTION = {
+  'nav.forward': 'forward',
+  'nav.backward': 'backward',
+  'nav.left': 'left',
+  'nav.right': 'right',
+  'nav.up': 'up',
+  'nav.down': 'down',
+  'nav.boost': 'boost'
+}
 
 /**
  * `TransformControls.setMode()` 接受的三个值。
@@ -181,6 +215,8 @@ export default {
     objects: { type: Array, required: true },
     cameraState: { type: Object, required: true },
     lighting: { type: Object, required: true },
+    /** 全景图背景（`scene.background`），见 core/project-document.js。 */
+    background: { type: Object, default: null },
     selectedIds: { type: Array, default: () => [] },
     selectedLightId: { type: String, default: null },
     transformMode: { type: String, default: 'translate' },
@@ -200,7 +236,8 @@ export default {
     cameraViewActive: { type: Boolean, default: false },
     /** 导航方案标识（`wasd` / `orbit`），实现见 core/camera-nav.js。 */
     cameraNavScheme: { type: String, default: 'wasd' },
-    /** 场景摄影机是否被选中——决定高亮与是否挂载控制柄。 */
+    /** 快捷键绑定表（动作 id → 规范绑定字符串），见 core/keybindings.js。 */
+    keybindings: { type: Object, default: () => ({}) },    /** 场景摄影机是否被选中——决定高亮与是否挂载控制柄。 */
     cameraSelected: { type: Boolean, default: false },
     /** 是否显示"摄影机监视器"小窗。 */
     monitorOpen: { type: Boolean, default: false },
@@ -233,6 +270,20 @@ export default {
       canvasHeight: 0,
       /** 容器尺寸监听器（见 mounted 里的说明）。 */
       resizeObserver: null,
+      /**
+       * 当前按住不放的飞行动作 id 集合。
+       *
+       * 用于 keyup 时可靠地清除状态：用户在按住 W 的途中改了快捷键，
+       * 只按"重新解析"去清就会漏掉那个键，相机会一直往前飞。
+       */
+      navPressedBindings: {},
+      /** 当前全景图背景纹理与其文件名（用于判断"是否只是改了旋转/亮度"）。 */
+      backgroundTexture: null,
+      backgroundFileName: '',
+      /** 加载序号：异步返回时用来丢弃过期结果。 */
+      backgroundToken: 0,
+      /** 是否正有图片拖到视口上（拖拽高亮提示用）。 */
+      panoramaDropActive: false,
       // 监视器窗体的位置与尺寸。位置是相对视口左上角的像素值。
       monitorRect: { x: 0, y: 0, w: 268, h: 151 },
       monitorReady: false,
@@ -246,6 +297,13 @@ export default {
   },
 
   computed: {
+    /** 拖拽建墙/地面的实时尺寸文本（"长度 3.20 m" / "3.20 × 1.80 m"）。 */
+    quickBuildSizeLabel() {
+      const draft = this.quickBuildDraft
+      if (!draft || !draft.start || !draft.end) return ''
+      return quickBuildMeasurement(draft)
+    },
+
     /** 绘制提示里显示的节点间距（米）。 */
     nodeSpacing() {
       return PATH_NODE_SPACING
@@ -261,6 +319,7 @@ export default {
   watch: {
     objects: { handler: 'rebuildObjects', deep: true },
     lighting: { handler: 'rebuildLights', deep: true },
+    background: { handler: 'applyBackground', deep: true },
     // 绘制草稿与选中节点只影响导航线的辅助显示，重建路径组即可。
     pathDraft: 'rebuildPaths',
     selectedPathNode: 'rebuildPaths',
@@ -269,6 +328,8 @@ export default {
     transformMode: 'attachTransformControls',
     selectedIds: 'attachTransformControls',
     modelingDraft: { handler: 'renderModelingDraft', deep: true },
+    // 拖拽建墙/地面：每次指针移动都要更新幽灵预览，否则用户看不到尺寸变化。
+    quickBuildDraft: { handler: 'renderQuickBuildDraft', deep: true },
     cutTool: { handler: 'renderCutPlane', deep: true },
     // 相机位姿、视场角、画幅任一变化都要重画摄影机模型与视锥。
     cameraState: { handler: 'rebuildCameraHelper', deep: true },
@@ -430,6 +491,15 @@ export default {
       this.modelingGroup = new THREE.Group()
       scene.add(this.modelingGroup)
 
+      /*
+       * 快速建墙/地面的拖拽预览。
+       *
+       * 独立分组、挂在 scene 上（不进 objectGroup）：预览是"临时视图"，
+       * 导出时只取 objectGroup，所以它天然不会被导出。
+       */
+      this.quickBuildGroup = new THREE.Group()
+      scene.add(this.quickBuildGroup)
+
       this.cutGroup = new THREE.Group()
       scene.add(this.cutGroup)
 
@@ -497,6 +567,17 @@ export default {
       // 不用 THREE.Clock：动画完全由时间轴驱动，不需要墙钟时间，
       // 而且它已被 three.js 标记为弃用（会污染控制台）。
       this.importedModels = new Map()
+      /*
+       * 导入模型的"按引用恢复"状态，键是 `${object.id}|${主文件名}`。
+       *
+       * 为什么不挂在 root.userData 上：`rebuildObjects` 对 imported 是**不复用**的
+       * （每次重建都换一个 root），挂上去的状态会跟着旧 root 一起丢，
+       * 于是每次重建都重新下载一遍模型文件。键里带主文件名，
+       * 是因为"同一个物体换了模型文件"必须重新加载。
+       * 取值：'loading' 下载中 / 'loaded' 已就绪 / 'failed' 失败（不再重试，
+       * 避免文件真的丢了时每次重建都打一串 404）。
+       */
+      this.importedLoads = new Map()
 
       // 顺序很关键：rebuildObjects / rebuildLights / attachTransformControls
       // 都会在最前面检查 `if (!this.ready) return`，因此 ready 必须先置真。
@@ -509,6 +590,8 @@ export default {
       this.rebuildPaths()
       this.rebuildCameraHelper()
       this.attachTransformControls()
+      // 全景图是异步加载的，不阻塞首帧；加载完自然替换背景。
+      this.applyBackground()
 
       // 必须在第一帧之前量一次尺寸：canvas 是替换元素，未显式设置时
       // 会保持 300×150 的默认内联尺寸，导致画面被压成一小块。
@@ -1026,6 +1109,15 @@ export default {
         group.add(root)
         this.rootMap = this.rootMap || new Map()
         this.rootMap.set(object.id, root)
+        /*
+         * 导入模型的真实网格必须在这里挂，不能放在 `createObjectRoot` 里。
+         *
+         * `setImportedMesh` 是按 object id 找容器的，而新 root 此刻才登记进
+         * `rootMap`——在 createObjectRoot 里调用会因为"找不到容器"直接返回，
+         * 占位方块于是留在画面上，直到下一次重建才被替换
+         * （表现出来就是"导入完要再点一下才显示模型"）。
+         */
+        if (object.kind === 'imported' && object.importedAsset) this.applyImportedMesh(object)
       }
 
       for (const [id, child] of previous) {
@@ -1313,8 +1405,11 @@ export default {
         this.attachMannequinVisual(root, object)
         material.dispose()
       } else if (object.kind === 'imported' && object.importedAsset) {
-        // 导入模型的网格在导入时已解析，这里用包围盒占位。
-        // 真实网格由父组件通过 setImportedMesh 注入，避免在视口里重复解析文件。
+        /*
+         * 先放一个半透明占位方块，真实网格由 `applyImportedMesh` 在
+         * 新 root 登记进 `rootMap` 之后再挂上来：本次会话刚导入的走内存缓存，
+         * 重新打开工程的按工程里的文件引用恢复（见 restoreImportedMesh）。
+         */
         const placeholder = new THREE.Mesh(
           new THREE.BoxGeometry(1, 1, 1),
           new THREE.MeshStandardMaterial({
@@ -1329,8 +1424,6 @@ export default {
         placeholder.receiveShadow = true
         placeholder.userData.objectId = object.id
         root.add(placeholder)
-        const cached = this.importedModels?.get(object.id)
-        if (cached) this.setImportedMesh(object.id, cached)
       } else {
         const material = new THREE.MeshStandardMaterial({
           color: object.colorOverride || object.color,
@@ -1402,6 +1495,122 @@ export default {
     // ------------------------------------------------------------------
     // 灯光
     // ------------------------------------------------------------------
+
+    /**
+     * 应用全景图背景（等距圆柱 / equirectangular）。
+     *
+     * 语义是"站在全景图里面"：把图当天空盒贴到场景四周，**任何机位**都能看到，
+     * 成片预演、监视器、图片/视频导出也都跟着变——因为它们渲染的是同一个 scene。
+     *
+     * 几个必须做对的地方：
+     *
+     * 1. `mapping = EquirectangularReflectionMapping`：不设的话 three 会把它当
+     *    普通平面贴图铺在背景上，看到的是被拉伸的一张图，而不是"四周的环境"。
+     * 2. `colorSpace = SRGBColorSpace`：全景图是给人看的图片（sRGB），
+     *    不声明就会被当线性数据，整张图偏暗发灰。
+     * 3. 水平旋转用 `scene.backgroundRotation`：three 没有"旋转背景图"的开关，
+     *    直接转相机不行（会把场景一起转）。旋转必须作用在背景本身。
+     * 4. 换图/移除时必须 `dispose()` 旧纹理：一张 4K 全景图在 GPU 上几十 MB，
+     *    不释放的话反复换几张就把显存吃满。
+     */
+    async applyBackground() {
+      if (!this.ready || !this.scene) return
+      const config = this.background || {}
+      const fileName = String(config.panoramaFileName || '').trim()
+      const token = (this.backgroundToken = (this.backgroundToken || 0) + 1)
+
+      // 亮度与旋转即使没有图也先写进去：它们不依赖纹理。
+      this.scene.backgroundRotation = new THREE.Euler(
+        0,
+        THREE.MathUtils.degToRad(Number(config.rotateDegrees) || 0),
+        0
+      )
+      this.scene.backgroundIntensity = Number.isFinite(Number(config.intensity))
+        ? Number(config.intensity)
+        : 1
+
+      if (!fileName) {
+        this.disposeBackgroundTexture()
+        this.scene.background = null
+        this.scene.environment = null
+        return
+      }
+
+      if (this.backgroundFileName === fileName && this.backgroundTexture) {
+        // 同一张图，只是改了旋转/亮度/开关：不用重新下载。
+        this.scene.background = this.backgroundTexture
+        this.scene.environment = config.affectsLighting ? this.backgroundTexture : null
+        return
+      }
+
+      try {
+        const texture = await new THREE.TextureLoader().loadAsync(
+          `/api/exports/${encodeURIComponent(fileName)}`
+        )
+        // 异步回来时配置可能又变了（连点两次、或刚删掉），丢弃过期结果。
+        if (token !== this.backgroundToken) {
+          texture.dispose()
+          return
+        }
+        texture.mapping = THREE.EquirectangularReflectionMapping
+        texture.colorSpace = THREE.SRGBColorSpace
+        this.disposeBackgroundTexture()
+        this.backgroundTexture = texture
+        this.backgroundFileName = fileName
+        this.scene.background = texture
+        this.scene.environment = config.affectsLighting ? texture : null
+      } catch (error) {
+        record('warn', 'background', `全景图加载失败：${error?.message || error}`)
+        this.disposeBackgroundTexture()
+        this.scene.background = null
+        this.scene.environment = null
+      }
+    },
+
+    /**
+     * 把图片拖进视口 = 设为全景图背景（"扔进去"这个交互）。
+     *
+     * 只处理**文件**拖拽。左侧物体列表拖的是 `text/x-object-id`，
+     * 没有 `Files`，所以不会误触。
+     */
+    isPanoramaDrag(event) {
+      const transfer = event.dataTransfer
+      if (!transfer) return false
+      const files = Array.from(transfer.files || [])
+      if (files.length === 0) return false
+      return files.some((file) => /^image\/(png|jpeg|webp)$/i.test(file.type))
+    },
+
+    handlePanoramaDragOver(event) {
+      if (!this.isPanoramaDrag(event)) return
+      // 必须 preventDefault，否则浏览器会拒绝 drop（默认行为是"打开图片"）。
+      event.preventDefault()
+      this.panoramaDropActive = true
+    },
+
+    handlePanoramaDragLeave() {
+      this.panoramaDropActive = false
+    },
+
+    handlePanoramaDrop(event) {
+      const wasPanorama = this.isPanoramaDrag(event)
+      this.panoramaDropActive = false
+      if (!wasPanorama) return
+      event.preventDefault()
+      const file = Array.from(event.dataTransfer.files).find((item) =>
+        /^image\/(png|jpeg|webp)$/i.test(item.type)
+      )
+      if (file) this.$emit('panorama-dropped', file)
+    },
+
+    /** 释放当前背景纹理并清空记录（换图、移除、销毁时都要走）。 */
+    disposeBackgroundTexture() {
+      if (this.backgroundTexture) {
+        this.backgroundTexture.dispose()
+        this.backgroundTexture = null
+      }
+      this.backgroundFileName = ''
+    },
 
     rebuildLights() {
       if (!this.ready) return
@@ -2960,6 +3169,71 @@ export default {
      * 草稿是"半成品"，因此用独立的高亮材质，并且不参与导出：
      * 导出时只取 objectGroup，草稿留在 modelingGroup 里。
      */
+    /**
+     * 拖拽建墙/地面时的**实时幽灵预览**。
+     *
+     * 以前拖拽全程画面毫无反应，松手才"啪"地出现物体，用户完全无法判断
+     * 正在拖多宽、多长——尺寸只能靠猜或者建完了再改数值。
+     *
+     * 做法：按当前草稿算出的 transform 摆一个半透明盒子 + 亮色边线。
+     * 盒子用**单位立方体**建成一次后只改 scale/position/rotation，
+     * 不在每次指针移动时新建几何体（拖拽是每帧触发的，反复建几何体会掉帧
+     * 并制造大量垃圾给 GC）。
+     */
+    renderQuickBuildDraft(draft) {
+      if (!this.quickBuildGroup) return
+      const ghost = this.ensureQuickBuildGhost()
+      const transform = draft && draft.start && draft.end ? quickBuildTransform(draft) : null
+      if (!transform) {
+        ghost.visible = false
+        return
+      }
+      ghost.visible = true
+      ghost.position.set(transform.position.x, transform.position.y, transform.position.z)
+      ghost.rotation.set(
+        THREE.MathUtils.degToRad(transform.rotation.x),
+        THREE.MathUtils.degToRad(transform.rotation.y),
+        THREE.MathUtils.degToRad(transform.rotation.z)
+      )
+      // 尺寸可能有一瞬间为 0（刚按下），给个极小值避免 scale=0 导致矩阵退化。
+      ghost.scale.set(
+        Math.max(transform.size.x, 1e-4),
+        Math.max(transform.size.y, 1e-4),
+        Math.max(transform.size.z, 1e-4)
+      )
+    },
+
+    /** 懒创建幽灵预览（单位立方体 + 边线，整个生命周期只建一次）。 */
+    ensureQuickBuildGhost() {
+      if (this.quickBuildGhost) return this.quickBuildGhost
+      const group = new THREE.Group()
+      group.name = '快速建墙/地面预览'
+      const geometry = new THREE.BoxGeometry(1, 1, 1)
+      const fill = new THREE.Mesh(
+        geometry,
+        new THREE.MeshBasicMaterial({
+          color: '#2f7cf6',
+          transparent: true,
+          opacity: 0.16,
+          depthWrite: false
+        })
+      )
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(geometry),
+        new THREE.LineBasicMaterial({ color: '#2f7cf6' })
+      )
+      // renderOrder 必须设在子对象上：Group 的 renderOrder 不会传给子对象，
+      // 设错位置会出现"幽灵盒被实体挡住"。
+      fill.renderOrder = 900
+      edges.renderOrder = 901
+      group.add(fill)
+      group.add(edges)
+      group.visible = false
+      this.quickBuildGroup.add(group)
+      this.quickBuildGhost = group
+      return group
+    },
+
     renderModelingDraft(draft) {
       if (!this.modelingGroup) return
       clearGroup(this.modelingGroup)
@@ -3082,6 +3356,110 @@ export default {
     // ------------------------------------------------------------------
     // 供父组件调用的能力
     // ------------------------------------------------------------------
+
+    /**
+     * 给导入模型挂上真实网格：内存里有就复用，没有就按文件引用恢复。
+     *
+     * 必须在 `rootMap` 登记**之后**调用（见 `rebuildObjects`）。
+     */
+    applyImportedMesh(object) {
+      const cached = this.importedModels?.get(object.id)
+      if (cached) {
+        this.setImportedMesh(object.id, cached)
+        return
+      }
+      this.restoreImportedMesh(object)
+    },
+
+    /**
+     * 按工程里的文件引用恢复导入模型的几何体（schema 18）。
+     *
+     * 重新打开工程时内存里没有解析结果，而工程里只有文件名，所以要：
+     * 取回主文件 → 取回全部依赖资源 → `importStaticModel` 重新解析 →
+     * 替换占位方块。取回地址是 `/api/exports/<fileName>`（同源、带 cookie）。
+     *
+     * 几个必须处理好的点：
+     * 1. **不重复下载**：状态挂在 `importedLoads`（键 `object.id|主文件名`）上，
+     *    而不是 `root.userData` —— imported 的 root 每次重建都会换新的，
+     *    挂在 root 上的状态会跟着旧 root 一起丢，于是每次重建都重下一次；
+     * 2. **加载期间对象可能被删/被重建**：回来时按 id 重新确认当前容器，
+     *    没人要就 dispose，绝不把几何体挂到已经扔掉的 root 上；
+     * 3. **老工程没有 `files`**：直接跳过，占位方块留着（当初也没存文件）；
+     * 4. 失败只记一条 warn 诊断，不抛未捕获异常——模型恢复不出来不该让页面崩。
+     */
+    async restoreImportedMesh(object) {
+      const asset = object.importedAsset
+      const files = asset?.files
+      const mainFileName = files?.main?.fileName
+      if (!mainFileName) return
+      if (!['glb', 'gltf', 'obj'].includes(asset.format)) return
+
+      const key = `${object.id}|${mainFileName}`
+      // 已有解析结果（本次会话导入过、或上一次重建已经加载完）：复用，不再下载。
+      const cached = this.importedModels?.get(object.id)
+      if (cached) {
+        this.setImportedMesh(object.id, cached)
+        return
+      }
+      const state = this.importedLoads.get(key)
+      if (state === 'loading' || state === 'loaded' || state === 'failed') return
+      this.importedLoads.set(key, 'loading')
+
+      try {
+        const { importStaticModel, isBinaryAssetName } = await import('@/core/model-io')
+        /*
+         * 动态 import 至少要等一个微任务，而父组件的 `syncImportedMeshes`
+         * 恰好在同一个 tick 的 watcher 队列里（"刚导入完"就是这种情况）。
+         * 这时内存里已经有解析好的网格，没必要再下载一遍同样的文件。
+         */
+        const injected = this.importedModels?.get(object.id)
+        if (injected) {
+          this.importedLoads.set(key, 'loaded')
+          this.setImportedMesh(object.id, injected)
+          return
+        }
+        const fetchAsset = async (name) => {
+          // 网络请求统一走 api/client.js（同源 + cookie），组件里不直接 fetch。
+          const response = await api.exports.fetchAsset(name)
+          if (!response.ok) throw new Error(`取回 ${name} 失败（${response.status}）`)
+          // 纹理与 .bin 必须按二进制读，见 core/model-io.js 的 isBinaryAssetName。
+          return isBinaryAssetName(name) ? response.arrayBuffer() : response.text()
+        }
+
+        const data = await fetchAsset(mainFileName)
+        const resources = []
+        for (const entry of files.resources ?? []) {
+          if (!entry?.fileName) continue
+          resources.push({
+            // `name` 才是模型内部引用的名字，`fileName` 只是服务端的存储名。
+            name: entry.name || entry.fileName,
+            data: await fetchAsset(entry.fileName)
+          })
+        }
+        const model = await importStaticModel(data, asset.format, resources)
+
+        /*
+         * 加载是异步的，期间对象可能被删掉、或工程被重新打开（root 被重建）。
+         * 按 id 重新确认一次：还在、还是同一个模型，就挂到**当前**那个容器上
+         * （占位方块由 setImportedMesh 负责替换）。
+         */
+        const current = this.objects.find((item) => item.id === object.id)
+        const stillSameAsset =
+          current?.kind === 'imported' &&
+          current.importedAsset?.files?.main?.fileName === mainFileName
+        if (!stillSameAsset || !this.rootMap?.has(object.id)) {
+          // 没人要了：清掉状态，让"撤销删除"之类的后续重建能再来一次。
+          this.importedLoads.delete(key)
+          disposeObject(model)
+          return
+        }
+        this.importedLoads.set(key, 'loaded')
+        this.setImportedMesh(object.id, model)
+      } catch (error) {
+        this.importedLoads.set(key, 'failed')
+        record('warn', 'imported-model', `导入模型恢复失败（${mainFileName}）：${error?.message || error}`)
+      }
+    },
 
     /**
      * 注入导入模型的真实网格。
@@ -3496,7 +3874,10 @@ export default {
     },
 
     /**
-     * WASD 按键按下。
+     * 相机飞行按键按下。
+     *
+     * 按键走可配置注册表（默认 WASD / QE / Shift，可在"快捷键设置"里改，
+     * 也可整套切成 Maya / Blender 预设）。
      *
      * 必须先排除"正在输入"的元素：编辑器里有工程名输入框和大量
      * 数值输入框，用户在框里打 wasd 会被当成相机移动。
@@ -3504,49 +3885,40 @@ export default {
     handleNavKeyDown(event) {
       if (isEditableTarget(event.target)) return
       if (!this.navKeys) return
-      const key = event.key.toLowerCase()
       // 方案决定是否消费键盘：`orbit` 方案下 WASD 完全不参与。
       if (!navSchemeHandler(this.cameraNavScheme).consumesKeyboard) return
-      const mapping = {
-        w: 'forward',
-        arrowup: 'forward',
-        s: 'backward',
-        arrowdown: 'backward',
-        a: 'left',
-        arrowleft: 'left',
-        d: 'right',
-        arrowright: 'right',
-        q: 'down',
-        e: 'up'
-      }
-      const field = mapping[key]
-      if (field) {
-        this.navKeys[field] = true
-        // 阻止方向键滚动页面；WASD 不 preventDefault，避免干扰浏览器快捷键。
-        if (key.startsWith('arrow')) event.preventDefault()
-        return
-      }
-      if (key === 'shift') this.navKeys.boost = true
+      const action = matchAction(this.keybindings, event, { scopes: [SCOPES.CAMERA_NAV] })
+      if (!action) return
+      const field = NAV_FIELD_BY_ACTION[action.id]
+      if (!field) return
+      this.navKeys[field] = true
+      /*
+       * 记下"这个绑定按下了"，keyup 时按**同一个绑定**清除。
+       *
+       * 不能只靠 keyup 时重新解析：用户按住 W 的途中改了快捷键，重解析就会
+       * 得到别的动作，那个键永远清不掉，相机会一直往前飞。
+       */
+      this.navPressedBindings = { ...this.navPressedBindings, [action.id]: true }
+      // 阻止方向键滚动页面；普通字母键不 preventDefault，避免干扰浏览器快捷键。
+      if (event.key.toLowerCase().startsWith('arrow')) event.preventDefault()
     },
 
     handleNavKeyUp(event) {
       if (!this.navKeys) return
-      const key = event.key.toLowerCase()
-      const mapping = {
-        w: 'forward',
-        arrowup: 'forward',
-        s: 'backward',
-        arrowdown: 'backward',
-        a: 'left',
-        arrowleft: 'left',
-        d: 'right',
-        arrowright: 'right',
-        q: 'down',
-        e: 'up'
+      const action = matchAction(this.keybindings, event, { scopes: [SCOPES.CAMERA_NAV] })
+      // 先按 keyup 当时的解析结果清；解析不到就退回到"哪些动作还按着"的记录。
+      const candidates = new Set()
+      if (action && NAV_FIELD_BY_ACTION[action.id]) candidates.add(action.id)
+      for (const actionId of Object.keys(this.navPressedBindings)) {
+        if (this.navPressedBindings[actionId]) candidates.add(actionId)
       }
-      const field = mapping[key]
-      if (field) this.navKeys[field] = false
-      if (key === 'shift') this.navKeys.boost = false
+      for (const actionId of candidates) {
+        const field = NAV_FIELD_BY_ACTION[actionId]
+        if (field) this.navKeys[field] = false
+        const next = { ...this.navPressedBindings }
+        delete next[actionId]
+        this.navPressedBindings = next
+      }
     },
 
     /**
@@ -3557,6 +3929,8 @@ export default {
     handleNavBlur() {
       if (!this.navKeys) return
       for (const field of Object.keys(this.navKeys)) this.navKeys[field] = false
+      // 记录也要一起清，否则下次 keyup 会拿旧记录去清不存在的键。
+      this.navPressedBindings = {}
     },
 
     /** 中键按下：开始拖拽转向。 */
@@ -4236,6 +4610,8 @@ export default {
       // 注销探针：组件销毁后不能再让外部读到半拆解的 three.js 对象。
       registerSceneProbe(null, {})
       this.disposeMonitor()
+      // 全景图纹理在 GPU 上占几十 MB，销毁时必须释放。
+      this.disposeBackgroundTexture()
       // 相机视角的键盘监听与提交计时器必须清掉：
       // 组件销毁后键盘监听还在，会对着已拆解的相机继续算位移。
       this.endCameraView()
@@ -4257,9 +4633,11 @@ export default {
       disposeObject(this.userLightGroup)
       disposeObject(this.guideGroup)
       disposeObject(this.modelingGroup)
+      disposeObject(this.quickBuildGroup)
       disposeObject(this.cutGroup)
       disposeObject(this.pathGroup)
       this.importedModels?.clear()
+      this.importedLoads?.clear()
       this.scene?.clear()
       this.renderer?.dispose()
       this.ready = false

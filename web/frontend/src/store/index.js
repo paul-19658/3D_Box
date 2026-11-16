@@ -15,6 +15,7 @@ import Vuex from 'vuex'
 import { api } from '@/api/client'
 import { createHistory, commitHistory, undoHistory, redoHistory } from '@/core/history'
 import { createInitialScene } from '@/core/scene'
+import { DEFAULT_BACKGROUND } from '@/core/project-document'
 import {
   migrateProjectDocument,
   sceneFingerprint,
@@ -23,6 +24,14 @@ import {
 } from '@/core/project-document'
 import { applyAiSceneCommands } from '@/core/apply-ai-scene-commands'
 import { CAMERA_NAV_SCHEMES, DEFAULT_CAMERA_NAV_SCHEME } from '@/core/camera-nav'
+import {
+  ACTION_BY_ID,
+  DEFAULT_KEYBINDINGS,
+  DEFAULT_PRESET_ID,
+  normalizeBinding,
+  presetBindings,
+  sanitizeBindings
+} from '@/core/keybindings'
 import { applyAutoKey, collectAutoKeyTargets } from '@/core/auto-key'
 import { AI_MAX_HISTORY_MESSAGES } from '@/core/ai-defaults'
 import {
@@ -101,7 +110,42 @@ let autosaveTimer = null
 const initialScene = createInitialScene()
 
 const fingerprintOf = (scene) =>
-  sceneFingerprint(scene.objects, scene.camera, scene.lighting, scene.timeline)
+  sceneFingerprint(
+    scene.objects,
+    scene.camera,
+    scene.lighting,
+    scene.timeline,
+    scene.background,
+    scene.poseLibrary
+  )
+
+const KEYBINDINGS_STORAGE_KEY = 'xiaobaihe-keybindings'
+
+/**
+ * 把绑定表写进 localStorage。
+ *
+ * 存的是**规范字符串**（`'ctrl+shift+z'`），不是 `event.key` 的原始值——
+ * 这样换平台、换键盘布局时读回来仍然可用。
+ * 隐私模式下 localStorage 可能抛异常，失败就当没存过，不影响功能。
+ */
+function persistKeybindings(bindings) {
+  try {
+    window.localStorage.setItem(KEYBINDINGS_STORAGE_KEY, JSON.stringify(bindings))
+  } catch {
+    /* 忽略：取不到存储不影响功能 */
+  }
+}
+
+/** 从 localStorage 读绑定表；任何异常都回落到默认值。 */
+function loadKeybindings() {
+  try {
+    const raw = window.localStorage.getItem(KEYBINDINGS_STORAGE_KEY)
+    if (!raw) return { ...DEFAULT_KEYBINDINGS }
+    return sanitizeBindings(JSON.parse(raw))
+  } catch {
+    return { ...DEFAULT_KEYBINDINGS }
+  }
+}
 
 export default new Vuex.Store({
   state: {
@@ -139,6 +183,17 @@ export default new Vuex.Store({
     timelineOpen: true,
     /** 摄影机监视器小窗是否打开。 */
     monitorOpen: false,
+    /**
+     * 快捷键绑定：动作 id → 规范绑定字符串。
+     *
+     * 这是**操作习惯**而不是工程数据，所以放 store + localStorage，
+     * 不进 `.block3d`——同一份工程在不同人的机器上打开，快捷键应该各用各的。
+     * 载入时走 `sanitizeBindings()` 清洗：用户可能手改过存储，
+     * 也可能升级后动作被删了，缺的一律回落到默认值。
+     */
+    keybindings: { ...DEFAULT_KEYBINDINGS },
+    /** 快捷键设置面板是否打开。 */
+    shortcutDialogOpen: false,
 
     cameraViewMode: 'none',
     /**
@@ -223,6 +278,10 @@ export default new Vuex.Store({
     camera: (state) => state.history.present.camera,
     lighting: (state) => state.history.present.lighting,
     timeline: (state) => state.history.present.timeline,
+    /** 全景图背景；老工程没有该字段时回落到默认值（无背景）。 */
+    background: (state) => state.history.present.background ?? { ...DEFAULT_BACKGROUND },
+    /** 姿势库；老工程（v18 及更早）没有该字段时回落到空列表。 */
+    poseLibrary: (state) => state.history.present.poseLibrary ?? [],
     isAdmin: (state) => state.currentUser?.role === 'admin',
     isReadOnly: (state) => Boolean(state.readOnlyProject),
     canUndo: (state) => !state.readOnlyProject && state.history.past.length > 0,
@@ -234,8 +293,14 @@ export default new Vuex.Store({
     isDirty: (state, getters) => {
       const scene = getters.scene
       return (
-        sceneFingerprint(scene.objects, scene.camera, scene.lighting, scene.timeline) !==
-        state.savedFingerprint
+        sceneFingerprint(
+          scene.objects,
+          scene.camera,
+          scene.lighting,
+          scene.timeline,
+          scene.background,
+          scene.poseLibrary
+        ) !== state.savedFingerprint
       )
     },
     sceneSummary: (state, getters) => summarizeScene(getters.scene)
@@ -336,6 +401,36 @@ export default new Vuex.Store({
       } catch {
         /* 忽略：取不到存储不影响功能 */
       }
+    },
+    /**
+     * 改一个动作的绑定。
+     *
+     * 允许传 `null` 表示"不绑定"——有些用户就是想把某个键空出来。
+     * 冲突**不在这里拦**：设置面板要能显示"这个键已经被谁占了"，
+     * 直接拒绝会让用户不知道自己错在哪。判定交给 `findConflicts()`，
+     * 由界面提示，用户想保留冲突也可以（不同 scope 本来就允许同键）。
+     */
+    setKeybinding(state, { actionId, binding }) {
+      if (!ACTION_BY_ID[actionId]) return
+      state.keybindings = { ...state.keybindings, [actionId]: normalizeBinding(binding) }
+      persistKeybindings(state.keybindings)
+    },
+    /** 套用预设。 */
+    applyKeybindingPreset(state, presetId) {
+      state.keybindings = presetBindings(presetId)
+      persistKeybindings(state.keybindings)
+    },
+    /** 恢复全部默认（= 本应用默认预设）。 */
+    resetKeybindings(state) {
+      state.keybindings = presetBindings(DEFAULT_PRESET_ID)
+      persistKeybindings(state.keybindings)
+    },
+    setShortcutDialogOpen(state, open) {
+      state.shortcutDialogOpen = Boolean(open)
+    },
+    /** 启动时用清洗过的绑定表覆盖默认值（不写回存储）。 */
+    restoreKeybindings(state, bindings) {
+      state.keybindings = sanitizeBindings(bindings)
     },
     setAutoKeyEnabled(state, enabled) {
       state.autoKeyEnabled = Boolean(enabled)
@@ -550,6 +645,12 @@ export default new Vuex.Store({
       const theme = window.localStorage.getItem('xiaobaihe-theme')
       if (theme === 'light' || theme === 'dark') commit('setTheme', theme)
 
+      /*
+       * 恢复自定义快捷键。放在这里而不是 state 初始化里：`bootstrap` 里能拿到
+       * 完整的清洗逻辑，而且首屏渲染时快捷键已经就位，不会出现"前几毫秒用默认键"。
+       */
+      commit('restoreKeybindings', loadKeybindings())
+
       // 恢复上次选择的相机导航方案；非法值一律忽略，回退到默认方案。
       const navScheme = window.localStorage.getItem('xiaobaihe-camera-nav')
       if (CAMERA_NAV_SCHEMES.includes(navScheme)) commit('setCameraNavScheme', navScheme)
@@ -682,7 +783,9 @@ export default new Vuex.Store({
               objects: scene.objects,
               camera: scene.camera,
               lighting: scene.lighting,
-              timeline: scene.timeline
+              timeline: scene.timeline,
+              background: scene.background,
+              poseLibrary: scene.poseLibrary
             }),
             state.projectId
           )
@@ -705,11 +808,20 @@ export default new Vuex.Store({
           objects: scene.objects,
           camera: scene.camera,
           lighting: scene.lighting,
-          timeline: scene.timeline
+          timeline: scene.timeline,
+          background: scene.background,
+          poseLibrary: scene.poseLibrary
         })
         const result = await api.projects.save(document, saveAs ? null : state.projectId)
         commit('markSaved', {
-          fingerprint: sceneFingerprint(scene.objects, scene.camera, scene.lighting, scene.timeline),
+          fingerprint: sceneFingerprint(
+            scene.objects,
+            scene.camera,
+            scene.lighting,
+            scene.timeline,
+            scene.background,
+            scene.poseLibrary
+          ),
           savedAt: result.savedAt,
           projectId: result.projectId
         })
@@ -735,14 +847,18 @@ export default new Vuex.Store({
           objects: document.scene.objects,
           camera: document.scene.camera,
           lighting: document.scene.lighting,
-          timeline: document.scene.timeline
+          timeline: document.scene.timeline,
+          background: document.scene.background,
+          poseLibrary: document.scene.poseLibrary
         })
         commit('markSaved', {
           fingerprint: sceneFingerprint(
             document.scene.objects,
             document.scene.camera,
             document.scene.lighting,
-            document.scene.timeline
+            document.scene.timeline,
+            document.scene.background,
+            document.scene.poseLibrary
           ),
           savedAt: document.savedAt,
           projectId,
@@ -768,14 +884,18 @@ export default new Vuex.Store({
           objects: document.scene.objects,
           camera: document.scene.camera,
           lighting: document.scene.lighting,
-          timeline: document.scene.timeline
+          timeline: document.scene.timeline,
+          background: document.scene.background,
+          poseLibrary: document.scene.poseLibrary
         })
         commit('markSaved', {
           fingerprint: sceneFingerprint(
             document.scene.objects,
             document.scene.camera,
             document.scene.lighting,
-            document.scene.timeline
+            document.scene.timeline,
+            document.scene.background,
+            document.scene.poseLibrary
           ),
           savedAt: document.savedAt,
           projectId,
@@ -821,14 +941,18 @@ export default new Vuex.Store({
         objects: document.scene.objects,
         camera: document.scene.camera,
         lighting: document.scene.lighting,
-        timeline: document.scene.timeline
+        timeline: document.scene.timeline,
+        background: document.scene.background,
+        poseLibrary: document.scene.poseLibrary
       })
       commit('markSaved', {
         fingerprint: sceneFingerprint(
           document.scene.objects,
           document.scene.camera,
           document.scene.lighting,
-          document.scene.timeline
+          document.scene.timeline,
+          document.scene.background,
+          document.scene.poseLibrary
         ),
         savedAt: document.savedAt,
         projectId: snapshot.projectId ?? null,

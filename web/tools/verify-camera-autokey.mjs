@@ -2362,6 +2362,2061 @@ async function main() {
     )
     check('镜头轨也记录了新画幅', shotRemap.aspect.every((a) => a === '21:9'), JSON.stringify(shotRemap.aspect))
 
+    // ===================== 二十、快捷键设置 =====================
+    /*
+     * 可配置快捷键的回归护栏。重点在**按住类动作**（相机飞行）：
+     * 改成注册表驱动最容易出的问题是"按住不放的键在 keyup 时清不掉"，
+     * 相机会一直往前飞。
+     */
+    check('从菜单打开快捷键设置', (await clickMenu(cdp, '帮助', '键盘快捷键')) === 'ok')
+    const shortcutPanel = await cdp.evaluate(`(() => {
+      const dialog = document.querySelector('.dialog')
+      if (!dialog) return { open: false }
+      const rows = [...dialog.querySelectorAll('.shortcut-row')]
+      return {
+        open: true,
+        rowCount: rows.length,
+        labels: rows.map((r) => r.querySelector('.shortcut-row__label')?.textContent.trim()),
+        keys: rows.map((r) => r.querySelector('.shortcut-key')?.textContent.trim()),
+        groups: [...dialog.querySelectorAll('.section-title')].map((el) => el.textContent.trim()),
+        presets: [...dialog.querySelectorAll('.panel__section .btn-grid .btn')].map((b) => b.textContent.trim())
+      }
+    })()`)
+    check('快捷键面板已打开', shortcutPanel.open === true, JSON.stringify(shortcutPanel.open))
+    check('列出全部可配置动作', shortcutPanel.rowCount === 15, String(shortcutPanel.rowCount))
+    check(
+      '面板按"工具 / 相机飞行 / 通用"分组',
+      ['工具', '相机飞行', '通用'].every((g) => shortcutPanel.groups.includes(g)),
+      JSON.stringify(shortcutPanel.groups)
+    )
+    check(
+      '预设提供 本应用默认 / Maya / Blender',
+      ['本应用默认', 'Maya', 'Blender'].every((p) => shortcutPanel.presets.includes(p)),
+      JSON.stringify(shortcutPanel.presets)
+    )
+    check(
+      '默认显示 Q/W/E/R',
+      ['Q', 'W', 'E', 'R'].every((k) => shortcutPanel.keys.includes(k)),
+      JSON.stringify(shortcutPanel.keys.slice(0, 4))
+    )
+
+    // ---- 录制改键 ----
+    const recorded = await cdp.evaluate(`(async () => {
+      const dialog = document.querySelector('.dialog')
+      const row = [...dialog.querySelectorAll('.shortcut-row')].find(
+        (r) => r.querySelector('.shortcut-row__label')?.textContent.trim() === '移动工具'
+      )
+      row.querySelector('.shortcut-key').click()
+      await new Promise((r) => setTimeout(r, 250))
+      return {
+        recording: Boolean(dialog.querySelector('.shortcut-row.is-recording')),
+        hint: dialog.querySelector('.shortcut-recording')?.textContent.trim() ?? null
+      }
+    })()`)
+    check('点击按键格子进入录制态', recorded.recording === true, JSON.stringify(recorded))
+    check('录制态提示按 Esc 可取消', Boolean(recorded.hint) && recorded.hint.includes('Esc'), String(recorded.hint))
+
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 't' })
+    await sleep(80)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 't' })
+    await sleep(250)
+    const afterRecord = await cdp.evaluate(`(() => {
+      const dialog = document.querySelector('.dialog')
+      const row = [...dialog.querySelectorAll('.shortcut-row')].find(
+        (r) => r.querySelector('.shortcut-row__label')?.textContent.trim() === '移动工具'
+      )
+      return { key: row.querySelector('.shortcut-key').textContent.trim(), binding: ${STORE}.state.keybindings['tool.translate'] }
+    })()`)
+    check('录制把移动工具改成了 T', afterRecord.binding === 't' && afterRecord.key === 'T', JSON.stringify(afterRecord))
+
+    // 关闭面板验证改键真的生效、旧键真的失效
+    await cdp.evaluate(`(() => { ${STORE}.commit('setShortcutDialogOpen', false); return true })()`)
+    await sleep(400)
+    await cdp.evaluate(`(() => { ${STORE}.commit('setTransformMode', 'translate'); return true })()`)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 't' })
+    await sleep(60)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 't' })
+    await sleep(200)
+    const withT = await cdp.evaluate(`(() => ${STORE}.state.transformMode)()`)
+    await cdp.evaluate(`(() => { ${STORE}.commit('setTransformMode', 'rotate'); return true })()`)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'w' })
+    await sleep(60)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'w' })
+    await sleep(200)
+    const withW = await cdp.evaluate(`(() => ${STORE}.state.transformMode)()`)
+    check('新键 T 生效（切到移动）', withT === 'translate', String(withT))
+    check('旧键 W 不再切工具（起点 rotate 仍为 rotate）', withW === 'rotate', String(withW))
+    await cdp.evaluate(`(() => { ${STORE}.commit('resetKeybindings'); return true })()`)
+    await sleep(300)
+
+    // ---- 预设 ----
+    const presetBindings = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const step = (ms) => new Promise((r) => setTimeout(r, ms))
+      const pick = (label) => {
+        const dialog = document.querySelector('.dialog')
+        const btn = [...dialog.querySelectorAll('.panel__section .btn-grid .btn')].find(
+          (b) => b.textContent.trim() === label
+        )
+        if (btn) btn.click()
+      }
+      store.commit('setShortcutDialogOpen', true)
+      await step(400)
+      pick('Maya'); await step(400)
+      const maya = { ...store.state.keybindings }
+      pick('Blender'); await step(400)
+      const blender = { ...store.state.keybindings }
+      store.commit('setShortcutDialogOpen', false)
+      await step(300)
+      return { maya, blender }
+    })()`)
+    const mayaTools = ['tool.select', 'tool.translate', 'tool.rotate', 'tool.scale'].map((id) => presetBindings.maya[id])
+    const blenderTools = ['tool.select', 'tool.translate', 'tool.rotate', 'tool.scale'].map((id) => presetBindings.blender[id])
+    check('Maya 预设：Q/W/E/R 是选择/移动/旋转/缩放', JSON.stringify(mayaTools) === JSON.stringify(['q', 'w', 'e', 'r']), JSON.stringify(mayaTools))
+    check('Maya 预设：播放是 Alt+V', presetBindings.maya['timeline.play'] === 'alt+v', String(presetBindings.maya['timeline.play']))
+    check('Blender 预设：W/G/R/S 是选择/移动/旋转/缩放', JSON.stringify(blenderTools) === JSON.stringify(['w', 'g', 'r', 's']), JSON.stringify(blenderTools))
+    check('Blender 预设：播放是空格', presetBindings.blender['timeline.play'] === 'space', String(presetBindings.blender['timeline.play']))
+    check(
+      '相机飞行键三套预设一致（Maya 与 Blender 的飞行也是 WASD）',
+      ['nav.forward', 'nav.backward', 'nav.left', 'nav.right', 'nav.up', 'nav.down', 'nav.boost'].every(
+        (id) => presetBindings.maya[id] === presetBindings.blender[id]
+      ),
+      JSON.stringify(['nav.forward', 'nav.backward', 'nav.up', 'nav.down'].map((id) => presetBindings.blender[id]))
+    )
+
+    // Blender 预设下真的用 G 移动
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'g' })
+    await sleep(60)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'g' })
+    await sleep(220)
+    const blenderG = await cdp.evaluate(`(() => ${STORE}.state.transformMode)()`)
+    check('Blender 预设下 G 切到移动', blenderG === 'translate', String(blenderG))
+    await cdp.evaluate(`(() => { ${STORE}.commit('applyKeybindingPreset', 'default'); return true })()`)
+    await sleep(300)
+
+    // ---- 冲突提示 ----
+    const conflictUi = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const step = (ms) => new Promise((r) => setTimeout(r, ms))
+      store.commit('setShortcutDialogOpen', true)
+      await step(400)
+      const cleanCount = document.querySelectorAll('.dialog .field-hint--warn').length
+      // 把"缩放工具"也绑到 W：与"移动工具"同 scope，应判冲突
+      store.commit('setKeybinding', { actionId: 'tool.scale', binding: 'w' })
+      await step(500)
+      const warn = document.querySelector('.dialog .field-hint--warn')
+      const marked = document.querySelectorAll('.dialog .shortcut-key.is-conflict').length
+      store.commit('resetKeybindings')
+      await step(400)
+      return { cleanCount, text: warn ? warn.textContent.trim() : null, marked }
+    })()`)
+    check('默认绑定无冲突提示（W 跨 scope 是合法的）', conflictUi.cleanCount === 0, String(conflictUi.cleanCount))
+    check('同 scope 撞键会被提示', Boolean(conflictUi.text) && conflictUi.text.includes('冲突'), String(conflictUi.text))
+    check('冲突的按键格子被标出', conflictUi.marked >= 2, String(conflictUi.marked))
+    await cdp.evaluate(`(() => { ${STORE}.commit('setShortcutDialogOpen', false); return true })()`)
+    await sleep(300)
+
+    // ---- 持久化 ----
+    const persist = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      store.commit('setKeybinding', { actionId: 'tool.select', binding: 'z' })
+      await new Promise((r) => setTimeout(r, 400))
+      const raw = window.localStorage.getItem('xiaobaihe-keybindings')
+      store.commit('restoreKeybindings', { 'tool.select': 'hyper+z', bogus: 'q' })
+      await new Promise((r) => setTimeout(r, 300))
+      const sanitized = {
+        select: store.state.keybindings['tool.select'],
+        hasBogus: 'bogus' in store.state.keybindings,
+        count: Object.keys(store.state.keybindings).length
+      }
+      store.commit('resetKeybindings')
+      await new Promise((r) => setTimeout(r, 300))
+      return { raw, sanitized }
+    })()`)
+    check('绑定写入 localStorage', Boolean(persist.raw) && persist.raw.includes('"tool.select":"z"'), String(persist.raw).slice(0, 60))
+    check(
+      '非法存储被清洗并补齐缺失动作',
+      persist.sanitized.select === 'q' && persist.sanitized.hasBogus === false && persist.sanitized.count === 15,
+      JSON.stringify(persist.sanitized)
+    )
+
+    // ---- 按住类动作：改绑后仍能飞、松手能停 ----
+    await clickMenu(cdp, '相机', '进入相机视角')
+    await clickMenu(cdp, '相机', '导航：WASD 飞行')
+    await sleep(400)
+    const flyBefore = await cdp.evaluate(`(() => { const vm = ${VIEWPORT}; return { x: vm.camera.position.x, z: vm.camera.position.z } })()`)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'w' })
+    await sleep(800)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'w' })
+    await sleep(250)
+    const flyAfter = await cdp.evaluate(`(() => { const vm = ${VIEWPORT}; return { x: vm.camera.position.x, z: vm.camera.position.z } })()`)
+    check(
+      '默认 W 仍能飞行（改绑机制没破坏原有行为）',
+      Math.hypot(flyAfter.x - flyBefore.x, flyAfter.z - flyBefore.z) > 0.2,
+      `位移=${Math.hypot(flyAfter.x - flyBefore.x, flyAfter.z - flyBefore.z).toFixed(3)}`
+    )
+
+    await cdp.evaluate(`(() => { ${STORE}.commit('setKeybinding', { actionId: 'nav.forward', binding: 'i' }); return true })()`)
+    await sleep(300)
+    const rebindBefore = await cdp.evaluate(`(() => { const vm = ${VIEWPORT}; return { x: vm.camera.position.x, z: vm.camera.position.z } })()`)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'w' })
+    await sleep(700)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'w' })
+    await sleep(250)
+    const afterOldKey = await cdp.evaluate(`(() => { const vm = ${VIEWPORT}; return { x: vm.camera.position.x, z: vm.camera.position.z } })()`)
+    check(
+      '改绑后旧键 W 不再飞行',
+      Math.hypot(afterOldKey.x - rebindBefore.x, afterOldKey.z - rebindBefore.z) < 0.05,
+      `位移=${Math.hypot(afterOldKey.x - rebindBefore.x, afterOldKey.z - rebindBefore.z).toFixed(4)}`
+    )
+
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'i' })
+    await sleep(800)
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'i' })
+    await sleep(250)
+    const afterNewKey = await cdp.evaluate(`(() => { const vm = ${VIEWPORT}; return { x: vm.camera.position.x, z: vm.camera.position.z } })()`)
+    check(
+      '改绑后的新键 I 能飞行',
+      Math.hypot(afterNewKey.x - rebindBefore.x, afterNewKey.z - rebindBefore.z) > 0.2,
+      `位移=${Math.hypot(afterNewKey.x - rebindBefore.x, afterNewKey.z - rebindBefore.z).toFixed(3)}`
+    )
+    // 按住类动作最容易出的问题：松手还在飞
+    await sleep(700)
+    const settled = await cdp.evaluate(`(() => { const vm = ${VIEWPORT}; return { x: vm.camera.position.x, z: vm.camera.position.z } })()`)
+    check(
+      '松开新键后相机停下（不会一直飞）',
+      Math.hypot(settled.x - afterNewKey.x, settled.z - afterNewKey.z) < 0.05,
+      `松手后位移=${Math.hypot(settled.x - afterNewKey.x, settled.z - afterNewKey.z).toFixed(4)}`
+    )
+
+    await cdp.evaluate(`(() => { ${STORE}.commit('resetKeybindings'); return true })()`)
+    await sleep(300)
+    await clickMenu(cdp, '相机', '退出相机视角')
+    await sleep(300)
+
+    // ---- Esc 不参与配置 ----
+    const escBinding = await cdp.evaluate(`(() => {
+      const values = Object.values(${STORE}.state.keybindings)
+      return { hasEscape: values.includes('escape'), count: values.length }
+    })()`)
+    check('Esc 不在可配置绑定里（它是全局取消键）', escBinding.hasEscape === false, JSON.stringify(escBinding))
+
+    // ===================== 二十一、全景图背景 =====================
+    /*
+     * 全景图当天空盒：任何机位都像"站在那张图里"。
+     *
+     * 关键不变量：
+     * - 工程里**只存文件名引用**（几 MB 的图塞进 JSON 会让每次保存都重传）；
+     * - `mapping` 必须是等距圆柱（303），否则会被当平面贴图铺在背景上；
+     * - `colorSpace` 必须是 sRGB，否则整张图偏暗发灰；
+     * - 换了背景必须进指纹（否则关窗口就丢）；
+     * - 存盘重开后要还在（`openProject` 曾把 background 漏掉）。
+     */
+    const panoPng =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=='
+
+    const panoApplied = await cdp.evaluate(`(async () => {
+      const editor = document.querySelector('.editor').__vue__
+      const bytes = Uint8Array.from(atob(${JSON.stringify(panoPng)}), (c) => c.charCodeAt(0))
+      const file = new File([bytes], '全景测试.png', { type: 'image/png' })
+      await editor.uploadPanorama(file)
+      /*
+       * 必须「轮询等纹理真的挂上」，不能固定 sleep：
+       * 纹理要经过 HTTP 取图 + 解码，实测抖到 1.2s 左右，
+       * 写死 1200ms 会偶发读到还没挂上的状态（曾经因此假失败）。
+       */
+      const vm0 = ${VIEWPORT}
+      const deadline = Date.now() + 15000
+      while (Date.now() < deadline) {
+        const bg = vm0.scene.background
+        if (bg && bg.isTexture && bg.image && bg.image.width > 0) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      const store = ${STORE}
+      const vm = ${VIEWPORT}
+      const bg = vm.scene.background
+      return {
+        fileName: store.state.history.present.background.panoramaFileName,
+        sourceName: store.state.history.present.background.panoramaSourceName,
+        dirty: store.getters.isDirty,
+        isTexture: Boolean(bg && bg.isTexture),
+        isEquirect: Boolean(bg && bg.mapping === 303),
+        colorSpace: bg ? bg.colorSpace : null,
+        environmentSet: Boolean(vm.scene.environment)
+      }
+    })()`)
+    check(
+      '上传全景图后工程里只记文件名（不是 base64）',
+      /\.png$/i.test(panoApplied.fileName || '') && !String(panoApplied.fileName).startsWith('data:'),
+      String(panoApplied.fileName)
+    )
+    check('保留了原始文件名用于显示', panoApplied.sourceName === '全景测试.png', String(panoApplied.sourceName))
+    check('应用背景被判成"有未保存修改"', panoApplied.dirty === true, String(panoApplied.dirty))
+    check(
+      'scene.background 是等距圆柱纹理（不是平面贴图）',
+      panoApplied.isTexture && panoApplied.isEquirect,
+      JSON.stringify(panoApplied)
+    )
+    check('色彩空间声明为 sRGB', panoApplied.colorSpace === 'srgb', String(panoApplied.colorSpace))
+    check('默认不参与环境光照', panoApplied.environmentSet === false, String(panoApplied.environmentSet))
+
+    const panoParams = await cdp.evaluate(`(async () => {
+      const editor = document.querySelector('.editor').__vue__
+      const vm = ${VIEWPORT}
+      editor.updateBackground({ rotateDegrees: 90, intensity: 1.6, affectsLighting: true })
+      await new Promise((r) => setTimeout(r, 800))
+      return {
+        rotateY: +(vm.scene.backgroundRotation.y * 180 / Math.PI).toFixed(2),
+        intensity: vm.scene.backgroundIntensity,
+        envIsBackground: vm.scene.environment === vm.scene.background
+      }
+    })()`)
+    check('水平旋转生效', Math.abs(panoParams.rotateY - 90) < 1, String(panoParams.rotateY))
+    check('背景亮度生效', Math.abs(panoParams.intensity - 1.6) < 0.01, String(panoParams.intensity))
+    check('开启后全景图同时作为环境光照', panoParams.envIsBackground === true, JSON.stringify(panoParams))
+
+    const panoDrop = await cdp.evaluate(`(async () => {
+      const root = document.querySelector('.viewport')
+      const bytes = Uint8Array.from(atob(${JSON.stringify(panoPng)}), (c) => c.charCodeAt(0))
+      const file = new File([bytes], '拖进来的全景.png', { type: 'image/png' })
+      const dt = new DataTransfer()
+      dt.items.add(file)
+      const over = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt })
+      root.dispatchEvent(over)
+      // Vue 的 DOM 更新是异步的，等两帧再读 class
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+      const highlighted = root.classList.contains('is-panorama-drop')
+      root.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }))
+      await new Promise((r) => setTimeout(r, 1400))
+      return {
+        overPrevented: over.defaultPrevented,
+        highlighted,
+        stillHighlighted: root.classList.contains('is-panorama-drop'),
+        sourceName: ${STORE}.state.history.present.background.panoramaSourceName
+      }
+    })()`)
+    check('拖到视口上有高亮提示', panoDrop.highlighted === true, String(panoDrop.highlighted))
+    check('拖拽被接管（阻止浏览器"打开图片"）', panoDrop.overPrevented === true, String(panoDrop.overPrevented))
+    check('松手后提示消失', panoDrop.stillHighlighted === false, String(panoDrop.stillHighlighted))
+    check('拖进来的图被应用为背景', panoDrop.sourceName === '拖进来的全景.png', String(panoDrop.sourceName))
+
+    const panoPersist = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const saved = await store.dispatch('saveProject', {})
+      const projectId = saved.projectId || store.state.projectId
+      const doc = await fetch('/api/projects/' + projectId, { credentials: 'include' }).then((r) => r.json())
+      const background = doc.document ? doc.document.scene.background : doc.scene.background
+      await store.dispatch('openProject', projectId)
+      await new Promise((r) => setTimeout(r, 1600))
+      const vm = ${VIEWPORT}
+      return {
+        projectId,
+        savedFileName: background ? background.panoramaFileName : null,
+        reopenedFileName: store.state.history.present.background.panoramaFileName,
+        reopenedHasBackground: Boolean(vm.scene.background),
+        reopenedIsEquirect: Boolean(vm.scene.background && vm.scene.background.mapping === 303)
+      }
+    })()`)
+    check(
+      '存盘文档里带上了背景（只有文件名，无图片数据）',
+      /\.png$/i.test(panoPersist.savedFileName || '') && !String(panoPersist.savedFileName).startsWith('data:'),
+      String(panoPersist.savedFileName)
+    )
+    check(
+      '重新打开工程后背景配置还在',
+      /\.png$/i.test(panoPersist.reopenedFileName || ''),
+      String(panoPersist.reopenedFileName)
+    )
+    check(
+      '重新打开后天空盒重新加载出来了',
+      panoPersist.reopenedHasBackground === true && panoPersist.reopenedIsEquirect === true,
+      JSON.stringify({ bg: panoPersist.reopenedHasBackground, equirect: panoPersist.reopenedIsEquirect })
+    )
+
+    const panoRemoved = await cdp.evaluate(`(async () => {
+      const editor = document.querySelector('.editor').__vue__
+      const vm = ${VIEWPORT}
+      editor.removePanorama()
+      await new Promise((r) => setTimeout(r, 900))
+      return {
+        fileName: ${STORE}.state.history.present.background.panoramaFileName,
+        hasBackground: Boolean(vm.scene.background),
+        hasEnvironment: Boolean(vm.scene.environment)
+      }
+    })()`)
+    check('移除后工程里文件名清空', panoRemoved.fileName === '', JSON.stringify(panoRemoved.fileName))
+    check(
+      '移除后天空盒与环境光照都清空',
+      panoRemoved.hasBackground === false && panoRemoved.hasEnvironment === false,
+      JSON.stringify(panoRemoved)
+    )
+
+    // ===================== 二十二、人台比例 =====================
+    /*
+     * 人台曾经有三处比例问题，且都只在"看画面"时才暴露：
+     *
+     * 1. 根节点按 `size` 三分量缩放，而 `size` 存的是 `{x:1, y:身高, z:1}`
+     *    → 人物被竖直拉伸 1.75 倍（又细又长）；
+     * 2. 控制骨架实际包围盒是 0.9883 高、脚底 -0.5475，而外观按 1.0 / -0.5
+     *    归一化 → 关节手柄比画出来的身体低 13% 身高（≈24cm），脚底陷地 8cm；
+     * 3. 骨架比例按"教科书 7.5 头身"，而随附 GLB 是 6 头身 → 肩/头又偏高 5%。
+     *
+     * 现在骨架比例按 GLB 的**实测**骨骼位置定，这里做端到端校验。
+     */
+    const mannequin = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      editor.addMannequin()
+      /*
+       * 必须等外观 GLB 真的挂上再量，不能只 sleep：
+       * GLB 有 7.3MB，没加载完时包围盒只有控制骨架（宽/高 ≈ 0.29），
+       * 会让"身材不是细长条"这条断言假失败。
+       */
+      const vmWait = ${VIEWPORT}
+      const deadline = Date.now() + 20000
+      let root0 = null
+      while (Date.now() < deadline) {
+        const object0 = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+        root0 = object0 ? vmWait.rootMap.get(object0.id) : null
+        if (root0 && root0.userData.mannequinVisual) break
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      await new Promise((r) => setTimeout(r, 400))
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      const vm = ${VIEWPORT}
+      const root = vm.rootMap.get(object.id)
+      const visual = root.userData.mannequinVisual
+      root.updateMatrixWorld(true)
+
+      // 包围盒（自己算，避免依赖 THREE 模块作用域）
+      const min = { x: Infinity, y: Infinity, z: Infinity }
+      const max = { x: -Infinity, y: -Infinity, z: -Infinity }
+      const stack = [root]
+      while (stack.length) {
+        const node = stack.pop()
+        for (const c of node.children) stack.push(c)
+        if (!node.isMesh || !node.geometry) continue
+        node.geometry.computeBoundingBox()
+        const bb = node.geometry.boundingBox
+        if (!bb) continue
+        const m = node.matrixWorld.elements
+        for (const xs of [bb.min.x, bb.max.x])
+          for (const ys of [bb.min.y, bb.max.y])
+            for (const zs of [bb.min.z, bb.max.z]) {
+              const wx = m[0]*xs + m[4]*ys + m[8]*zs + m[12]
+              const wy = m[1]*xs + m[5]*ys + m[9]*zs + m[13]
+              const wz = m[2]*xs + m[6]*ys + m[10]*zs + m[14]
+              min.x = Math.min(min.x, wx); max.x = Math.max(max.x, wx)
+              min.y = Math.min(min.y, wy); max.y = Math.max(max.y, wy)
+              min.z = Math.min(min.z, wz); max.z = Math.max(max.z, wz)
+            }
+      }
+      const height = max.y - min.y
+      const scratch = root.position.clone()
+      const at = (id) => {
+        root.userData.mannequinJoints.get(id).getWorldPosition(scratch)
+        return +(((scratch.y - min.y) / height).toFixed(3))
+      }
+      const boneAt = (name) => {
+        const bone = visual?.bones?.get(name)
+        if (!bone) return null
+        bone.getWorldPosition(scratch)
+        return +(((scratch.y - min.y) / height).toFixed(3))
+      }
+      return {
+        size: { ...object.size },
+        scale: { x: root.scale.x, y: root.scale.y, z: root.scale.z },
+        footY: +min.y.toFixed(4),
+        headY: +max.y.toFixed(4),
+        height: +height.toFixed(4),
+        width: +(max.x - min.x).toFixed(3),
+        depth: +(max.z - min.z).toFixed(3),
+        visualLoaded: Boolean(visual),
+        rig: {
+          knee: at('leftKnee'),
+          hip: at('leftHip'),
+          spine: at('spine'),
+          shoulder: at('leftShoulder'),
+          elbow: at('leftElbow'),
+          head: at('head')
+        },
+        bones: {
+          calf: boneAt('calf_l'),
+          thigh: boneAt('thigh_l'),
+          spine: boneAt('spine_01'),
+          upperarm: boneAt('upperarm_l'),
+          lowerarm: boneAt('lowerarm_l'),
+          head: boneAt('Head')
+        }
+      }
+    })()`)
+
+    check(
+      '人台根节点是等比缩放（以前竖直拉伸 1.75 倍）',
+      Math.abs(mannequin.scale.x - mannequin.scale.y) < 1e-6 &&
+        Math.abs(mannequin.scale.z - mannequin.scale.y) < 1e-6,
+      JSON.stringify(mannequin.scale)
+    )
+    check(
+      'size 三个分量相等（否则会被拉伸）',
+      Math.abs(mannequin.size.x - mannequin.size.y) < 1e-6 &&
+        Math.abs(mannequin.size.z - mannequin.size.y) < 1e-6,
+      JSON.stringify(mannequin.size)
+    )
+    check('脚底正好落在世界 y=0（不陷地也不悬空）', Math.abs(mannequin.footY) < 0.002, String(mannequin.footY))
+    check(
+      '头顶高度等于设定身高（1.75）',
+      Math.abs(mannequin.headY - mannequin.size.y) < 0.002,
+      `${mannequin.headY} vs ${mannequin.size.y}`
+    )
+    check(
+      '身材不是细长条：宽度/高度在合理范围',
+      /*
+       * 这条必须在外观挂上之后量，否则包围盒只有控制骨架（宽/高≈0.29）会假失败。
+       * 摆好姿势的人体约 0.55（臂在体侧），T-pose 约 1.06（臂展开），
+       * 所以 0.5~1.2 这个带宽同时容纳两种状态，但排除"竖直拉伸"。
+       */
+      mannequin.visualLoaded === true &&
+        mannequin.width / mannequin.height > 0.5 &&
+        mannequin.width / mannequin.height < 1.2,
+      `visual=${mannequin.visualLoaded} w=${mannequin.width} h=${mannequin.height} ratio=${(mannequin.width / mannequin.height).toFixed(2)}`
+    )
+    check(
+      '关节高度落在人体标准位置（髋≈0.49 肩≈0.77 膝≈0.28）',
+      Math.abs(mannequin.rig.hip - 0.49) < 0.02 &&
+        Math.abs(mannequin.rig.shoulder - 0.769) < 0.02 &&
+        Math.abs(mannequin.rig.knee - 0.284) < 0.02,
+      JSON.stringify(mannequin.rig)
+    )
+
+    // 最关键的一条：控制手柄必须和**画出来的人体**对齐，否则拖关节会拖错部位。
+    if (mannequin.visualLoaded) {
+      const pairs = [
+        ['膝', mannequin.rig.knee, mannequin.bones.calf],
+        ['髋', mannequin.rig.hip, mannequin.bones.thigh],
+        ['脊柱', mannequin.rig.spine, mannequin.bones.spine],
+        ['肩', mannequin.rig.shoulder, mannequin.bones.upperarm],
+        ['肘', mannequin.rig.elbow, mannequin.bones.lowerarm],
+        ['头', mannequin.rig.head, mannequin.bones.head]
+      ]
+      const worst = pairs.reduce(
+        (acc, [label, rigY, boneY]) => {
+          if (boneY === null) return acc
+          const diff = Math.abs(rigY - boneY)
+          return diff > acc.diff ? { label, diff, rigY, boneY } : acc
+        },
+        { label: '', diff: 0 }
+      )
+      check(
+        '关节手柄与外观骨骼对齐（偏差 <2% 身高）',
+        worst.diff < 0.02,
+        `${worst.label}: 控制 ${worst.rigY} vs 外观 ${worst.boneY}，偏差 ${(worst.diff * 100).toFixed(1)}%`
+      )
+    }
+
+    // 改身高也只能等比缩放
+    const resized = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      const feetBefore = object.position.y - object.size.y / 2
+      editor.updateMannequinHeight({ id: object.id, heightMeters: 1.9 })
+      await new Promise((r) => setTimeout(r, 1200))
+      const after = store.state.history.present.objects.find((o) => o.id === object.id)
+      const vm = ${VIEWPORT}
+      const root = vm.rootMap.get(object.id)
+      return {
+        size: { ...after.size },
+        scale: { x: root.scale.x, y: root.scale.y, z: root.scale.z },
+        feetBefore: +feetBefore.toFixed(4),
+        feetAfter: +(after.position.y - after.size.y / 2).toFixed(4)
+      }
+    })()`)
+    check(
+      '改身高后仍是等比缩放',
+      Math.abs(resized.scale.x - resized.scale.y) < 1e-6 && Math.abs(resized.scale.z - resized.scale.y) < 1e-6,
+      JSON.stringify(resized.scale)
+    )
+    check(
+      '改身高时脚底高度不变',
+      Math.abs(resized.feetAfter - resized.feetBefore) < 0.002,
+      `${resized.feetBefore} → ${resized.feetAfter}`
+    )
+
+    // ===================== 二十三、导入模型持久化 =====================
+    /*
+     * 以前导入的模型只活在内存 Map 里：重新打开工程就只剩一个占位方块。
+     * 现在工程里只存**文件引用**（主文件 + 全部依赖资源），几何体靠
+     * "按引用下载 → 重新 importStaticModel"恢复。这里用一个最小 glTF
+     * （一个三角形 + 外部 .bin）走完整条真实路径：
+     *
+     *   editor.handleModelFiles → 上传 exports → 存盘 → **刷新页面**
+     *   → 重新打开工程 → 断言三角面数真的 > 0
+     *
+     * 必须刷新页面：`importedModels` / `importedLoads` 都是组件内存状态，
+     * 不刷新的话"重新打开工程"会命中本次导入的缓存，恢复逻辑根本不会执行，
+     * 测试会假通过。
+     */
+    const miniPositions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0])
+    const miniIndices = new Uint16Array([0, 1, 2])
+    const miniBin = Buffer.concat([
+      Buffer.from(miniPositions.buffer, miniPositions.byteOffset, miniPositions.byteLength),
+      Buffer.from(miniIndices.buffer, miniIndices.byteOffset, miniIndices.byteLength)
+    ])
+    const miniGltf = {
+      asset: { version: '2.0' },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ name: 'triangle', mesh: 0 }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1 }] }],
+      buffers: [{ uri: 'mini-mesh.bin', byteLength: miniBin.byteLength }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: 36, target: 34962 },
+        { buffer: 0, byteOffset: 36, byteLength: 6, target: 34963 }
+      ],
+      accessors: [
+        {
+          bufferView: 0,
+          componentType: 5126,
+          count: 3,
+          type: 'VEC3',
+          min: [0, 0, 0],
+          max: [1, 1, 0]
+        },
+        { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' }
+      ]
+    }
+    const miniGltfText = JSON.stringify(miniGltf)
+    const miniBinBase64 = miniBin.toString('base64')
+
+    /*
+     * 页面内统计一棵 three.js 子树的面数。
+     *
+     * 场景探针只给出"有哪些物体"，不提供面数；而"恢复了没有"这件事
+     * 只能用真实几何体证明——占位方块的 children 也是 1。
+     */
+    const TRIANGLE_COUNT = `((root) => {
+      let total = 0
+      root.traverse((child) => {
+        if (!child.isMesh || !child.geometry) return
+        const geometry = child.geometry
+        const count = geometry.index
+          ? geometry.index.count
+          : (geometry.getAttribute('position') || { count: 0 }).count
+        total += Math.floor((count || 0) / 3)
+      })
+      return total
+    })`
+
+    const importPath = await cdp.evaluate(`(async () => {
+      const editor = document.querySelector('.editor').__vue__
+      const store = ${STORE}
+      const bin = Uint8Array.from(atob(${JSON.stringify(miniBinBase64)}), (c) => c.charCodeAt(0))
+      const files = [
+        new File([${JSON.stringify(miniGltfText)}], 'mini.gltf', { type: 'model/gltf+json' }),
+        new File([bin], 'mini-mesh.bin', { type: 'application/octet-stream' })
+      ]
+      await editor.handleModelFiles({ target: { files, value: '' } })
+      await new Promise((r) => setTimeout(r, 3000))
+      const object = store.state.history.present.objects.filter((item) => item.kind === 'imported').pop()
+      const vm = ${VIEWPORT}
+      const root = object ? vm.rootMap.get(object.id) : null
+      const asset = object ? object.importedAsset : null
+      const mainFileName = asset && asset.files ? asset.files.main.fileName : null
+      const mainResponse = mainFileName
+        ? await fetch('/api/exports/' + encodeURIComponent(mainFileName), { credentials: 'include' })
+        : null
+      return {
+        id: object ? object.id : null,
+        format: asset ? asset.format : null,
+        reportTriangles: asset && asset.report ? asset.report.triangleCount : 0,
+        mainFileName,
+        resourceNames: asset && asset.files ? asset.files.resources.map((item) => item.name) : [],
+        resourceFileNames: asset && asset.files ? asset.files.resources.map((item) => item.fileName) : [],
+        hasInlineData: Boolean(asset && (asset.primaryData || asset.resources)),
+        mainRetrievable: Boolean(mainResponse && mainResponse.ok),
+        triangles: root ? (${TRIANGLE_COUNT})(root) : 0,
+        children: root ? root.children.length : 0,
+        // 占位方块本身有 12 个三角面，所以"面数 > 0"证明不了模型加载出来了。
+        placeholderOnly: Boolean(
+          root &&
+            root.children.length === 1 &&
+            root.children[0].geometry &&
+            root.children[0].geometry.type === 'BoxGeometry'
+        ),
+        dirty: store.getters.isDirty
+      }
+    })()`)
+    check(
+      '导入后工程里记下了主文件引用',
+      /\.gltf$/i.test(importPath.mainFileName || ''),
+      String(importPath.mainFileName)
+    )
+    check(
+      '依赖 .bin 也记了引用（name 保原始名 / fileName 用服务端名）',
+      importPath.resourceNames.includes('mini-mesh.bin') &&
+        importPath.resourceFileNames.length === 1 &&
+        /\.bin$/i.test(importPath.resourceFileNames[0] || ''),
+      JSON.stringify({ names: importPath.resourceNames, files: importPath.resourceFileNames })
+    )
+    check('工程里不存模型 base64（只存文件名引用）', importPath.hasInlineData === false)
+    check('主文件能从 /api/exports 取回（同源、带 cookie）', importPath.mainRetrievable === true)
+    check(
+      '导入后立刻看到真实几何体（占位方块已被替换）',
+      importPath.triangles > 0 &&
+        importPath.triangles === importPath.reportTriangles &&
+        importPath.placeholderOnly === false,
+      `triangles=${importPath.triangles} report=${importPath.reportTriangles} placeholderOnly=${importPath.placeholderOnly}`
+    )
+    check('导入被判成"有未保存修改"', importPath.dirty === true, String(importPath.dirty))
+
+    const importSaved = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      await store.dispatch('saveProject', {})
+      const projectId = store.state.projectId
+      const payload = await fetch('/api/projects/' + encodeURIComponent(projectId), {
+        credentials: 'include'
+      }).then((r) => r.json())
+      const documentData = payload.document || payload
+      const stored = documentData.scene.objects.filter((item) => item.kind === 'imported').pop()
+      const asset = stored ? stored.importedAsset : null
+      return {
+        projectId,
+        schemaVersion: documentData.schemaVersion,
+        mainFileName: asset && asset.files ? asset.files.main.fileName : null,
+        resourceCount: asset && asset.files ? asset.files.resources.length : -1,
+        hasInlineData: Boolean(asset && (asset.primaryData || asset.resources))
+      }
+    })()`)
+    check('存盘文档的 schema 版本为 19', importSaved.schemaVersion === 19, String(importSaved.schemaVersion))
+    check(
+      '存盘后模型文件引用仍在（主文件 + 依赖）',
+      /\.gltf$/i.test(importSaved.mainFileName || '') && importSaved.resourceCount === 1,
+      JSON.stringify(importSaved)
+    )
+    check('存盘文档里没有模型 base64', importSaved.hasInlineData === false)
+
+    /*
+     * 刷新页面：把所有内存缓存（`importedModels` / `importedLoads` /
+     * Editor 的 `importedModels`）全部清掉，模拟"关掉再打开"。
+     */
+    await cdp.send('Page.navigate', { url: `${BASE_URL}/editor` })
+    await waitFor(cdp, 'Boolean(document.querySelector(".editor"))', { label: '编辑器（刷新后）' })
+    await sleep(2200)
+    const recoveryAfterReload = await cdp.evaluate(`(() => {
+      const dialog = document.querySelector('.dialog')
+      if (!dialog) return 'none'
+      const discard = [...dialog.querySelectorAll('button')].find((b) => b.textContent.trim() === '放弃')
+      if (discard) { discard.click(); return 'discarded' }
+      return 'other'
+    })()`)
+    console.log(`   [环境] 刷新后恢复对话框: ${recoveryAfterReload}`)
+    await sleep(700)
+
+    const importRestored = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const projectId = ${JSON.stringify(importSaved.projectId)}
+      // 产品里"重新打开工程"就是这条 action；此时内存里已经没有任何模型缓存。
+      await store.dispatch('openProject', projectId)
+      const vm = ${VIEWPORT}
+      const cachedBefore = vm.importedModels.size
+      const deadline = Date.now() + 20000
+      let object = null
+      let root = null
+      let triangles = 0
+      let reportTriangles = 0
+      let placeholderOnly = true
+      while (Date.now() < deadline) {
+        object = store.state.history.present.objects.filter((item) => item.kind === 'imported').pop()
+        root = object && vm.rootMap ? vm.rootMap.get(object.id) : null
+        triangles = root ? (${TRIANGLE_COUNT})(root) : 0
+        reportTriangles =
+          object && object.importedAsset && object.importedAsset.report
+            ? object.importedAsset.report.triangleCount
+            : 0
+        placeholderOnly = Boolean(
+          root &&
+            root.children.length === 1 &&
+            root.children[0].geometry &&
+            root.children[0].geometry.type === 'BoxGeometry'
+        )
+        // 占位方块也有 12 个面，所以必须等到"面数等于报告值且不再是占位方块"。
+        if (reportTriangles > 0 && triangles === reportTriangles && !placeholderOnly) break
+        await new Promise((r) => setTimeout(r, 300))
+      }
+      const asset = object ? object.importedAsset : null
+      const requests = performance.getEntriesByType('resource').map((entry) => entry.name)
+      const mainFileName = ${JSON.stringify(importSaved.mainFileName)}
+      return {
+        found: Boolean(object),
+        id: object ? object.id : null,
+        triangles,
+        children: root ? root.children.length : 0,
+        reportTriangles,
+        placeholderOnly,
+        filesRestored: Boolean(asset && asset.files),
+        cachedBefore,
+        downloadedMain: requests.some(
+          (name) => name.indexOf('/api/exports/') >= 0 && name.indexOf(mainFileName) >= 0
+        ),
+        warnings: window.__XBH_DIAGNOSE__.entries()
+          .filter((entry) => entry.source === 'imported-model')
+          .map((entry) => entry.message)
+      }
+    })()`)
+    check('刷新后模型缓存确实是空的（否则下面测不出恢复）', importRestored.cachedBefore === 0, String(importRestored.cachedBefore))
+    check('重新打开工程后导入物体还在', importRestored.found === true)
+    check(
+      '模型几何体真的恢复了（占位方块已被替换）',
+      importRestored.triangles > 0 && importRestored.placeholderOnly === false,
+      `triangles=${importRestored.triangles} placeholderOnly=${importRestored.placeholderOnly}`
+    )
+    check(
+      '恢复的是真实网格：面数等于导入时记录的面数',
+      importRestored.triangles === importRestored.reportTriangles && importRestored.children > 0,
+      JSON.stringify({
+        triangles: importRestored.triangles,
+        report: importRestored.reportTriangles,
+        children: importRestored.children
+      })
+    )
+    check(
+      '恢复时确实按引用下载了主文件（不是靠内存缓存）',
+      importRestored.downloadedMain === true,
+      String(importRestored.downloadedMain)
+    )
+    check(
+      '恢复过程没有记录警告（没有 404 / 解析失败）',
+      importRestored.warnings.length === 0,
+      importRestored.warnings.join(' | ')
+    )
+
+    /*
+     * 向后兼容：v17 及更早的工程里 `importedAsset` 只有 format / sourceName / report，
+     * 没有文件引用。这种工程必须能照常打开——占位方块留着，但不许报错。
+     */
+    const legacyImported = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const vm = ${VIEWPORT}
+      const scene = store.state.history.present
+      const imported = scene.objects.filter((item) => item.kind === 'imported').pop()
+      if (!imported) return { skipped: true }
+      const legacy = JSON.parse(JSON.stringify(imported))
+      legacy.id = 'legacy-imported'
+      delete legacy.importedAsset.files
+      store.commit('resetScene', {
+        objects: [legacy],
+        camera: scene.camera,
+        lighting: scene.lighting,
+        timeline: scene.timeline,
+        background: scene.background
+      })
+      await new Promise((r) => setTimeout(r, 1500))
+      const root = vm.rootMap.get('legacy-imported')
+      return {
+        skipped: false,
+        hasRoot: Boolean(root),
+        children: root ? root.children.length : 0,
+        triangles: root ? (${TRIANGLE_COUNT})(root) : 0,
+        placeholderOnly: Boolean(
+          root &&
+            root.children.length === 1 &&
+            root.children[0].geometry &&
+            root.children[0].geometry.type === 'BoxGeometry'
+        ),
+        hasFiles: Boolean(legacy.importedAsset.files),
+        warnings: window.__XBH_DIAGNOSE__.entries()
+          .filter((entry) => entry.source === 'imported-model')
+          .map((entry) => entry.message)
+      }
+    })()`)
+    check(
+      '老工程（没有文件引用）照常打开、只显示占位方块',
+      legacyImported.skipped === false &&
+        legacyImported.hasRoot === true &&
+        legacyImported.placeholderOnly === true &&
+        legacyImported.hasFiles === false,
+      JSON.stringify(legacyImported)
+    )
+
+    // ===================== 二十四、姿势参数面板 =====================
+    /*
+     * Live2D / VTube 那种"一条参数一根滑块"的关节参数面板。
+     *
+     * 光看 store 里的数字变化不算通过——这类功能最容易出的问题是
+     * **"数据变了但画面没动"**，所以这里必须量到：
+     * - 控制骨架关节的实际旋转（three 的 joint.rotation）；
+     * - 外观 GLB 骨骼的实际朝向（手动覆盖是否真的盖过了动作预设）。
+     *
+     * 注意：上一节结束时工程里是"老工程 + 导入物体"，没有人台，
+     * 所以这里先新建一个并确保它被选中（面板只在选中人台时渲染）。
+     */
+      const posePanel = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      editor.addMannequin()
+      /*
+       * 等外观 GLB 挂上再做（下面要量 GLB 骨骼四元数，没挂上就是 null）。
+       * 固定 sleep 会偶发太早——7.3MB 的模型加载时间有抖动。
+       */
+      const vmWait = ${VIEWPORT}
+      const deadline = Date.now() + 20000
+      while (Date.now() < deadline) {
+        const candidate = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+        const candidateRoot = candidate ? vmWait.rootMap.get(candidate.id) : null
+        if (candidateRoot && candidateRoot.userData.mannequinVisual) break
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      await new Promise((r) => setTimeout(r, 400))
+
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      if (!object) return { error: '没有新建出人台' }
+      const vm = ${VIEWPORT}
+      const root = vm.rootMap.get(object.id)
+      const joints = root.userData.mannequinJoints
+      const visual = root.userData.mannequinVisual
+
+      const deg = (rad) => +((rad * 180) / Math.PI).toFixed(2)
+      const rigRotation = (id) => ({
+        x: deg(joints.get(id).rotation.x),
+        y: deg(joints.get(id).rotation.y),
+        z: deg(joints.get(id).rotation.z)
+      })
+      // 外观骨骼的世界朝向——用来确认"手动覆盖真的生效了"（骨架变了不算）
+      const boneQuat = (name) => {
+        const bone = visual?.bones?.get(name)
+        if (!bone) return null
+        bone.updateWorldMatrix(true, false)
+        const q = bone.matrixWorld.decompose
+          ? (() => {
+              const p = root.position.clone()
+              const s = root.scale.clone()
+              const out = bone.quaternion.clone()
+              bone.matrixWorld.decompose(p, out, s)
+              return out
+            })()
+          : bone.quaternion.clone()
+        return [q.x, q.y, q.z, q.w].map((v) => +v.toFixed(5))
+      }
+
+      const panel = document.querySelector('.pose-panel')
+      const sliders = panel ? [...panel.querySelectorAll('.pose-axis__range')] : []
+      const disabled = panel ? [...panel.querySelectorAll('.pose-axis__range:disabled')] : []
+
+      const before = {
+        rigHead: rigRotation('head'),
+        manualJoints: [
+          ...(store.state.history.present.objects.find((o) => o.id === object.id).mannequin.manualJoints ?? [])
+        ],
+        boneHead: boneQuat('Head')
+      }
+
+      // 走界面真实路径：找到"头部"那一行的 Y 轴滑块，派发 input 事件
+      const headPanel = panel
+        ? [...panel.querySelectorAll('.pose-joint')].find((j) =>
+            j.querySelector('.pose-joint__label')?.textContent.includes('头部')
+          )
+        : null
+      const headYSlider = headPanel
+        ? [...headPanel.querySelectorAll('.pose-axis')]
+            .find((a) => a.querySelector('.pose-axis__name').textContent.trim() === 'Y')
+            ?.querySelector('input')
+        : null
+      if (headYSlider) {
+        headYSlider.value = '35'
+        headYSlider.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      await new Promise((r) => setTimeout(r, 1000))
+
+      const afterHead = store.state.history.present.objects.find((o) => o.id === object.id).mannequin
+      const mid = {
+        rigHead: rigRotation('head'),
+        poseHead: { ...afterHead.pose.head },
+        manualJoints: [...(afterHead.manualJoints ?? [])],
+        boneHead: boneQuat('Head'),
+        dirty: store.getters.isDirty
+      }
+
+      // 肘是单向关节（0~145）：传入负值必须被夹住
+      editor.updateJointAngle({ id: object.id, jointId: 'leftElbow', axis: 'x', value: -50 })
+      await new Promise((r) => setTimeout(r, 700))
+      const clamped = store.state.history.present.objects.find((o) => o.id === object.id).mannequin.pose
+        .leftElbow
+
+      // 只改一个轴，另外两轴不能被清零
+      editor.updateJointAngle({ id: object.id, jointId: 'leftElbow', axis: 'y', value: 10 })
+      await new Promise((r) => setTimeout(r, 700))
+      const twoAxes = store.state.history.present.objects.find((o) => o.id === object.id).mannequin.pose
+        .leftElbow
+
+      editor.resetMannequinPose({ id: object.id })
+      await new Promise((r) => setTimeout(r, 1000))
+      const afterReset = store.state.history.present.objects.find((o) => o.id === object.id).mannequin
+
+      return {
+        panelRendered: Boolean(panel),
+        sliderCount: sliders.length,
+        disabledCount: disabled.length,
+        jointCount: panel ? panel.querySelectorAll('.pose-joint').length : 0,
+        groupCount: panel ? panel.querySelectorAll('.pose-group').length : 0,
+        hadSlider: Boolean(headYSlider),
+        before,
+        mid,
+        clamped,
+        twoAxes,
+        afterReset: {
+          poseHead: { ...afterReset.pose.head },
+          manualJoints: [...(afterReset.manualJoints ?? [])],
+          rigHead: rigRotation('head')
+        }
+      }
+    })()`)
+
+    if (posePanel.error) throw new Error(posePanel.error)
+
+    check('姿势面板已渲染', posePanel.panelRendered === true, String(posePanel.panelRendered))
+    check(
+      '每个关节三根滑块（10 关节 = 30 根）',
+      posePanel.sliderCount === 30 && posePanel.jointCount === 10,
+      `sliders=${posePanel.sliderCount} joints=${posePanel.jointCount}`
+    )
+    check('关节按身体部位分组', posePanel.groupCount >= 2, String(posePanel.groupCount))
+    check(
+      '限位上下界相同的轴被禁用（膝盖 Y/Z 是 [0,0]，拖不动就别给可拖的滑块）',
+      posePanel.disabledCount > 0,
+      String(posePanel.disabledCount)
+    )
+    check('找到了头部 Y 轴滑块（走界面真实路径而非直接调方法）', posePanel.hadSlider === true, String(posePanel.hadSlider))
+    check(
+      '拖滑块后工程里的角度变了',
+      Math.abs(posePanel.mid.poseHead.y - 35) < 0.01,
+      JSON.stringify(posePanel.mid.poseHead)
+    )
+    check(
+      '画面真的跟着动：控制骨架头部旋转到位',
+      Math.abs(posePanel.mid.rigHead.y - 35) < 1,
+      `前 ${JSON.stringify(posePanel.before.rigHead)} → 后 ${JSON.stringify(posePanel.mid.rigHead)}`
+    )
+    check(
+      '该关节被记进 manualJoints（否则会被动作预设盖住）',
+      posePanel.mid.manualJoints.includes('head'),
+      JSON.stringify(posePanel.mid.manualJoints)
+    )
+    check(
+      '外观 GLB 的头部骨骼朝向真的被手动覆盖改变了',
+      posePanel.mid.boneHead !== null &&
+        JSON.stringify(posePanel.before.boneHead) !== JSON.stringify(posePanel.mid.boneHead),
+      `前 ${JSON.stringify(posePanel.before.boneHead)} → 后 ${JSON.stringify(posePanel.mid.boneHead)}`
+    )
+    check('改姿势被判成"有未保存修改"', posePanel.mid.dirty === true, String(posePanel.mid.dirty))
+    check(
+      '越界被限位夹住（肘 -50 → 0）',
+      Math.abs(posePanel.clamped.x) < 0.01,
+      JSON.stringify(posePanel.clamped)
+    )
+    check(
+      '改一个轴不会把另外两轴清零',
+      Math.abs(posePanel.twoAxes.x) < 0.01 && Math.abs(posePanel.twoAxes.y - 10) < 0.01,
+      JSON.stringify(posePanel.twoAxes)
+    )
+    check(
+      '重置全部：姿势回预设、手动覆盖清空、骨架复位',
+      Math.abs(posePanel.afterReset.poseHead.y) < 0.01 &&
+        posePanel.afterReset.manualJoints.length === 0 &&
+        Math.abs(posePanel.afterReset.rigHead.y) < 0.01,
+      JSON.stringify(posePanel.afterReset)
+    )
+
+    // ===================== 二十五、姿势库 =====================
+    /*
+     * 保存 / 命名 / 切换自定义姿势（schema 19）。
+     *
+     * 走**界面真实路径**：内联输入框 + 按钮，不用 window.prompt——
+     * prompt 是浏览器原生模态，脚本驱动不了，用户也没法边看画面边想名字。
+     *
+     * 覆盖链条：保存 → 出现在列表 → 应用（presetId 必须置 null，否则外观层
+     * 拿动作预设盖住它）→ 存盘 → **刷新页面** → 重开工程后库还在 → 更新 / 删除。
+     * 必须刷新：`poseLibrary` 虽然存在工程里，但刷新才能证明它是"存盘数据"
+     * 而不是内存里的残留。
+     */
+    const poseLibrary = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      if (!object) return { error: '没有可用的人台' }
+      editor.handleSelection([object.id])
+      await sleep(700)
+
+      const panel = document.querySelector('.pose-panel')
+      if (!panel) return { error: '姿势面板没有渲染' }
+      const input = panel.querySelector('.pose-library__input')
+      const saveButton = panel.querySelector('.pose-library__save-btn')
+
+      // 摆一个可辨认的姿势：头 Y=30、左前臂 X=40（都走滑块的真实事件）
+      const setJoint = (label, axisLabel, value) => {
+        const row = [...panel.querySelectorAll('.pose-joint')].find((j) =>
+          j.querySelector('.pose-joint__label')?.textContent.includes(label)
+        )
+        const slider = row
+          ? [...row.querySelectorAll('.pose-axis')]
+              .find((a) => a.querySelector('.pose-axis__name').textContent.trim() === axisLabel)
+              ?.querySelector('input')
+          : null
+        if (!slider) return false
+        slider.value = String(value)
+        slider.dispatchEvent(new Event('input', { bubbles: true }))
+        return true
+      }
+      const usedHead = setJoint('头部', 'Y', 30)
+      await sleep(500)
+      const usedElbow = setJoint('左前臂', 'X', 40)
+      await sleep(800)
+
+      const libraryBefore = (store.state.history.present.poseLibrary ?? []).length
+      const dirtyBefore = store.getters.isDirty
+      const hadEmptyHint = Boolean(panel.querySelector('.pose-library__empty'))
+
+      input.value = '抱臂姿势'
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      await sleep(250)
+      saveButton.click()
+      await sleep(800)
+
+      const scene = store.state.history.present
+      const entries = scene.poseLibrary ?? []
+      const savedEntry = entries[entries.length - 1]
+      const savedObject = scene.objects.find((o) => o.id === object.id)
+      const rows = [...panel.querySelectorAll('.pose-library__entry')]
+      return {
+        usedHead,
+        usedElbow,
+        libraryBefore,
+        dirtyBefore,
+        hadEmptyHint,
+        hasInput: Boolean(input),
+        hasSaveButton: Boolean(saveButton),
+        count: entries.length,
+        name: savedEntry?.name,
+        entryId: savedEntry?.id,
+        headY: savedEntry?.pose?.head?.y,
+        elbowX: savedEntry?.pose?.leftElbow?.x,
+        jointCount: savedEntry ? Object.keys(savedEntry.pose).length : 0,
+        createdAtValid: Boolean(savedEntry && !Number.isNaN(new Date(savedEntry.createdAt).getTime())),
+        inputCleared: panel.querySelector('.pose-library__input').value === '',
+        rowCount: rows.length,
+        rowNames: rows.map((r) => r.querySelector('.pose-library__entry-name').textContent.trim()),
+        emptyHintGone: !panel.querySelector('.pose-library__empty'),
+        dirtyAfter: store.getters.isDirty,
+        objectHeadY: savedObject?.mannequin?.pose?.head?.y
+      }
+    })()`)
+
+    if (poseLibrary.error) throw new Error(poseLibrary.error)
+
+    check('姿势库的保存入口是内联输入框 + 按钮（不是 window.prompt）', poseLibrary.hasInput === true && poseLibrary.hasSaveButton === true)
+    check('保存前库是空的并显示空态提示', poseLibrary.libraryBefore === 0 && poseLibrary.hadEmptyHint === true, `before=${poseLibrary.libraryBefore}`)
+    check('走界面滑块真的改了关节角度（头 Y=30 / 左肘 X=40）', poseLibrary.usedHead === true && poseLibrary.usedElbow === true)
+    check(
+      '保存后库里出现一条命名条目，姿势是完整关节表',
+      poseLibrary.count === 1 &&
+        poseLibrary.name === '抱臂姿势' &&
+        poseLibrary.jointCount === 10 &&
+        poseLibrary.headY === 30 &&
+        poseLibrary.elbowX === 40,
+      JSON.stringify({ count: poseLibrary.count, name: poseLibrary.name, joints: poseLibrary.jointCount, head: poseLibrary.headY, elbow: poseLibrary.elbowX })
+    )
+    check('条目带 id 与可解析的 createdAt', Boolean(poseLibrary.entryId) && poseLibrary.createdAtValid === true)
+    check(
+      '列表里出现该条目、空态提示消失',
+      poseLibrary.rowCount === 1 && poseLibrary.rowNames[0] === '抱臂姿势' && poseLibrary.emptyHintGone === true,
+      JSON.stringify(poseLibrary.rowNames)
+    )
+    check('保存后输入框被清空（下一次保存不会误用旧名字）', poseLibrary.inputCleared === true)
+    check('保存姿势被判成"有未保存修改"', poseLibrary.dirtyBefore === true && poseLibrary.dirtyAfter === true)
+
+    /*
+     * 应用：先把姿势改坏，再点「应用」，必须回到保存时那一套；
+     * 同时校验 presetId 被置 null、manualJoints 填满 10 个关节，
+     * 以及**控制骨架真的跟着转**（数据对了画面没动是这类功能的经典坑）。
+     */
+    const poseLibraryApply = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const vm = ${VIEWPORT}
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      const root = vm.rootMap.get(object.id)
+      const joints = root.userData.mannequinJoints
+      const deg = (rad) => +((rad * 180) / Math.PI).toFixed(2)
+
+      const entryBefore = JSON.parse(JSON.stringify(store.state.history.present.poseLibrary[0]))
+      // 先把头扭到另一个方向，证明"应用"确实把它改回来了
+      editor.updateJointAngle({ id: object.id, jointId: 'head', axis: 'y', value: -25 })
+      await sleep(700)
+      const brokenHeadY = store.state.history.present.objects.find((o) => o.id === object.id).mannequin.pose.head.y
+      const entryAfterEdit = store.state.history.present.poseLibrary[0]
+
+      const panel = document.querySelector('.pose-panel')
+      panel.querySelector('.pose-library__apply').click()
+      await sleep(900)
+
+      const applied = store.state.history.present.objects.find((o) => o.id === object.id).mannequin
+      return {
+        brokenHeadY,
+        entryUnchangedByEditing: entryAfterEdit.pose.head.y === entryBefore.pose.head.y,
+        presetId: applied.presetId,
+        manualCount: (applied.manualJoints ?? []).length,
+        headY: applied.pose.head.y,
+        elbowX: applied.pose.leftElbow.x,
+        rigHeadY: deg(joints.get('head').rotation.y),
+        // 面板上的「手动」标记必须整排亮起（manualJoints 填满的证据）
+        manualBadges: [...panel.querySelectorAll('.pose-joint__overridden.is-on')].length,
+        presetSelectShowsCustom: (() => {
+          const select = document.querySelector('.pose-panel')?.parentElement?.querySelector('select')
+          return select ? select.value : null
+        })()
+      }
+    })()`)
+
+    check(
+      '应用前先改坏姿势（头 Y=-25），确认后面是真的被改回来',
+      Math.abs(poseLibraryApply.brokenHeadY + 25) < 0.01,
+      String(poseLibraryApply.brokenHeadY)
+    )
+    check(
+      '库条目是快照：拖滑块不会改坏库里存的姿势',
+      poseLibraryApply.entryUnchangedByEditing === true
+    )
+    check(
+      '应用库姿势：姿势回到保存时那一套',
+      Math.abs(poseLibraryApply.headY - 30) < 0.01 && Math.abs(poseLibraryApply.elbowX - 40) < 0.01,
+      JSON.stringify({ head: poseLibraryApply.headY, elbow: poseLibraryApply.elbowX })
+    )
+    check(
+      '应用库姿势后 presetId 置 null（否则外观层会用动作预设盖住它）',
+      poseLibraryApply.presetId === null,
+      String(poseLibraryApply.presetId)
+    )
+    check(
+      '应用库姿势后 manualJoints 填满全部 10 个关节（面板标记才准确）',
+      poseLibraryApply.manualCount === 10 && poseLibraryApply.manualBadges === 10,
+      `manual=${poseLibraryApply.manualCount} badges=${poseLibraryApply.manualBadges}`
+    )
+    check(
+      '画面真的跟着动：控制骨架头部旋转到位',
+      Math.abs(poseLibraryApply.rigHeadY - 30) < 1,
+      String(poseLibraryApply.rigHeadY)
+    )
+
+    // 存盘：姿势库必须真的进工程文件（schema 19）
+    const poseLibrarySaved = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      await store.dispatch('saveProject', {})
+      const projectId = store.state.projectId
+      const payload = await fetch('/api/projects/' + encodeURIComponent(projectId), {
+        credentials: 'include'
+      }).then((r) => r.json())
+      const documentData = payload.document || payload
+      const library = documentData.scene.poseLibrary ?? []
+      return {
+        projectId,
+        schemaVersion: documentData.schemaVersion,
+        count: library.length,
+        name: library[0]?.name,
+        headY: library[0]?.pose?.head?.y,
+        jointCount: library[0] ? Object.keys(library[0].pose).length : 0,
+        dirty: store.getters.isDirty
+      }
+    })()`)
+    check('存盘文档 schema 版本为 19（姿势库）', poseLibrarySaved.schemaVersion === 19, String(poseLibrarySaved.schemaVersion))
+    check(
+      '姿势库随工程存盘（名字 + 完整关节表）',
+      poseLibrarySaved.count === 1 &&
+        poseLibrarySaved.name === '抱臂姿势' &&
+        poseLibrarySaved.jointCount === 10 &&
+        Math.abs(poseLibrarySaved.headY - 30) < 0.01,
+      JSON.stringify(poseLibrarySaved)
+    )
+    check('存盘后不再是"有未保存修改"', poseLibrarySaved.dirty === false, String(poseLibrarySaved.dirty))
+
+    // 刷新页面：清掉所有内存状态，证明库是从工程文件读回来的
+    await cdp.send('Page.navigate', { url: `${BASE_URL}/editor` })
+    await waitFor(cdp, 'Boolean(document.querySelector(".editor"))', { label: '编辑器（刷新后·姿势库）' })
+    await sleep(2200)
+    const recoveryAfterReloadPose = await cdp.evaluate(`(() => {
+      const dialog = document.querySelector('.dialog')
+      if (!dialog) return 'none'
+      const discard = [...dialog.querySelectorAll('button')].find((b) => b.textContent.trim() === '放弃')
+      if (discard) { discard.click(); return 'discarded' }
+      return 'other'
+    })()`)
+    console.log(`   [环境] 刷新后恢复对话框: ${recoveryAfterReloadPose}`)
+    await sleep(700)
+
+    const poseLibraryReloaded = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      await store.dispatch('openProject', ${JSON.stringify(poseLibrarySaved.projectId)})
+      await sleep(1500)
+      const scene = store.state.history.present
+      const library = scene.poseLibrary ?? []
+      const object = scene.objects.filter((o) => o.kind === 'mannequin').pop()
+      if (object) editor.handleSelection([object.id])
+      await sleep(800)
+      const panel = document.querySelector('.pose-panel')
+      const rows = panel ? [...panel.querySelectorAll('.pose-library__entry')] : []
+      return {
+        count: library.length,
+        name: library[0]?.name,
+        headY: library[0]?.pose?.head?.y,
+        jointCount: library[0] ? Object.keys(library[0].pose).length : 0,
+        rowCount: rows.length,
+        rowNames: rows.map((r) => r.querySelector('.pose-library__entry-name').textContent.trim()),
+        selected: Boolean(object)
+      }
+    })()`)
+    check(
+      '刷新页面 + 重开工程后姿势库还在（来自工程文件，不是内存残留）',
+      poseLibraryReloaded.count === 1 &&
+        poseLibraryReloaded.name === '抱臂姿势' &&
+        poseLibraryReloaded.jointCount === 10 &&
+        Math.abs(poseLibraryReloaded.headY - 30) < 0.01,
+      JSON.stringify(poseLibraryReloaded)
+    )
+    check(
+      '重开工程后列表里也能看到它',
+      poseLibraryReloaded.selected === true &&
+        poseLibraryReloaded.rowCount === 1 &&
+        poseLibraryReloaded.rowNames[0] === '抱臂姿势',
+      JSON.stringify({ selected: poseLibraryReloaded.selected, rows: poseLibraryReloaded.rowNames })
+    )
+
+    /*
+     * 更新 / 删除 / 命名边界：空名给默认名、超长截断、重名允许（按 id 区分）。
+     * 这些"确定行为"必须固定下来，否则以后改净化规则会静默改变用户数据。
+     */
+    const poseLibraryMaintenance = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      editor.handleSelection([object.id])
+      await sleep(600)
+
+      const inputNow = () => document.querySelector('.pose-library__input')
+      const rowsNow = () => [...document.querySelectorAll('.pose-library__entry')]
+      const typeName = async (name) => {
+        const input = inputNow()
+        input.value = name
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        await sleep(200)
+      }
+      const clickSave = async () => {
+        document.querySelector('.pose-library__save-btn').click()
+        await sleep(700)
+      }
+
+      const entryId = store.state.history.present.poseLibrary[0].id
+      const nameBefore = store.state.history.present.poseLibrary[0].name
+
+      // 「更新为当前」：改姿势后覆盖这一条（id 与名字不变）
+      editor.updateJointAngle({ id: object.id, jointId: 'head', axis: 'y', value: 15 })
+      await sleep(700)
+      rowsNow()[0].querySelector('.pose-library__update').click()
+      await sleep(800)
+      const updated = store.state.history.present.poseLibrary[0]
+
+      // 空名 → 「姿势 N」
+      await typeName('')
+      await clickSave()
+      const namesAfterEmpty = store.state.history.present.poseLibrary.map((e) => e.name)
+
+      // 超长名 → 截断到 24
+      await typeName('超'.repeat(50))
+      await clickSave()
+      const afterLong = store.state.history.present.poseLibrary
+      const longEntry = afterLong[afterLong.length - 1]
+
+      // 重名允许：再存一条同名
+      await typeName(longEntry.name)
+      await clickSave()
+      const afterDuplicate = store.state.history.present.poseLibrary
+      const duplicateIds = afterDuplicate.map((e) => e.id)
+
+      // 删除第一条
+      rowsNow()[0].querySelector('.pose-library__delete').click()
+      await sleep(800)
+      const afterDelete = store.state.history.present.poseLibrary
+
+      return {
+        entryId,
+        nameBefore,
+        updatedIdSame: updated.id === entryId,
+        updatedNameSame: updated.name === nameBefore,
+        updatedHeadY: updated.pose.head.y,
+        namesAfterEmpty,
+        longName: longEntry.name,
+        longNameLength: longEntry.name.length,
+        duplicateCount: afterDuplicate.length,
+        duplicateUniqueIds: new Set(duplicateIds).size === duplicateIds.length,
+        duplicateNames: afterDuplicate.map((e) => e.name),
+        afterDeleteCount: afterDelete.length,
+        deletedGone: !afterDelete.some((e) => e.id === entryId),
+        rowCountAfterDelete: rowsNow().length,
+        dirtyAfterAll: store.getters.isDirty
+      }
+    })()`)
+
+    check(
+      '「更新为当前」覆盖同一条（id / 名字不变，姿势变新）',
+      poseLibraryMaintenance.updatedIdSame === true &&
+        poseLibraryMaintenance.updatedNameSame === true &&
+        Math.abs(poseLibraryMaintenance.updatedHeadY - 15) < 0.01,
+      JSON.stringify({
+        id: poseLibraryMaintenance.updatedIdSame,
+        name: poseLibraryMaintenance.updatedNameSame,
+        head: poseLibraryMaintenance.updatedHeadY
+      })
+    )
+    check(
+      '空名保存自动编号为「姿势 N」',
+      poseLibraryMaintenance.namesAfterEmpty.includes('姿势 1'),
+      JSON.stringify(poseLibraryMaintenance.namesAfterEmpty)
+    )
+    check(
+      '超长名截断到 24 个字符',
+      poseLibraryMaintenance.longNameLength === 24,
+      `${poseLibraryMaintenance.longNameLength} / ${poseLibraryMaintenance.longName}`
+    )
+    check(
+      '重名允许且各自独立（按 id 区分，不会互相覆盖）',
+      poseLibraryMaintenance.duplicateCount === 4 &&
+        poseLibraryMaintenance.duplicateUniqueIds === true &&
+        poseLibraryMaintenance.duplicateNames.filter((n) => n === poseLibraryMaintenance.longName).length === 2,
+      JSON.stringify(poseLibraryMaintenance.duplicateNames)
+    )
+    check(
+      '删除生效：条目从工程与列表里一起消失',
+      poseLibraryMaintenance.deletedGone === true &&
+        poseLibraryMaintenance.afterDeleteCount === 3 &&
+        poseLibraryMaintenance.rowCountAfterDelete === 3,
+      JSON.stringify({
+        gone: poseLibraryMaintenance.deletedGone,
+        store: poseLibraryMaintenance.afterDeleteCount,
+        rows: poseLibraryMaintenance.rowCountAfterDelete
+      })
+    )
+    check('改姿势库被判成"有未保存修改"', poseLibraryMaintenance.dirtyAfterAll === true)
+
+    // ===================== 二十六、镜像 / 对称 =====================
+    /*
+     * 一键左右对称。
+     *
+     * **只断言"数字变了"不算通过**：镜像最容易错的地方是符号（y/z 取反）、
+     * 以及忘了左右骨骼局部系本身是镜像的。所以这里直接量左右关节的
+     * 世界坐标（换算到人台根节点局部空间），必须满足
+     *
+     *     left.x ≈ -right.x   且   left.y ≈ right.y  且   left.z ≈ right.z
+     *
+     * 容差 1e-3（人台骨架是"全身高 = 1"的单位模型，乘上 1.75 身高后
+     * 约等于 1.75mm）：浮点三角函数误差在 1e-15 量级，1e-3 已经足够严。
+     *
+     * 注意躯干：`spine` 绕 Y/Z 扭转时整具身体**本来就不该**是世界坐标镜像的
+     * （中轴关节被刻意排除在镜像之外）。所以量几何之前先把 spine 的 Y/Z 归零，
+     * 而"不动 head/spine"单独用数值断言。
+     */
+    const mirror = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const vm = ${VIEWPORT}
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      editor.handleSelection([object.id])
+      await sleep(600)
+      editor.resetMannequinPose({ id: object.id })
+      await sleep(600)
+
+      // 摆一个"左右明显不同"的姿势：左侧四肢都带 Y/Z 分量（这样符号错了立刻暴露）
+      const set = async (jointId, value) => {
+        for (const axis of ['x', 'y', 'z']) {
+          editor.updateJointAngle({ id: object.id, jointId, axis, value: value[axis] })
+          await sleep(120)
+        }
+      }
+      await set('leftShoulder', { x: 30, y: 20, z: -35 })
+      await set('leftElbow', { x: 50, y: 10, z: 5 })
+      await set('leftHip', { x: -20, y: 15, z: -10 })
+      await set('leftKnee', { x: 40, y: 0, z: 0 })
+      // 躯干与头也被扭过：镜像不许动它们
+      await set('spine', { x: 12, y: 8, z: -4 })
+      await set('head', { x: 5, y: 25, z: 3 })
+      await sleep(700)
+
+      const poseBefore = JSON.parse(JSON.stringify(store.state.history.present.objects.find((o) => o.id === object.id).mannequin.pose))
+      const presetIdBefore = store.state.history.present.objects.find((o) => o.id === object.id).mannequin.presetId
+      const panel = document.querySelector('.pose-panel')
+      const leftButton = panel ? panel.querySelector('.pose-mirror__left') : null
+      if (!leftButton) return { error: '找不到「左 → 右」按钮' }
+      leftButton.click()
+      await sleep(900)
+
+      const mannequinAfter = store.state.history.present.objects.find((o) => o.id === object.id).mannequin
+      const poseAfter = mannequinAfter.pose
+
+      /*
+       * 量几何前把 spine 的 Y/Z 归零：绕 X 的旋转是自镜像的，
+       * 这样整具身体在世界坐标里才真的是镜像（见上面的注释）。
+       */
+      editor.updateJointAngle({ id: object.id, jointId: 'spine', axis: 'y', value: 0 })
+      await sleep(250)
+      editor.updateJointAngle({ id: object.id, jointId: 'spine', axis: 'z', value: 0 })
+      await sleep(900)
+
+      const root = vm.rootMap.get(object.id)
+      root.updateMatrixWorld(true)
+      const joints = root.userData.mannequinJoints
+      const handles = root.userData.mannequinHandles
+      const local = (node) => {
+        const p = node.getWorldPosition(root.position.clone())
+        return root.worldToLocal(p)
+      }
+      const pairs = [
+        ['leftShoulder', 'rightShoulder'],
+        ['leftElbow', 'rightElbow'],
+        ['leftHip', 'rightHip'],
+        ['leftKnee', 'rightKnee']
+      ]
+      const measurements = []
+      let worst = { label: '', diff: 0 }
+      for (const [leftId, rightId] of pairs) {
+        for (const [kind, map] of [
+          ['枢轴', joints],
+          ['手柄', handles]
+        ]) {
+          const leftNode = map.get(leftId)
+          const rightNode = map.get(rightId)
+          if (!leftNode || !rightNode) continue
+          const l = local(leftNode)
+          const r = local(rightNode)
+          const diff = Math.max(Math.abs(l.x + r.x), Math.abs(l.y - r.y), Math.abs(l.z - r.z))
+          measurements.push({
+            label: leftId + '/' + kind,
+            left: [+l.x.toFixed(5), +l.y.toFixed(5), +l.z.toFixed(5)],
+            right: [+r.x.toFixed(5), +r.y.toFixed(5), +r.z.toFixed(5)],
+            diff: +diff.toExponential(2)
+          })
+          if (diff > worst.diff) worst = { label: leftId + '/' + kind, diff }
+        }
+      }
+
+      return {
+        poseBefore,
+        presetIdBefore,
+        mirrorButtonPresent: Boolean(leftButton),
+        poseAfter,
+        spineAfter: { ...poseAfter.spine },
+        headAfter: { ...poseAfter.head },
+        manualJoints: [...(mannequinAfter.manualJoints ?? [])],
+        presetId: mannequinAfter.presetId,
+        measurements,
+        worstDiff: worst.diff,
+        worstLabel: worst.label,
+        measuredCount: measurements.length
+      }
+    })()`)
+
+    if (mirror.error) throw new Error(mirror.error)
+
+    check('姿势面板里有「左 → 右」镜像按钮', mirror.mirrorButtonPresent === true)
+    check(
+      '镜像后右侧四肢 = 左侧的镜像（x 不变、y/z 取反）',
+      Math.abs(mirror.poseAfter.rightShoulder.x - 30) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightShoulder.y + 20) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightShoulder.z - 35) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightElbow.x - 50) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightElbow.y + 10) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightElbow.z + 5) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightHip.x + 20) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightHip.y + 15) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightHip.z - 10) < 0.01 &&
+        Math.abs(mirror.poseAfter.rightKnee.x - 40) < 0.01,
+      JSON.stringify({
+        shoulder: mirror.poseAfter.rightShoulder,
+        elbow: mirror.poseAfter.rightElbow,
+        hip: mirror.poseAfter.rightHip,
+        knee: mirror.poseAfter.rightKnee
+      })
+    )
+    check(
+      '左侧（源）保持原样，不被改写',
+      JSON.stringify(mirror.poseAfter.leftShoulder) === JSON.stringify(mirror.poseBefore.leftShoulder) &&
+        JSON.stringify(mirror.poseAfter.leftElbow) === JSON.stringify(mirror.poseBefore.leftElbow) &&
+        JSON.stringify(mirror.poseAfter.leftHip) === JSON.stringify(mirror.poseBefore.leftHip),
+      JSON.stringify(mirror.poseAfter.leftShoulder)
+    )
+    check(
+      '中轴关节（头 / 躯干）不被镜像动到',
+      JSON.stringify(mirror.spineAfter) === JSON.stringify(mirror.poseBefore.spine) &&
+        JSON.stringify(mirror.headAfter) === JSON.stringify(mirror.poseBefore.head),
+      JSON.stringify({ spine: mirror.spineAfter, head: mirror.headAfter })
+    )
+    check(
+      '量到左右关节世界坐标真的成镜像（x 反号、y/z 相等）',
+      mirror.measuredCount === 8 && mirror.worstDiff < 1e-3,
+      `最差 ${mirror.worstLabel} = ${mirror.worstDiff.toExponential(2)}；` +
+        JSON.stringify(mirror.measurements.slice(0, 2))
+    )
+    check(
+      '镜像的关节被记进 manualJoints（否则有预设时外观不跟随）',
+      ['leftShoulder', 'rightShoulder', 'leftElbow', 'rightElbow', 'leftHip', 'rightHip', 'leftKnee', 'rightKnee'].every(
+        (id) => mirror.manualJoints.includes(id)
+      ),
+      JSON.stringify(mirror.manualJoints)
+    )
+    check(
+      '镜像不改变动作预设（presetId 原样保留）',
+      mirror.presetId === mirror.presetIdBefore,
+      `${mirror.presetIdBefore} → ${mirror.presetId}`
+    )
+
+    // 「右 → 左」方向：把右侧改成另一组值，镜像后左侧必须跟着变成它的镜像
+    const mirrorReverse = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      const set = async (jointId, value) => {
+        for (const axis of ['x', 'y', 'z']) {
+          editor.updateJointAngle({ id: object.id, jointId, axis, value: value[axis] })
+          await sleep(120)
+        }
+      }
+      await set('rightShoulder', { x: -10, y: 40, z: 25 })
+      await sleep(600)
+      const panel = document.querySelector('.pose-panel')
+      const button = panel ? panel.querySelector('.pose-mirror__right') : null
+      if (!button) return { error: '找不到「右 → 左」按钮' }
+      button.click()
+      await sleep(900)
+      const pose = store.state.history.present.objects.find((o) => o.id === object.id).mannequin.pose
+      return { leftShoulder: { ...pose.leftShoulder }, rightShoulder: { ...pose.rightShoulder } }
+    })()`)
+    if (mirrorReverse.error) throw new Error(mirrorReverse.error)
+    check(
+      '「右 → 左」同样正确（左侧 = 右侧的镜像）',
+      Math.abs(mirrorReverse.leftShoulder.x + 10) < 0.01 &&
+        Math.abs(mirrorReverse.leftShoulder.y + 40) < 0.01 &&
+        Math.abs(mirrorReverse.leftShoulder.z + 25) < 0.01 &&
+        JSON.stringify(mirrorReverse.rightShoulder) === JSON.stringify({ x: -10, y: 40, z: 25 }),
+      JSON.stringify(mirrorReverse)
+    )
+
+    // ===================== 二十七、关节关键帧通道 =====================
+    /*
+     * 按关节打帧（"只动画左臂"）。
+     *
+     * 这一类功能最容易假通过：store 里的关键帧数据看起来对，画面却不对。
+     * 所以这里一律**量控制骨架关节的真实旋转**：
+     *
+     * 1. 打两个不同姿势的关键帧 → 拖到中间时刻 → 骨架旋转必须是两者的插值；
+     * 2. 只给一个关节打帧 → 其它关节**不被影响**（保持工程姿势），且不出现 NaN；
+     * 3. 同一帧再点一次是覆盖，不是插出两条同刻帧（同刻帧会让插值除以 0）。
+     *
+     * 时刻说明：打帧会对齐到 24fps 帧格，所以用 0 / 2 秒这两个正好落在帧上的
+     * 时刻，避免"期望 1.0 秒实际是 1.0417 秒"这种自己给自己制造的偏差。
+     */
+    const poseKeyframes = await cdp.evaluate(`(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const vm = ${VIEWPORT}
+      const object = store.state.history.present.objects.filter((o) => o.kind === 'mannequin').pop()
+      editor.handleSelection([object.id])
+      await sleep(600)
+
+      const deg = (rad) => +((rad * 180) / Math.PI).toFixed(2)
+      const rigRotation = (jointId) => {
+        const root = vm.rootMap.get(object.id)
+        const joint = root.userData.mannequinJoints.get(jointId)
+        return { x: deg(joint.rotation.x), y: deg(joint.rotation.y), z: deg(joint.rotation.z) }
+      }
+      const finite = (value) => Object.values(value).every(Number.isFinite)
+      const panel = () => document.querySelector('.pose-panel')
+      const setJoint = async (jointId, value) => {
+        for (const axis of ['x', 'y', 'z']) {
+          editor.updateJointAngle({ id: object.id, jointId, axis, value: value[axis] })
+          await sleep(100)
+        }
+      }
+      const keyAll = async () => {
+        panel().querySelector('.pose-keyframe-all').click()
+        await sleep(800)
+      }
+      const keyJoint = async (label) => {
+        const row = [...panel().querySelectorAll('.pose-joint')].find((j) =>
+          j.querySelector('.pose-joint__label')?.textContent.includes(label)
+        )
+        if (!row) return false
+        row.querySelector('.pose-joint__key').click()
+        await sleep(800)
+        return true
+      }
+
+      // 清掉旧关键帧，从确定状态开始
+      store.commit('setTimelineTime', 0)
+      editor.clearObjectKeyframes(object.id)
+      await sleep(700)
+      editor.resetMannequinPose({ id: object.id })
+      await sleep(700)
+
+      // --- 第一段：全部关节通道，两帧之间应插值 ---
+      await setJoint('leftShoulder', { x: 0, y: 0, z: 0 })
+      await setJoint('spine', { x: 0, y: 0, z: 0 })
+      await sleep(500)
+      await keyAll()
+      const afterFirst = store.state.history.present.timeline.objectKeyframes.filter(
+        (k) => k.objectId === object.id
+      )
+      const firstPoseJoints = afterFirst[0] ? Object.keys(afterFirst[0].transform.mannequinPose).length : 0
+
+      // 第二帧：把左肩抬到 90°、躯干扭到 30°（都在限位内：肩 X ±120、躯干 X ±35）
+      store.commit('setTimelineTime', 2)
+      await sleep(500)
+      await setJoint('leftShoulder', { x: 90, y: 0, z: 0 })
+      await setJoint('spine', { x: 30, y: 0, z: 0 })
+      await sleep(500)
+      await keyAll()
+      const afterSecond = store.state.history.present.timeline.objectKeyframes.filter(
+        (k) => k.objectId === object.id
+      )
+      const secondFramePose = afterSecond[1]
+        ? {
+            leftShoulder: { ...afterSecond[1].transform.mannequinPose.leftShoulder },
+            spine: { ...afterSecond[1].transform.mannequinPose.spine }
+          }
+        : null
+
+      // 拖到 1 秒（两帧正中）：骨架旋转必须是两者的插值
+      store.commit('setTimelineTime', 1)
+      await sleep(900)
+      const atMiddle = {
+        leftShoulder: rigRotation('leftShoulder'),
+        spine: rigRotation('spine')
+      }
+      // 手动拖过的物体在播放头处会被"编辑覆盖"挡住，这里断言覆盖列表已清空
+      const overridesAtMiddle = [...store.state.timelineEditOverrides]
+
+      // --- 第二段：通道粒度，只给左前臂打帧 ---
+      store.commit('setTimelineTime', 0)
+      await sleep(400)
+      editor.clearObjectKeyframes(object.id)
+      await sleep(700)
+      editor.resetMannequinPose({ id: object.id })
+      await sleep(600)
+      await setJoint('leftElbow', { x: 0, y: 0, z: 0 })
+      await setJoint('leftShoulder', { x: 0, y: 0, z: 0 })
+      await sleep(500)
+      const keyedElbow = await keyJoint('左前臂')
+      const singleChannel = store.state.history.present.timeline.objectKeyframes.filter(
+        (k) => k.objectId === object.id
+      )
+
+      // 把左前臂抬到 100°，同一帧再打一次（必须覆盖而不是新增）
+      await setJoint('leftElbow', { x: 100, y: 0, z: 0 })
+      await sleep(500)
+      await keyJoint('左前臂')
+      const afterSecondKey = store.state.history.present.timeline.objectKeyframes.filter(
+        (k) => k.objectId === object.id
+      )
+      const sameTimeCount = afterSecondKey.filter((k) => Math.abs(k.timeSeconds - 0) < 1e-6).length
+
+      // 再给另一个关节（右上臂）打帧：必须合并进同一帧，左前臂的值不能被清掉
+      await keyJoint('右上臂')
+      const afterHeadKey = store.state.history.present.timeline.objectKeyframes.filter(
+        (k) => k.objectId === object.id
+      )
+      const frameAtZero = afterHeadKey.find((k) => Math.abs(k.timeSeconds - 0) < 1e-6)
+      const mergedJoints = frameAtZero ? Object.keys(frameAtZero.transform.mannequinPose).sort() : []
+
+      // 把工程姿势里的左前臂改成 30°、头扭到 40°（这两个都**不**再打帧）：
+      // 预览时左前臂必须被关键帧里的 100° 覆盖，头则保持工程姿势 40°
+      editor.updateJointAngle({ id: object.id, jointId: 'leftElbow', axis: 'x', value: 30 })
+      await sleep(400)
+      editor.updateJointAngle({ id: object.id, jointId: 'head', axis: 'y', value: 40 })
+      await sleep(700)
+      const storePoseBeforePreview = JSON.parse(
+        JSON.stringify(store.state.history.present.objects.find((o) => o.id === object.id).mannequin.pose)
+      )
+      store.commit('setTimelineTime', 1.5)
+      await sleep(900)
+      const headAtMiddle = rigRotation('head')
+      const elbowAtMiddle = rigRotation('leftElbow')
+
+      return {
+        objectId: object.id,
+        firstPoseJoints,
+        frameCount: afterSecond.length,
+        frameTimes: afterSecond.map((k) => k.timeSeconds),
+        frameJointCounts: afterSecond.map((k) => Object.keys(k.transform.mannequinPose).length),
+        secondFramePose,
+        atMiddle,
+        overridesAtMiddle,
+        keyedElbow,
+        singleChannelCount: singleChannel.length,
+        singleChannelJoints: singleChannel[0] ? Object.keys(singleChannel[0].transform.mannequinPose) : [],
+        sameTimeCount,
+        mergedJoints,
+        storePoseBeforePreview,
+        headAtMiddle,
+        elbowAtMiddle,
+        headFinite: finite(headAtMiddle),
+        elbowFinite: finite(elbowAtMiddle),
+        frameAtZeroTime: frameAtZero ? frameAtZero.timeSeconds : null
+      }
+    })()`)
+
+    if (poseKeyframes.error) throw new Error(poseKeyframes.error)
+
+    check(
+      '「为全部关节打帧」写入完整姿势的关键帧（10 个关节）',
+      poseKeyframes.firstPoseJoints === 10,
+      String(poseKeyframes.firstPoseJoints)
+    )
+    check(
+      '两个不同姿势各打一帧（同一物体共 2 帧）',
+      poseKeyframes.frameCount === 2 &&
+        Math.abs(poseKeyframes.frameTimes[0]) < 1e-6 &&
+        Math.abs(poseKeyframes.frameTimes[1] - 2) < 1e-6,
+      JSON.stringify(poseKeyframes.frameTimes)
+    )
+    check(
+      '中间时刻量到骨架旋转是两者的插值（左肩 X 0→90、躯干 X 0→30，smoothstep(0.5)=0.5）',
+      Math.abs(poseKeyframes.atMiddle.leftShoulder.x - 45) < 1.5 &&
+        Math.abs(poseKeyframes.atMiddle.spine.x - 15) < 1.5,
+      JSON.stringify({ atMiddle: poseKeyframes.atMiddle, secondFrame: poseKeyframes.secondFramePose })
+    )
+    check(
+      '拖到中间时刻后手动编辑覆盖已清空（否则看到的还是编辑态姿势）',
+      poseKeyframes.overridesAtMiddle.length === 0,
+      JSON.stringify(poseKeyframes.overridesAtMiddle)
+    )
+    check('逐关节打帧按钮存在并可点', poseKeyframes.keyedElbow === true)
+    check(
+      '只给左前臂打帧：关键帧里只有这一个关节',
+      poseKeyframes.singleChannelCount === 1 &&
+        JSON.stringify(poseKeyframes.singleChannelJoints) === JSON.stringify(['leftElbow']),
+      JSON.stringify(poseKeyframes.singleChannelJoints)
+    )
+    check(
+      '同一时刻再打一次是覆盖（不是两条同刻帧）',
+      poseKeyframes.sameTimeCount === 1,
+      String(poseKeyframes.sameTimeCount)
+    )
+    check(
+      '再给右上臂打帧：合并进同一帧，左前臂的值不被清掉',
+      JSON.stringify(poseKeyframes.mergedJoints) === JSON.stringify(['leftElbow', 'rightShoulder']),
+      JSON.stringify(poseKeyframes.mergedJoints)
+    )
+    check(
+      '未被任何关键帧覆盖的关节保持工程姿势（头 40°）且不出现 NaN',
+      Math.abs(poseKeyframes.headAtMiddle.y - 40) < 1.5 && poseKeyframes.headFinite === true,
+      JSON.stringify({ head: poseKeyframes.headAtMiddle, finite: poseKeyframes.headFinite })
+    )
+    check(
+      '左前臂自己的通道在 0→1.5 秒之间保持 100°（只有一帧 → 取最近的已有值），并覆盖工程姿势里的 30°',
+      Math.abs(poseKeyframes.elbowAtMiddle.x - 100) < 1.5 &&
+        Math.abs(poseKeyframes.storePoseBeforePreview.leftElbow.x - 30) < 0.01 &&
+        poseKeyframes.elbowFinite === true,
+      JSON.stringify({
+        elbow: poseKeyframes.elbowAtMiddle,
+        storePose: poseKeyframes.storePoseBeforePreview.leftElbow,
+        finite: poseKeyframes.elbowFinite
+      })
+    )
+
+    // ===================== 二十八、拖拽建墙/地面的实时预览 =====================
+    /*
+     * 以前拖拽全程画面毫无反应，松手才"啪"地出现物体，
+     * 用户完全无法判断正在拖多宽。这里量的是「拖拽中画面确实在变」：
+     * - 幽灵预览的 scale 随拖拽尺寸变化（不是只到最后才出现）；
+     * - HUD 上的尺寸文本同步变化；
+     * - 预览看到多大，松手建出来就是多大（共用同一个 transform）。
+     */
+    const quickBuild = await cdp.evaluate(`(async () => {
+      const store = ${STORE}
+      const editor = document.querySelector('.editor').__vue__
+      const vm = ${VIEWPORT}
+      const ghost = () => {
+        const group = vm.quickBuildGroup
+        const child = group ? group.children.find((item) => item.visible) : null
+        return child || null
+      }
+      const label = () => {
+        const pill = document.querySelector('.hud-pill--measure')
+        return pill ? pill.textContent.trim() : null
+      }
+
+      editor.beginQuickBuild('floor')
+      await new Promise((r) => setTimeout(r, 400))
+      const beforeStart = { visible: Boolean(ghost()), label: label() }
+
+      // 按下（还没移动）
+      editor.handleQuickBuildStart({ x: 0, y: 0, z: 0 })
+      await new Promise((r) => setTimeout(r, 300))
+      const atStart = { visible: Boolean(ghost()), label: label() }
+
+      // 拖到 3.2 × 1.8
+      editor.handleQuickBuildMove({ x: 3.2, y: 0, z: 1.8 })
+      await new Promise((r) => setTimeout(r, 300))
+      const g1 = ghost()
+      const mid = {
+        visible: Boolean(g1),
+        scale: g1 ? { x: +g1.scale.x.toFixed(3), y: +g1.scale.y.toFixed(3), z: +g1.scale.z.toFixed(3) } : null,
+        position: g1 ? { x: +g1.position.x.toFixed(3), y: +g1.position.y.toFixed(3), z: +g1.position.z.toFixed(3) } : null,
+        label: label()
+      }
+
+      // 继续拖到 6.4 × 3.6 —— 预览必须跟着变大
+      editor.handleQuickBuildMove({ x: 6.4, y: 0, z: 3.6 })
+      await new Promise((r) => setTimeout(r, 300))
+      const g2 = ghost()
+      const bigger = {
+        visible: Boolean(g2),
+        scale: g2 ? { x: +g2.scale.x.toFixed(3), y: +g2.scale.y.toFixed(3), z: +g2.scale.z.toFixed(3) } : null,
+        label: label()
+      }
+
+      // 松手：建出来的尺寸必须等于预览看到的
+      editor.handleQuickBuildEnd({ x: 6.4, y: 0, z: 3.6 })
+      await new Promise((r) => setTimeout(r, 600))
+      const created = store.state.history.present.objects.filter((o) => o.kind === 'floor').pop()
+      const afterEnd = {
+        ghostVisible: Boolean(ghost()),
+        label: label(),
+        size: created ? { x: +created.size.x.toFixed(3), y: +created.size.y.toFixed(3), z: +created.size.z.toFixed(3) } : null,
+        position: created ? { x: +created.position.x.toFixed(3), z: +created.position.z.toFixed(3) } : null
+      }
+
+      // ---- 墙：有旋转、高度固定 2.8 ----
+      editor.beginQuickBuild('wall')
+      await new Promise((r) => setTimeout(r, 300))
+      editor.handleQuickBuildStart({ x: 0, y: 0, z: 0 })
+      editor.handleQuickBuildMove({ x: 4, y: 0, z: 0 })
+      await new Promise((r) => setTimeout(r, 300))
+      const wallGhost = ghost()
+      const wall = {
+        visible: Boolean(wallGhost),
+        scale: wallGhost ? { x: +wallGhost.scale.x.toFixed(3), y: +wallGhost.scale.y.toFixed(3), z: +wallGhost.scale.z.toFixed(3) } : null,
+        rotationY: wallGhost ? +(wallGhost.rotation.y * 180 / Math.PI).toFixed(2) : null,
+        label: label()
+      }
+
+      // 拖到斜向（45度）：预览必须跟着转，而不是只变长
+      editor.handleQuickBuildMove({ x: 3, y: 0, z: 3 })
+      await new Promise((r) => setTimeout(r, 300))
+      const wallGhost2 = ghost()
+      const wallDiagonal = {
+        visible: Boolean(wallGhost2),
+        rotationY: wallGhost2 ? +(wallGhost2.rotation.y * 180 / Math.PI).toFixed(2) : null,
+        length: wallGhost2 ? +wallGhost2.scale.x.toFixed(3) : null,
+        label: label()
+      }
+      editor.handleQuickBuildEnd({ x: 3, y: 0, z: 3 })
+      await new Promise((r) => setTimeout(r, 600))
+      const createdWall = store.state.history.present.objects.filter((o) => o.kind === 'wall').pop()
+      const wallCreated = createdWall
+        ? { rotationY: +(createdWall.rotation.y).toFixed(2), length: +createdWall.size.x.toFixed(3) }
+        : null
+
+      return { beforeStart, atStart, mid, bigger, afterEnd, wall, wallDiagonal, wallCreated }
+    })()`)
+
+    check('拖拽开始前没有幽灵预览', quickBuild.beforeStart.visible === false, JSON.stringify(quickBuild.beforeStart))
+    check(
+      '刚按下（尺寸为 0）时不画幽灵体，但 HUD 不报错',
+      quickBuild.atStart.visible === false,
+      JSON.stringify(quickBuild.atStart)
+    )
+    check(
+      '拖动中出现幽灵预览（不是松手才出现）',
+      quickBuild.mid.visible === true,
+      JSON.stringify(quickBuild.mid)
+    )
+    check(
+      '幽灵预览尺寸 = 拖拽尺寸（3.2 × 1.8）',
+      quickBuild.mid.scale !== null &&
+        Math.abs(quickBuild.mid.scale.x - 3.2) < 0.01 &&
+        Math.abs(quickBuild.mid.scale.z - 1.8) < 0.01,
+      JSON.stringify(quickBuild.mid.scale)
+    )
+    check(
+      'HUD 实时显示尺寸文本',
+      quickBuild.mid.label === '3.20 × 1.80 m',
+      String(quickBuild.mid.label)
+    )
+    check(
+      '继续拖大时预览跟着变大（实时反馈）',
+      quickBuild.bigger.scale !== null &&
+        quickBuild.bigger.scale.x > quickBuild.mid.scale.x + 1 &&
+        quickBuild.bigger.scale.z > quickBuild.mid.scale.z + 1,
+      JSON.stringify({ mid: quickBuild.mid.scale, bigger: quickBuild.bigger.scale })
+    )
+    check(
+      'HUD 文本跟着变',
+      quickBuild.bigger.label === '6.40 × 3.60 m',
+      String(quickBuild.bigger.label)
+    )
+    check(
+      '松手后幽灵预览消失（不残留）',
+      quickBuild.afterEnd.ghostVisible === false,
+      JSON.stringify(quickBuild.afterEnd)
+    )
+    check(
+      '建出来的尺寸与预览看到的一致',
+      quickBuild.afterEnd.size !== null &&
+        Math.abs(quickBuild.afterEnd.size.x - quickBuild.bigger.scale.x) < 0.01 &&
+        Math.abs(quickBuild.afterEnd.size.z - quickBuild.bigger.scale.z) < 0.01,
+      JSON.stringify({ preview: quickBuild.bigger.scale, created: quickBuild.afterEnd.size })
+    )
+
+    check(
+      '墙的幽灵预览：高度固定 2.8、长度跟拖拽',
+      quickBuild.wall.visible === true &&
+        Math.abs(quickBuild.wall.scale.y - 2.8) < 0.01 &&
+        Math.abs(quickBuild.wall.scale.x - 4) < 0.01,
+      JSON.stringify(quickBuild.wall)
+    )
+    check(
+      '墙的幽灵预览带正确旋转（沿世界 X 走）',
+      Math.abs(quickBuild.wall.rotationY) < 0.01,
+      String(quickBuild.wall.rotationY)
+    )
+    check(
+      '拖成斜墙时预览跟着转（45°），不是只变长',
+      /*
+       * 只要幅度对：符号由 `rotation.y = -atan2(dz, dx)` 的约定决定
+       * （局部 +X 要对上拖拽方向），写死正号会把正确实现判成失败。
+       */
+      Math.abs(Math.abs(quickBuild.wallDiagonal.rotationY) - 45) < 1 &&
+        Math.abs(quickBuild.wallDiagonal.length - Math.hypot(3, 3)) < 0.02,
+      JSON.stringify(quickBuild.wallDiagonal)
+    )
+    check(
+      '斜墙建成后的旋转与预览完全一致（预览即所得）',
+      quickBuild.wallCreated !== null &&
+        Math.abs(quickBuild.wallCreated.rotationY - quickBuild.wallDiagonal.rotationY) < 0.01 &&
+        Math.abs(quickBuild.wallCreated.length - quickBuild.wallDiagonal.length) < 0.01,
+      JSON.stringify({ preview: quickBuild.wallDiagonal, created: quickBuild.wallCreated })
+    )
+    check(
+      '墙的 HUD 只显示长度（高度是固定的）',
+      /^长度 4\.24 m$/.test(String(quickBuild.wallDiagonal.label)),
+      String(quickBuild.wallDiagonal.label)
+    )
+
     check('无未捕获运行时异常', pageErrors.length === 0, pageErrors.slice(0, 2).join(' | '))
   } finally {
     cdp?.close()

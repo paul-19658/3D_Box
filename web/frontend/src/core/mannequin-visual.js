@@ -19,6 +19,8 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js'
 
+import { MANNEQUIN_RIG_BOUNDS } from './mannequin'
+
 /**
  * 人台模型地址。
  *
@@ -168,11 +170,17 @@ function findNamedObject(root, name) {
 }
 
 /**
- * 归一化：把模型缩放到 1 米高、脚底对齐 y=-0.5。
+ * 归一化：把模型缩放到**与控制骨架完全一致**的基准。
  *
- * 为什么是 -0.5 而不是 0：控制骨架的根节点在髋部（y=0），
- * 整个身体向下延伸约 0.5 米。外观必须用同一套基准，
- * 否则人物会浮在空中或陷进地里。
+ * 骨架契约见 `mannequin.js` 的 `MANNEQUIN_RIG_BOUNDS`：脚底 -0.5、头顶 +0.5、
+ * 总高 1。外观必须用同一套基准，否则会出现两类可见问题：
+ *
+ * - 脚底不一致 → 人物浮在空中或陷进地面；
+ * - 总高不一致 → 关节手柄和画出来的肢体差一截，看上去"比例不对"。
+ *
+ * 这里**不再硬编码 1 / -0.5**，而是直接引用契约常量；测试会断言真实骨架
+ * 确实落在该范围内，所以两边不会再各自漂移（以前骨架实际是 0.9883 / -0.5475，
+ * 外观按 1.0 / -0.5 归一化，髋关节比画出来的髋部低了 13% 身高）。
  */
 function normalizeVisual(content) {
   content.updateMatrixWorld(true)
@@ -180,9 +188,13 @@ function normalizeVisual(content) {
   const size = bounds.getSize(new THREE.Vector3())
   if (!Number.isFinite(size.y) || size.y <= 0) throw new Error('人台资源没有有效高度。')
   const center = bounds.getCenter(new THREE.Vector3())
-  const scale = 1 / size.y
+  const scale = MANNEQUIN_RIG_BOUNDS.height / size.y
   content.scale.setScalar(scale)
-  content.position.set(-center.x * scale, -0.5 - bounds.min.y * scale, -center.z * scale)
+  content.position.set(
+    -center.x * scale,
+    MANNEQUIN_RIG_BOUNDS.minY - bounds.min.y * scale,
+    -center.z * scale
+  )
   content.updateMatrixWorld(true)
   return content
 }
